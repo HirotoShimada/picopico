@@ -3,11 +3,15 @@ export type PlayerId = 1 | 2;
 export type InputAction = 'left' | 'right' | 'confirm';
 
 export type ProfileFilterId = 'normal' | 'comic' | 'neon' | 'party' | 'retro' | 'pixel';
+export type ProfileBackgroundId = 'plain' | 'burst' | 'stage' | 'space' | 'pixel';
+export type ProfileEffectId = 'none' | 'sparkle' | 'lightning' | 'bubbles' | 'victory';
 
 export type PlayerProfile = {
   name: string;
   imageDataUrl: string;
   filterId: ProfileFilterId;
+  backgroundId: ProfileBackgroundId;
+  effectId: ProfileEffectId;
 };
 
 export type PlayerProfiles = Record<PlayerId, PlayerProfile>;
