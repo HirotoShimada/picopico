@@ -8,6 +8,6 @@ services:
     healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION
-        value: 24.14.0
+        value: 20.18.1
       - key: NODE_ENV
         value: production
