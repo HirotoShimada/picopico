@@ -13,6 +13,8 @@ function getWebSocketUrl() {
 
 export function useNetworkRoom(profile: PlayerProfile) {
   const socketRef = useRef<WebSocket | null>(null);
+  const profileRef = useRef(profile);
+  const roomCodeRef = useRef('');
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [role, setRole] = useState<NetworkRole>('spectator');
   const [roomCode, setRoomCode] = useState('');
@@ -20,41 +22,74 @@ export function useNetworkRoom(profile: PlayerProfile) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const socket = new WebSocket(getWebSocketUrl());
-    socketRef.current = socket;
-    setStatus('connecting');
+    profileRef.current = profile;
+  }, [profile]);
 
-    socket.addEventListener('open', () => {
-      setStatus('open');
-      const roomFromUrl = new URLSearchParams(window.location.search).get('room');
-      if (roomFromUrl) send(socket, { type: 'join', roomCode: roomFromUrl, profile });
-    });
-    socket.addEventListener('close', () => setStatus('closed'));
-    socket.addEventListener('error', () => setError('サーバーに接続できませんでした'));
-    socket.addEventListener('message', (event) => {
-      const message = parseMessage(event.data);
-      if (!message) return;
-      if (message.type === 'joined') {
-        setRole(message.role);
-        setRoomCode(message.roomCode);
-        updateUrlRoom(message.roomCode);
-      }
-      if (message.type === 'state') {
-        setRoom({ ...message.state, receivedAt: Date.now() });
-      }
-      if (message.type === 'error') setError(message.message);
-    });
+  useEffect(() => {
+    let stopped = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer = 0;
+
+    const connect = () => {
+      if (stopped) return;
+      const socket = new WebSocket(getWebSocketUrl());
+      socketRef.current = socket;
+      setStatus('connecting');
+
+      socket.addEventListener('open', () => {
+        if (stopped) return;
+        reconnectAttempt = 0;
+        setStatus('open');
+        setError(null);
+        const roomFromUrl = new URLSearchParams(window.location.search).get('room');
+        const roomToJoin = roomCodeRef.current || roomFromUrl;
+        if (roomToJoin) send(socket, { type: 'join', roomCode: roomToJoin, profile: profileRef.current });
+      });
+
+      socket.addEventListener('close', () => {
+        if (socketRef.current === socket) socketRef.current = null;
+        if (stopped) return;
+        setStatus('connecting');
+        setError('サーバーに再接続しています。無料サーバーの起動中は少し時間がかかります。');
+        const delayMs = Math.min(12000, 1000 * 2 ** reconnectAttempt);
+        reconnectAttempt += 1;
+        reconnectTimer = window.setTimeout(connect, delayMs);
+      });
+
+      socket.addEventListener('error', () => {
+        if (!stopped) setError('サーバーに接続中です。接続OKになるまで少し待ってください。');
+      });
+
+      socket.addEventListener('message', (event) => {
+        const message = parseMessage(event.data);
+        if (!message) return;
+        if (message.type === 'joined') {
+          roomCodeRef.current = message.roomCode;
+          setRole(message.role);
+          setRoomCode(message.roomCode);
+          updateUrlRoom(message.roomCode);
+        }
+        if (message.type === 'state') {
+          setRoom({ ...message.state, receivedAt: Date.now() });
+        }
+        if (message.type === 'error') setError(message.message);
+      });
+    };
+
+    connect();
 
     return () => {
-      socket.close();
+      stopped = true;
+      window.clearTimeout(reconnectTimer);
+      socketRef.current?.close();
       socketRef.current = null;
     };
-  }, [profile]);
+  }, []);
 
   const sendMessage = useCallback((message: NetworkClientMessage) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      setError('まだサーバーに接続していません');
+      setError('まだサーバーに接続していません。接続OKになってから押してください。');
       return;
     }
     send(socket, message);

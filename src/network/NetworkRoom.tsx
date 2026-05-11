@@ -137,6 +137,10 @@ function NetworkLobby({
   onJoin: () => void;
   onBack: () => void;
 }) {
+  const isConnected = status === 'open';
+  const joinDisabled = !isConnected || !joinCode.trim();
+  const disabledButtonClass = 'opacity-45 cursor-not-allowed hover:translate-y-0 hover:shadow-[0_6px_0_#1a1f2c]';
+
   return (
     <div className="absolute inset-0 flex flex-col items-center justify-center gap-8">
       <button
@@ -160,16 +164,21 @@ function NetworkLobby({
             placeholder="部屋コード"
             className="rounded-2xl border-4 border-slate-900 bg-white px-5 py-3 text-center text-4xl font-black tracking-widest text-slate-900 shadow-[0_4px_0_#1a1f2c] outline-none"
           />
-          <button type="button" onClick={onJoin} className="btn-pop text-2xl">
+          <button type="button" onClick={onJoin} disabled={joinDisabled} className={`btn-pop text-2xl ${joinDisabled ? disabledButtonClass : ''}`}>
             参加
           </button>
         </div>
-        <button type="button" onClick={onCreate} className="btn-pop mx-auto text-2xl">
-          新しい部屋をつくる
+        <button type="button" onClick={onCreate} disabled={!isConnected} className={`btn-pop mx-auto text-2xl ${!isConnected ? disabledButtonClass : ''}`}>
+          {isConnected ? '新しい部屋をつくる' : 'サーバー接続中...'}
         </button>
         <div className="text-center text-sm font-bold text-slate-600">
           接続状態: {status === 'open' ? '接続OK' : status === 'connecting' ? '接続中...' : '切断'}
         </div>
+        {!isConnected && (
+          <div className="text-center text-xs font-bold text-slate-500">
+            Render無料サーバーの起動中は、接続OKになるまで30秒ほどかかることがあります。
+          </div>
+        )}
         {error && <div className="rounded-2xl bg-rose-100 px-4 py-2 text-center text-sm font-black text-rose-700">{error}</div>}
       </div>
     </div>
