@@ -111,7 +111,7 @@ export function ProfileSetupScreen({ initialProfiles, onComplete }: Props) {
             <div className="text-sm font-black tracking-widest text-slate-700">PROFILE</div>
             <div className="font-display text-5xl leading-[1.05] text-pop-pink text-stroke">プレイヤー登録</div>
           </div>
-          {([1, 2] as PlayerId[]).map((player) => (
+          {([1] as PlayerId[]).map((player) => (
             <button
               key={player}
               type="button"
@@ -122,13 +122,13 @@ export function ProfileSetupScreen({ initialProfiles, onComplete }: Props) {
             >
               <ProfileAvatar profile={profiles[player]} player={player} size="md" />
               <div>
-                <div className="text-xs font-extrabold tracking-widest">{player === 1 ? 'あなた / 1P' : 'ローカル2P'}</div>
+                <div className="text-xs font-extrabold tracking-widest">あなた</div>
                 <div className="max-w-[190px] truncate text-2xl font-black">{profiles[player].name}</div>
               </div>
             </button>
           ))}
           <div className="card bg-white/95 px-5 py-4 text-sm font-bold text-slate-700">
-            ネット対戦では「あなた / 1P」のプロフィールを相手に送ります。ローカル対戦では2Pもここで使います。
+            ネット対戦では、このプロフィールを相手の画面にも表示します。
           </div>
           <button type="button" onClick={complete} className="btn-pop text-2xl">
             これでOK
@@ -140,7 +140,7 @@ export function ProfileSetupScreen({ initialProfiles, onComplete }: Props) {
             <div className="grid grid-cols-[1fr_auto] items-end gap-4">
               <label className="flex flex-col gap-2">
                 <span className="text-sm font-black tracking-widest text-slate-600">
-                  {activePlayer === 1 ? 'あなたの名前' : 'ローカル2Pの名前'}
+                  あなたの名前
                 </span>
                 <input
                   value={activeProfile.name}

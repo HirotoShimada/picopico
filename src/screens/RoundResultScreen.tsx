@@ -20,7 +20,7 @@ type Props = {
 export function RoundResultScreen({ round, totalRounds, gameName, outcome, scores, profiles, input, onReveal, onContinue }: Props) {
   const hasWinner = outcome.winners.length > 0;
 
-  // Auto-advance after 2.5s, or sooner if either player hits confirm.
+  // Auto-advance after 2.5s, or sooner if the player hits confirm.
   useEffect(() => {
     const t = window.setTimeout(onContinue, 2500);
     return () => window.clearTimeout(t);
@@ -80,7 +80,7 @@ export function RoundResultScreen({ round, totalRounds, gameName, outcome, score
         })}
       </div>
 
-      <div className="text-sm font-bold text-slate-600">Space / Enter で次へ (自動で進みます)</div>
+      <div className="text-sm font-bold text-slate-600">↓ で次へ (自動で進みます)</div>
     </div>
   );
 }

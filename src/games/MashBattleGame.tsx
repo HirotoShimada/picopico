@@ -69,7 +69,7 @@ export function MashBattleGame({ durationMs, input, onFinish }: MiniGameProps) {
                   style={{ width: `${(counts[p] / max) * 100}%` }}
                 />
               </div>
-              <div className="text-sm font-bold text-slate-700">{p === 1 ? 'Space を連打！' : 'Enter を連打！'}</div>
+              <div className="text-sm font-bold text-slate-700">↓ を連打！</div>
             </div>
           ))}
         </div>

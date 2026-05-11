@@ -12,10 +12,10 @@ const CHOICES: { id: Choice; label: string; bg: string; key: 'left' | 'confirm' 
   { id: 'yellow', label: 'きいろ', bg: 'bg-amber-400', key: 'right' },
 ];
 
-const KEY_LABELS: Record<Choice, { p1: string; p2: string }> = {
-  red: { p1: 'A', p2: '←' },
-  blue: { p1: 'Space', p2: 'Enter' },
-  yellow: { p1: 'D', p2: '→' },
+const KEY_LABELS: Record<Choice, string> = {
+  red: '←',
+  blue: '↓',
+  yellow: '→',
 };
 
 export function ColorWordGame({ durationMs, input, onFinish }: MiniGameProps) {
@@ -146,8 +146,7 @@ function ColorChoiceCard({
         )}
       </div>
       <div className="flex items-center gap-1 rounded-full border-2 border-slate-900 bg-white px-2 py-1 text-xs font-black shadow-[0_2px_0_#1a1f2c]">
-        <span className="rounded bg-p1 px-1.5 py-0.5 text-white">1P {keys.p1}</span>
-        <span className="rounded bg-p2 px-1.5 py-0.5 text-white">2P {keys.p2}</span>
+        <span className="rounded bg-p1 px-1.5 py-0.5 text-white">{keys}</span>
       </div>
     </div>
   );

@@ -62,7 +62,7 @@ export function FinalResultScreen({ scores, profiles, input, onReveal, onRestart
       </div>
 
       <button onClick={onRestart} className="btn-pop">
-        もう一度あそぶ (Space / Enter)
+        もう一度あそぶ (↓)
       </button>
     </div>
   );

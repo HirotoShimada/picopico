@@ -5,14 +5,13 @@ import { useFreshInput } from '../hooks/useFreshInput';
 type Props = {
   input: PlayerInput | null;
   profiles: PlayerProfiles;
-  onStart: () => void;
   onNetworkMode: () => void;
   onEditProfiles: () => void;
 };
 
-export function TitleScreen({ input, profiles, onStart, onNetworkMode, onEditProfiles }: Props) {
+export function TitleScreen({ input, profiles, onNetworkMode, onEditProfiles }: Props) {
   useFreshInput(input, (e) => {
-    if (e.action === 'confirm') onStart();
+    if (e.action === 'confirm') onNetworkMode();
   });
 
   return (
@@ -27,16 +26,13 @@ export function TitleScreen({ input, profiles, onStart, onNetworkMode, onEditPro
           バトル!
         </h1>
         <p className="mt-2 text-lg font-bold text-slate-700">
-          短いミニゲームが連続で出題！全10ラウンドの2人対戦パーティーゲーム
+          それぞれのPCから同じ部屋に入って遊ぶ、全10ラウンドの2人対戦パーティーゲーム
         </p>
       </div>
 
       <div className="flex items-center gap-5">
-        <button type="button" onClick={onStart} className="btn-pop animate-wiggle">
-          ローカル対戦
-        </button>
-        <button type="button" onClick={onNetworkMode} className="btn-pop btn-mint">
-          ネット対戦
+        <button type="button" onClick={onNetworkMode} className="btn-pop btn-mint animate-wiggle">
+          ネット対戦をはじめる
         </button>
       </div>
       <button
@@ -47,27 +43,16 @@ export function TitleScreen({ input, profiles, onStart, onNetworkMode, onEditPro
         プロフィール変更
       </button>
 
-      <div className="grid grid-cols-2 gap-6 text-center">
+      <div className="grid grid-cols-1 gap-6 text-center">
         <PlayerCard
           player={1}
-          name="PLAYER 1"
+          name="PLAYER"
           profile={profiles[1]}
           color="bg-p1"
           keys={[
-            { k: 'A', d: '左' },
-            { k: 'D', d: '右' },
-            { k: 'Space', d: '決定' },
-          ]}
-        />
-        <PlayerCard
-          player={2}
-          name="PLAYER 2"
-          profile={profiles[2]}
-          color="bg-p2"
-          keys={[
             { k: '←', d: '左' },
             { k: '→', d: '右' },
-            { k: 'Enter', d: '決定' },
+            { k: '↓', d: '決定' },
           ]}
         />
       </div>

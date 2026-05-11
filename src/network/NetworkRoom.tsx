@@ -476,9 +476,9 @@ function NetworkControls({ disabled, roleLabel, onInput }: { disabled: boolean; 
     <div className="absolute inset-x-0 bottom-5 z-40 flex justify-center px-4">
       <div className={`card flex items-center gap-4 bg-white/95 px-5 py-3 ${disabled ? 'opacity-55' : ''}`}>
         <div className="mr-2 text-sm font-black text-slate-700">{roleLabel}</div>
-        <ControlButton label="左" keys="A / ←" disabled={disabled} onClick={() => onInput('left')} />
-        <ControlButton label="決定" keys="Space / Enter" disabled={disabled} onClick={() => onInput('confirm')} wide />
-        <ControlButton label="右" keys="D / →" disabled={disabled} onClick={() => onInput('right')} />
+        <ControlButton label="左" keys="←" disabled={disabled} onClick={() => onInput('left')} />
+        <ControlButton label="決定" keys="↓" disabled={disabled} onClick={() => onInput('confirm')} wide />
+        <ControlButton label="右" keys="→" disabled={disabled} onClick={() => onInput('right')} />
       </div>
     </div>
   );
