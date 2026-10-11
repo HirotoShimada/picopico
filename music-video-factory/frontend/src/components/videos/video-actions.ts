@@ -104,7 +104,10 @@ export function useVideoActions() {
   };
 }
 
-/** ZIP downloads (selection or whole batch) with a busy flag and error toast. */
+/**
+ * ZIP downloads (selection or whole batch) with a busy flag and error toast. `busy` covers only the
+ * request for the signed link; the browser then downloads the archive itself (its own progress UI).
+ */
 export function useZipDownload() {
   const [busy, setBusy] = React.useState(false);
 
@@ -121,7 +124,7 @@ export function useZipDownload() {
 
   return {
     busy,
-    downloadSelection: (ids: string[], filename?: string) => wrap(() => downloadVideosZip(ids, filename)),
-    downloadBatch: (batchId: string, filename?: string) => wrap(() => downloadBatchZip(batchId, filename)),
+    downloadSelection: (ids: string[]) => wrap(() => downloadVideosZip(ids)),
+    downloadBatch: (batchId: string) => wrap(() => downloadBatchZip(batchId)),
   };
 }

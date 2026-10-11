@@ -1,6 +1,7 @@
 "use client";
 
-import { Clapperboard, Copy, Sparkles, TriangleAlert } from "lucide-react";
+import { Clapperboard, Copy, ShieldAlert, Sparkles, Timer, TriangleAlert } from "lucide-react";
+import Link from "next/link";
 import * as React from "react";
 
 import { sectionColor } from "@/components/audio/sections";
@@ -12,11 +13,12 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/toast";
-import { errorMessage, previewStoryboard } from "@/lib/api";
+import { errorMessage, isApiError, previewStoryboard } from "@/lib/api";
 import { formatTime, formatUsd } from "@/lib/format";
 import type { PresetId, Storyboard, StoryboardScene } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { projectTabHref } from "./links";
 import { cameraAngleLabel, cameraMoveLabel, sceneTypeLabel, songSectionLabel } from "./vocab";
 
 const SCENE_COUNTS = [4, 8, 12, 16] as const;
@@ -28,6 +30,16 @@ export interface StoryboardPreviewProps {
   /** Blocks the request (e.g. custom preset without text). */
   disabledReason?: string | null;
   claudeConfigured: boolean | undefined;
+  /**
+   * The project has lyric lines but 「歌詞の権利」 is not confirmed: the server then does not send the
+   * lyrics to Claude and previews with the template (with a warning).
+   */
+  lyricsRightsMissing?: boolean;
+}
+
+/** `POST /storyboard` refused because of the per-user limit on Claude previews (429 `rate_limited`). */
+function isRateLimited(error: unknown): boolean {
+  return isApiError(error) && (error.code === "rate_limited" || error.status === 429);
 }
 
 interface PreviewResult {
@@ -101,7 +113,14 @@ function SceneCard({ scene, index }: { scene: StoryboardScene; index: number }) 
 }
 
 /** `POST /api/projects/{id}/storyboard` preview (not saved): scenes with Japanese descriptions and English prompts. */
-export function StoryboardPreview({ projectId, preset, customWorld, disabledReason, claudeConfigured }: StoryboardPreviewProps) {
+export function StoryboardPreview({
+  projectId,
+  preset,
+  customWorld,
+  disabledReason,
+  claudeConfigured,
+  lyricsRightsMissing = false,
+}: StoryboardPreviewProps) {
   const [sceneCount, setSceneCount] = React.useState<number>(8);
   const [result, setResult] = React.useState<PreviewResult | null>(null);
   const [error, setError] = React.useState<unknown>(null);
@@ -156,7 +175,25 @@ export function StoryboardPreview({ projectId, preset, customWorld, disabledReas
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         {disabledReason ? <p className="text-xs text-muted-foreground">{disabledReason}</p> : null}
-        {error ? (
+        {claudeConfigured && lyricsRightsMissing ? (
+          <Alert
+            tone="neutral"
+            icon={ShieldAlert}
+            action={
+              <Button variant="secondary" size="sm" asChild>
+                <Link href={projectTabHref(projectId, "rights")}>権利確認へ</Link>
+              </Button>
+            }
+          >
+            権利確認の「歌詞の権利」が未確認のため、プレビューでは歌詞を Claude に送らず、テンプレートで絵コンテを作成します。Claude
+            の絵コンテを見るには、歌詞の権利を確認してください。
+          </Alert>
+        ) : null}
+        {error && isRateLimited(error) ? (
+          <Alert tone="warning" icon={Timer} title="Claude による絵コンテのプレビュー回数の上限に達しました">
+            {errorMessage(error)}この上限は絵コンテのプレビューだけのもので、生成開始には影響しません。
+          </Alert>
+        ) : error ? (
           <Alert tone="danger" title="絵コンテを作成できませんでした">
             {errorMessage(error)}
           </Alert>

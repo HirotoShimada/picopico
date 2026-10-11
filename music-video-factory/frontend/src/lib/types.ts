@@ -194,6 +194,8 @@ export interface LyricsOut {
 
 export interface LyricLinesOut {
   lines: LyricLine[];
+  /** e.g. the `lyrics_rights` reset after a change of the line texts (empty otherwise). */
+  warnings: string[];
 }
 
 export interface AutoTimeRequest {
@@ -258,6 +260,8 @@ export interface ProjectOut {
   created_at: ISODateString;
   updated_at: ISODateString;
   counts: ProjectCounts;
+  /** Notices about this request, e.g. `POST /audio` un-confirming `audio_rights` (empty otherwise). */
+  warnings?: string[];
 }
 
 export interface ProjectSummary {
@@ -341,6 +345,8 @@ export interface GenerationSettings {
   seed: number | null;
   /** Ask Claude for a new storyboard instead of reusing the project's last one for the same world (one batch only). */
   new_storyboard?: boolean;
+  /** Let the planner flip shots horizontally (mirrors any text/signage in the footage); default false. */
+  allow_mirror?: boolean;
 }
 
 /** Request body for estimate / batch creation: omitted fields take server defaults. */
@@ -573,6 +579,19 @@ export interface VideoEdit {
 export interface VideoListFilters {
   favorite?: boolean;
   batch_id?: string;
+  /** `false` hides cancelled videos (server default: shown). */
+  include_cancelled?: boolean;
+}
+
+export interface ClipListFilters {
+  /** `false` hides cancelled clips (server default: shown). */
+  include_cancelled?: boolean;
+}
+
+/** Signed `GET /media-zip/…` link (`POST /api/videos/zip-link`, `POST /api/batches/{id}/zip-link`): no auth header needed. */
+export interface ZipLinkOut {
+  url: string;
+  expires_at: ISODateString;
 }
 
 // --- batches (§5.6) ----------------------------------------------------------------------------------
@@ -723,6 +742,14 @@ export interface LimitsInfo {
   max_duration: number;
 }
 
+/** A boolean `GenerationSettings` option (id = field name), e.g. `allow_mirror`. */
+export interface GenerationOptionInfo {
+  id: string;
+  name_ja: string;
+  description_ja: string;
+  default: boolean;
+}
+
 export interface CapabilitiesOut {
   providers: ProviderInfo[];
   claude_configured: boolean;
@@ -734,6 +761,7 @@ export interface CapabilitiesOut {
   durations: number[];
   counts: number[];
   limits: LimitsInfo;
+  generation_options?: GenerationOptionInfo[];
 }
 
 export interface ActiveJob {

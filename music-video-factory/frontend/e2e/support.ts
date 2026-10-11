@@ -3,9 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { expect, type APIRequestContext, type Page, type Route, type TestInfo } from "@playwright/test";
+import { expect, type APIRequestContext, type Page, type PlaywrightWorkerArgs, type Route, type TestInfo } from "@playwright/test";
 
 export const API_URL = (process.env.E2E_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
+/**
+ * Bearer token for a backend in `AUTH_MODE=token` (`API_TOKENS=name:<token>`); unset = `AUTH_MODE=dev`.
+ * Only the specs that call {@link apiContext} / {@link storeApiToken} support token mode.
+ */
+export const API_TOKEN = process.env.E2E_API_TOKEN?.trim() || null;
 export const DEMO_DIR = path.resolve(__dirname, "..", "..", "backend", "var", "demo");
 export const SCREENSHOT_DIR = path.resolve(__dirname, "screenshots");
 
@@ -63,13 +68,18 @@ export async function screenshot(page: Page, name: string): Promise<void> {
   });
 }
 
-/** Collects uncaught page errors and console errors; call `assertClean()` at the end of a test. */
-export function watchConsole(page: Page, testInfo: TestInfo) {
+/**
+ * Collects uncaught page errors and console errors; call `assertClean()` at the end of a test.
+ * `ignore`: console errors the test provokes on purpose (e.g. Chromium's log line for an HTTP error response).
+ */
+export function watchConsole(page: Page, testInfo: TestInfo, { ignore = [] }: { ignore?: RegExp[] } = {}) {
   const pageErrors: string[] = [];
   const consoleErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(`${message.text()} @ ${message.location().url}`);
+    if (message.type() === "error" && !ignore.some((pattern) => pattern.test(message.text()))) {
+      consoleErrors.push(`${message.text()} @ ${message.location().url}`);
+    }
   });
   return {
     assertClean() {
@@ -201,6 +211,21 @@ export async function patchApiJson<T>(page: Page, apiPath: string, patch: (body:
       await route.fulfill({ status: response.status(), headers, json: body });
     },
   );
+}
+
+/** Entry names of a ZIP file (`unzip -Z1`). */
+export function zipEntries(file: string): string[] {
+  return execFileSync("unzip", ["-Z1", file], { encoding: "utf8" }).split("\n").filter(Boolean);
+}
+
+/** Stores {@link API_TOKEN} the way /settings does, before any page script runs (no-op in dev mode). */
+export async function storeApiToken(page: Page): Promise<void> {
+  if (API_TOKEN) await page.addInitScript((token) => window.localStorage.setItem("mvf.apiToken", token), API_TOKEN);
+}
+
+/** API request context for test setup; sends {@link API_TOKEN} (the page itself gets no extra headers). */
+export function apiContext(playwright: PlaywrightWorkerArgs["playwright"]): Promise<APIRequestContext> {
+  return playwright.request.newContext({ extraHTTPHeaders: API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {} });
 }
 
 // --- direct API helpers (used to prepare the library test project) -------------------------------

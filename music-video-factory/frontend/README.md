@@ -61,7 +61,12 @@ src/
 - エンドポイントごとの関数: `listProjects`, `createProject`, `uploadAudio(id, file, { onProgress, signal })`,
   `getAnalysis`, `getWorldEstimate`, `updateSegment`, `updateLyrics`, `autoTimeLyrics`, `uploadClips`, `estimateBatch`,
   `createBatch`, `getBatch`, `cancelBatch`, `updateBatchBudget`（`PATCH /api/batches/{id}`）, `downloadBatchZip`,
-  `listVideos`, `editVideo`, `downloadVideo` など。
+  `downloadVideosZip`, `listVideos`, `editVideo`, `downloadVideo` など。
+- ZIP（ジョブの完成分・選択した動画）は `POST /api/batches/{id}/zip-link` / `POST /api/videos/zip-link` で署名付きリンク
+  （`/media-zip/…`、認証ヘッダー不要）を受け取り、ブラウザがそのリンクを直接ダウンロードします。トークン認証でも
+  ページのメモリに読み込まず、ブラウザの通常のダウンロード（進捗表示・中断）になります。ファイル名はサーバーが決めます。
+- 一覧のフィルター: `listVideos(id, { include_cancelled: false })`、`listClips(id, { include_cancelled: false })` で
+  キャンセル済みを除きます。キーが変わるため、一覧の再取得は `mutate(isListKey(apiPaths.clips(id)))` を使います。
 - `apiPaths` は SWR のキーを兼ねます（例: `mutate(apiPaths.project(id))`）。
 - エラーはすべて `ApiError`（`status`, `code`, `detail`, 日本語の `message`）。バックエンドに到達できない場合は
   `status === 0`（`isBackendUnreachable(error)`）。422 の検証エラーは項目名つきの日本語に変換されます。
@@ -84,6 +89,21 @@ API トークンを変更すると、SWR のキャッシュをすべて破棄し
 - 生成設定: 推定のおすすめ世界観（初回でプロジェクトの世界観が既定のままなら初期値に使用）、歌詞スタイル「自動」、
   Claude 設定時の「絵コンテを Claude で新しく作り直す」（`new_storyboard`、次回には引き継がない）。見積もりとバッチ作成には
   フォームごとに 1 つのランダムなシードを送るため、確認ダイアログの金額は実際の計画と一致します。
+  「左右反転を使う」（`allow_mirror`、既定オフ。素材内の文字が鏡文字になる旨を表示）は見積もりとバッチ作成に送り、
+  前回のジョブの設定として引き継ぎます。ジョブ画面の生成設定にも表示します。
+- 絵コンテのプレビュー: Claude 設定時、歌詞があり「歌詞の権利」が未確認なら、歌詞を送らずテンプレートで作ることを事前に表示
+  （権利確認タブへのリンク）。Claude のプレビュー回数の上限（429 `rate_limited`）は専用のメッセージで表示します
+  （生成開始には影響しない旨を添える）。
+- 権利確認のやり直し: 音源の差し替え（`ProjectOut.warnings`）や歌詞本文の変更（`LyricsParseOut.warnings` /
+  `LyricLinesOut.warnings`）でバックエンドが「音源の権利」「歌詞の権利」を未確認に戻すと、変更した場所（楽曲ファイルの
+  カード・歌詞タブ）に「権利確認をやり直してください」を表示し、権利確認タブに「要再確認」バッジ、該当項目に「要再確認」、
+  プロジェクトの見出しに「権利の再確認が必要」を出します。API はこの情報を変更時の応答でしか返さないため、ブラウザが
+  プロジェクトごとに `localStorage`（`mvf.rightsReset`）へ記録し、その項目が再び確認されるまで表示します
+  （`components/rights/rights-reset.ts`）。
+- 歌詞の読み込み: パーサーの注意（除外した見出し行、間奏前で表示終了を推定した LRC の行、文字コードなど）は
+  「読み込み時の注意」に、権利確認のやり直しはそれとは別に表示します。
+- 動画一覧・素材: キャンセル済みの動画・素材は既定で非表示（`include_cancelled=false`）。「キャンセル済みを表示」で
+  表示します（動画一覧は `?cancelled=1`）。非表示の本数を添えます。素材の「N本で使用」はキャンセルした動画を数えません。
 - 生成ジョブ: 予算超過で止まったジョブの「予算を変更」（`PATCH /api/batches/{id}`）→ 止まった動画を再試行、
   作り直し中（`reopened_from`）の表示と前回の停止理由（`previous_error`）、キャンセルした動画だけが残った `partial` は
   「一部キャンセル」と表示。代替素材を使ったショット数（`plan.substitutions`）。

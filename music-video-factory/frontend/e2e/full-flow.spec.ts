@@ -17,6 +17,7 @@ import {
   videoDuration,
   waitFor,
   watchConsole,
+  zipEntries,
 } from "./support";
 
 interface LyricLineDto {
@@ -250,6 +251,17 @@ test("full journey: mock provider, 3 × 15 s, preview, download, edit and re-ren
     expect(batch.counts).toMatchObject({ done: 3, total: 3 });
     expect(batch.settings).toMatchObject({ provider: "mock", duration_sec: 15, count: 3 });
     await screenshot(page, "09-batch-complete");
+
+    // 完成分を ZIP で保存: the browser itself downloads a signed /media-zip link (streamed, not held in page memory).
+    const [zip] = await Promise.all([
+      page.waitForEvent("download", { timeout: 60_000 }),
+      page.getByRole("button", { name: "完成分を ZIP で保存" }).click(),
+    ]);
+    expect(zip.url()).toMatch(new RegExp(`^${API_URL}/media-zip/`));
+    expect(zip.suggestedFilename()).toMatch(/^デモアーティスト_.*_videos\.zip$/);
+    const zipPath = testInfo.outputPath("batch.zip");
+    await zip.saveAs(zipPath);
+    expect(zipEntries(zipPath)).toHaveLength(3);
   });
 
   await test.step("gallery: 3 videos, preview loads metadata", async () => {

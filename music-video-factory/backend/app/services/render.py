@@ -4,13 +4,14 @@ One FFmpeg invocation renders the whole video:
 
 * every shot is its own input (``-ss``/``-t`` input seeking, ``-stream_loop``
   when a clip is too short) and filter chain: trim → speed → 30 fps CFR →
-  scale-to-cover (per-frame size for the Ken Burns zoom, ``eval=frame``) →
-  animated ``crop`` (pan; directly after the scaler, because ``crop`` clamps
-  x/y to the size of its input link and only the scaler's own output link
-  follows the per-frame size) → optional ``hflip`` → ``setsar=1``. The chain
-  works in planar RGB, so crop positions are pixel exact and the
-  grade/subtitles see true colours; the frame count of each shot is exact
-  (``tpad`` + ``trim``);
+  whole-pixel ``crop`` to the part of the frame the Ken Burns move ever shows
+  → one fixed scale (square pixels, at most the output size) → edge-repeating
+  pad → ``perspective`` with per-frame corner expressions (``eval=frame``,
+  cubic interpolation): the zoom/pan view is resampled at sub-pixel positions,
+  so the motion glides instead of stepping 1 px / 2 px per frame (see
+  :class:`_ShotGeometry`) → fixed scale to the output size and planar RGB →
+  optional ``hflip`` → ``setsar=1``. Grade and subtitles see true colours; the
+  frame count of each shot is exact (``tpad`` + ``trim``);
 * shots are joined with ``concat`` (cut) or a chain of ``xfade`` crossfades
   centred on the planned cut points, with shot lengths compensated so the
   total frame count equals ``duration × fps``;
@@ -19,6 +20,10 @@ One FFmpeg invocation renders the whole video:
   with libass (``subtitles`` filter, ASS from :mod:`app.services.subtitles`);
 * the song is decoded once from the original file at ``audio_start`` and
   encoded once to AAC-LC (afade in/out, padded/trimmed to the exact length).
+  When that segment's true peak exceeds ``TRUE_PEAK_CEILING_DBTP`` (-1 dBTP,
+  measured with ``ebur128=peak=true`` on the exact chain), a pure linear
+  ``volume`` gain brings it down to the ceiling, so the AAC encode does not
+  clip; otherwise the audio chain has no gain stage at all.
 
 Output: H.264 High yuv420p (BT.709), 30 fps CFR, GOP 2 s, ``+faststart``;
 thumbnail JPEG at half resolution (540×960) from ~1 s.
@@ -51,6 +56,7 @@ __all__ = [
     "CROSSFADE_SEC",
     "DEFAULT_PRESET",
     "FALLBACK_COLOR_GRADES",
+    "TRUE_PEAK_CEILING_DBTP",
     "ProgressCallback",
     "RenderResult",
     "RenderShot",
@@ -70,6 +76,9 @@ FFPROBE = shutil.which("ffprobe") or "ffprobe"
 # mostly buy smaller files, not visibly better frames, at this CRF.
 DEFAULT_PRESET = "veryfast"
 CROSSFADE_SEC = 0.3
+# Loud masters whose segment's true peak exceeds this are turned down to it (linear gain)
+# before the AAC encode: lossy coding adds overshoot, and overs clip on playback.
+TRUE_PEAK_CEILING_DBTP = -1.0
 MAX_RATE = "25M"  # VBV cap: keeps grainy footage from exploding the bitrate
 BUF_SIZE = "50M"
 _ALLOWED_PRESETS = frozenset(
@@ -78,6 +87,9 @@ _ALLOWED_PRESETS = frozenset(
 _SPEED_LIMITS = (0.25, 4.0)
 _MIN_SLOWDOWN = 0.6  # slow a too-short clip down to at most 60 % speed, else loop it
 _LOG_TAIL_LINES = 40
+_KB_PIXFMT = "yuv420p"
+_KB_INTERP = "cubic"
+_KB_EDGE = 4  # px of repeated edge around the scaled box (≥ cubic kernel radius)
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -129,6 +141,7 @@ class RenderResult:
     size_bytes: int
     log_tail: str
     timings: dict[str, float] = field(default_factory=dict)
+    audio_gain_db: float = 0.0  # < 0 when a hot master was turned down to TRUE_PEAK_CEILING_DBTP
 
 
 # --------------------------------------------------------------------------- colour grades
@@ -404,6 +417,15 @@ class _ClipInfo:
     width: float  # display size: rotation and sample aspect ratio applied
     height: float
     color_matrix: str  # swscale in_color_matrix
+    pixel_width: int = 0  # decoded frame size after autorotation (0 = same as the display size)
+    pixel_height: int = 0
+
+    @property
+    def frame_size(self) -> tuple[int, int]:
+        """Size of the frames the filter graph receives (autorotated, sample aspect not applied)."""
+        if self.pixel_width > 0 and self.pixel_height > 0:
+            return self.pixel_width, self.pixel_height
+        return max(1, round(self.width)), max(1, round(self.height))
 
 
 _MATRIX_BY_COLORSPACE = {
@@ -477,15 +499,20 @@ def _probe_clip(path: str) -> _ClipInfo:
         raise RenderError(f"素材動画の解像度を判定できません: {Path(path).name}")
     sar = _ratio(stream.get("sample_aspect_ratio")) or 1.0
     width, height = coded_w * sar, coded_h
+    pixel_w, pixel_h = int(coded_w), int(coded_h)
     if _rotation(stream) % 180 == 90:
         width, height = height, width
+        pixel_w, pixel_h = pixel_h, pixel_w
     duration = _float(stream.get("duration")) or _float((data.get("format") or {}).get("duration"))
     if not duration or duration <= 0:
         raise RenderError(f"素材動画の長さを判定できません: {Path(path).name}")
     matrix = _MATRIX_BY_COLORSPACE.get(str(stream.get("color_space") or ""))
     if matrix is None:
         matrix = "bt709" if max(coded_w, coded_h) >= 720 else "bt601"
-    return _ClipInfo(path=path, duration=duration, width=width, height=height, color_matrix=matrix)
+    return _ClipInfo(
+        path=path, duration=duration, width=width, height=height, color_matrix=matrix,
+        pixel_width=pixel_w, pixel_height=pixel_h,
+    )  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -620,24 +647,134 @@ def _ease(u: str) -> str:
     return f"(0.5*{u}+0.5*{u}*{u}*(3-2*{u}))"
 
 
+def _ease_value(u: float) -> float:
+    u = min(max(u, 0.0), 1.0)
+    return 0.5 * u + 0.5 * u * u * (3 - 2 * u)
+
+
+@dataclass(frozen=True)
+class _ShotGeometry:
+    """Ken Burns geometry of one shot.
+
+    The decoded frames are cropped (whole pixels) to the box the camera move
+    ever looks at (``box``) and scaled once to square pixels, at most the output
+    size (``scaled``). ``perspective`` then resamples the per-frame view with
+    sub-pixel corner positions (zoom and pan glide instead of snapping to whole
+    pixels) into ``view`` pixels — the source's own detail, so a 720p clip is
+    interpolated at 720p — and one fixed scaler takes it to the output size.
+    ``perspective`` keeps its frame size, so the scaled box is padded to
+    ``frame`` (≥ box and ≥ view) with its edge pixels repeated.
+    """
+
+    box: tuple[int, int, int, int]  # x, y, w, h in decoded-frame pixels
+    scaled: tuple[int, int]  # size of the box after the one-off scale (≤ output size)
+    view: tuple[int, int]  # size the view is resampled to (≤ output size, output aspect)
+    frame: tuple[int, int]  # perspective frame size (scaled box + repeated edge, ≥ view)
+    corners: tuple[str, str, str, str]  # perspective x0/x1/y0/y1 expressions of the input frame count ``in``
+    views: list[tuple[float, float, float, float]]  # per frame (x0, x1, y0, y1), same values as the expressions
+
+
+def _even_ceil(value: float) -> int:
+    return 2 * math.ceil(value / 2 - 1e-6)
+
+
+def _shot_geometry(plan: _ShotPlan, spec: RenderSpec) -> _ShotGeometry:
+    width, height, frames = spec.width, spec.height, plan.frames
+    clip = plan.clip
+    frame_w, frame_h = clip.frame_size
+    # display px per decoded px (sample aspect ratio), cover factor display → output
+    aspect_x, aspect_y = clip.width / frame_w, clip.height / frame_h
+    cover = max(width / clip.width, height / clip.height)
+    cover_w, cover_h = clip.width * cover, clip.height * cover
+    seconds = frames / spec.fps
+    dir_x, dir_y, travel_x, travel_y = _pan_travel(plan.shot.pan, seconds, width, height)
+    zoom_from, zoom_delta = plan.zoom_from, plan.zoom_to - plan.zoom_from
+
+    def view(n: int) -> tuple[float, float, float, float]:
+        """Frame n's crop window of the zoomed cover image, as a decoded-frame rectangle (x0, x1, y0, y1)."""
+        ease = _ease_value(n / frames)
+        zoom = zoom_from + zoom_delta * ease
+        x = (cover_w * zoom - width) / 2 + dir_x * travel_x * (ease - 0.5)
+        y = (cover_h * zoom - height) / 2 + dir_y * travel_y * (ease - 0.5)
+        x = min(max(x, 0.0), cover_w * zoom - width)
+        y = min(max(y, 0.0), cover_h * zoom - height)
+        scale = zoom * cover  # output px per display px
+        return (
+            x / scale / aspect_x,
+            (x + width) / scale / aspect_x,
+            y / scale / aspect_y,
+            (y + height) / scale / aspect_y,
+        )
+
+    rects = [view(n) for n in range(frames)]
+    margin = 3  # room for the cubic kernel
+    left = max(0, (math.floor(min(r[0] for r in rects)) - margin) // 2 * 2)
+    top = max(0, (math.floor(min(r[2] for r in rects)) - margin) // 2 * 2)
+    right = min(frame_w, math.ceil(max(r[1] for r in rects)) + margin)
+    bottom = min(frame_h, math.ceil(max(r[3] for r in rects)) + margin)
+    box_w, box_h = max(2, right - left), max(2, bottom - top)
+    # One-off resize: square pixels, never larger than the output (big sources are
+    # downscaled with a proper filter here; ``perspective`` only interpolates).
+    shrink = min(1.0, width / (box_w * aspect_x), height / (box_h * aspect_y))
+    scaled_w = max(2, min(width, 2 * round(box_w * aspect_x * shrink / 2)))  # even: 4:2:0 padding
+    scaled_h = max(2, min(height, 2 * round(box_h * aspect_y * shrink / 2)))
+    fx, fy = scaled_w / box_w, scaled_h / box_h
+    # Resample the view at the source's own density (the widest view), at most the output size.
+    density = min(1.0, max(r[1] - r[0] for r in rects) * fx / width)
+    view_w, view_h = min(width, _even_ceil(width * density)), min(height, _even_ceil(height * density))
+    full_w = max(view_w, min(scaled_w + _KB_EDGE, width) if scaled_w < width else scaled_w)
+    full_h = max(view_h, min(scaled_h + _KB_EDGE, height) if scaled_h < height else scaled_h)
+
+    def corners(rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        # ``perspective`` maps output pixel i to x0 + i*(x1-x0)/frame_w (pixel indices,
+        # not centres): the view's pixel pitch is sx, the quad extends over the whole
+        # frame, and x0 moves by half a pixel of the scale difference so pixel
+        # centres line up (a pure zoom stays centred).
+        x0, x1 = (rect[0] - left) * fx, (rect[1] - left) * fx
+        y0, y1 = (rect[2] - top) * fy, (rect[3] - top) * fy
+        sx, sy = (x1 - x0) / view_w, (y1 - y0) / view_h
+        x0 += 0.5 * sx - 0.5
+        y0 += 0.5 * sy - 0.5
+        return x0, x0 + full_w * sx, y0, y0 + full_h * sy
+
+    # The same curve as ``view`` as FFmpeg expressions of the frame number.
+    # ``in`` counts input frames from 1 in ``perspective``, so frame n is ``in - 1``.
+    ease = _ease(f"min(max((in-1)/{frames},0),1)")
+    zoom = f"({_f(zoom_from)}+{_f(zoom_delta)}*{ease})"
+    x = f"(({_f(cover_w, 4)}*{zoom}-{width})/2"
+    y = f"(({_f(cover_h, 4)}*{zoom}-{height})/2"
+    x += f"+{_f(dir_x * travel_x, 4)}*({ease}-0.5))" if dir_x else ")"
+    y += f"+{_f(dir_y * travel_y, 4)}*({ease}-0.5))" if dir_y else ")"
+    x = f"min(max({x},0),{_f(cover_w, 4)}*{zoom}-{width})"
+    y = f"min(max({y},0),{_f(cover_h, 4)}*{zoom}-{height})"
+    gx = fx / (cover * aspect_x)  # scaled-box px per (output px / zoom)
+    gy = fy / (cover * aspect_y)
+    x0 = f"({_f(gx, 9)}*({x}+{_f(0.5 * width / view_w, 9)})/{zoom}-{_f(left * fx + 0.5, 6)})"
+    y0 = f"({_f(gy, 9)}*({y}+{_f(0.5 * height / view_h, 9)})/{zoom}-{_f(top * fy + 0.5, 6)})"
+    x1 = f"({x0}+{_f(gx * width * full_w / view_w, 6)}/{zoom})"
+    y1 = f"({y0}+{_f(gy * height * full_h / view_h, 6)}/{zoom})"
+    return _ShotGeometry(
+        box=(left, top, box_w, box_h),
+        scaled=(scaled_w, scaled_h),
+        view=(view_w, view_h),
+        frame=(full_w, full_h),
+        corners=(x0, x1, y0, y1),
+        views=[corners(r) for r in rects],
+    )
+
+
 def _shot_chain(index: int, plan: _ShotPlan, spec: RenderSpec) -> str:
     fps, width, height = spec.fps, spec.width, spec.height
     seconds = plan.frames / fps
-    cover_w, cover_h = _cover_size(plan.clip, width, height)
-    u = f"min(max(t/{_f(seconds)},0),1)"
-    ease = _ease(u)
-    zoom = f"({_f(plan.zoom_from)}+{_f(plan.zoom_to - plan.zoom_from)}*{ease})"
-    scaled_w = f"ceil({_f(cover_w, 3)}*{zoom})"
-    scaled_h = f"ceil({_f(cover_h, 3)}*{zoom})"
-    dir_x, dir_y, travel_x, travel_y = _pan_travel(plan.shot.pan, seconds, width, height)
-    x = f"({scaled_w}-{width})/2"
-    y = f"({scaled_h}-{height})/2"
-    if dir_x:
-        x += f"+{dir_x * travel_x:.3f}*({ease}-0.5)"
-    if dir_y:
-        y += f"+{dir_y * travel_y:.3f}*({ease}-0.5)"
-    x = f"min(max({x},0),{scaled_w}-{width})"
-    y = f"min(max({y},0),{scaled_h}-{height})"
+    geometry = _shot_geometry(plan, spec)
+    frame_w, frame_h = plan.clip.frame_size
+    box_x, box_y, box_w, box_h = geometry.box
+    scaled_w, scaled_h = geometry.scaled
+    view_w, view_h = geometry.view
+    full_w, full_h = geometry.frame
+    matrix = plan.clip.color_matrix
+    x0, x1, y0, y1 = geometry.corners
+    flags = "bicubic+full_chroma_int+accurate_rnd"
 
     parts = ["setpts=PTS-STARTPTS"]
     if abs(plan.speed - 1.0) > 1e-3:
@@ -648,14 +785,35 @@ def _shot_chain(index: int, plan: _ShotPlan, spec: RenderSpec) -> str:
         f"tpad=stop_mode=clone:stop_duration={_f(seconds + 1, 3)}",
         f"trim=end_frame={plan.frames}",
         "setpts=PTS-STARTPTS",
-        f"scale=w='{scaled_w}':h='{scaled_h}':eval=frame:flags=bicubic+full_chroma_int+accurate_rnd"
-        f":in_color_matrix={plan.clip.color_matrix}",
-        # ``crop`` must follow the per-frame ``scale`` directly: it clamps x/y to its
-        # *input link* size, and a filter in between (e.g. ``format``) keeps the
-        # first frame's size on its output link, which pinned zoom-ins to the
-        # top-left corner and stalled pans. ``format=gbrp`` after the crop still
-        # makes the scaler output planar RGB (crop passes formats through).
-        f"crop=w={width}:h={height}:x='{x}':y='{y}'",
+    ]
+    if (box_x, box_y, box_w, box_h) != (0, 0, frame_w, frame_h):
+        # Whole-pixel crop to what the move ever shows (cheap: a pointer offset), so
+        # a landscape source is not upscaled in full only to throw most of it away.
+        parts.append(f"crop=w={box_w}:h={box_h}:x={box_x}:y={box_y}:exact=1")
+    parts += [
+        f"scale=w={scaled_w}:h={scaled_h}:flags={flags}:in_color_matrix={matrix}:out_color_matrix={matrix}",
+        f"format={_KB_PIXFMT}",
+    ]
+    if (scaled_w, scaled_h) != (full_w, full_h):
+        # Repeat the edge pixels a little, so interpolation at the box edge never
+        # pulls in black (the view never reaches further than the kernel radius).
+        edge_w, edge_h = min(full_w, scaled_w + _KB_EDGE), min(full_h, scaled_h + _KB_EDGE)
+        parts += [
+            f"pad=w={edge_w}:h={edge_h}:x=0:y=0",
+            f"fillborders=right={edge_w - scaled_w}:bottom={edge_h - scaled_h}:mode=smear",
+        ]
+        if (edge_w, edge_h) != (full_w, full_h):
+            parts.append(f"pad=w={full_w}:h={full_h}:x=0:y=0")
+    # Sub-pixel zoom/pan: the view's corners are evaluated per frame and the image
+    # is resampled with cubic interpolation.
+    parts.append(
+        f"perspective=x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}'"
+        f":interpolation={_KB_INTERP}:eval=frame"
+    )
+    if (view_w, view_h) != (full_w, full_h):
+        parts.append(f"crop=w={view_w}:h={view_h}:x=0:y=0")
+    parts += [
+        f"scale=w={width}:h={height}:flags={flags}:in_color_matrix={matrix}",
         "format=gbrp",
     ]
     if plan.shot.hflip:
@@ -692,6 +850,7 @@ def _build_filtergraph(
     audio: _AudioInfo,
     audio_index: int,
     post_steps: Sequence[_PostStep],
+    audio_gain_db: float = 0.0,
 ) -> str:
     chains = [_shot_chain(i, plan, spec) for i, plan in enumerate(plans)]
     fps = spec.fps
@@ -748,6 +907,16 @@ def _build_filtergraph(
     ]
     chains.append(f"[{current}]" + ",".join(pending) + "[vout]")
 
+    audio_parts = _audio_chain(spec, audio)
+    if audio_gain_db < 0:
+        # Pure linear gain (no limiter): keeps the AAC encode from clipping on hot masters.
+        audio_parts.append(f"volume={audio_gain_db:.4f}dB")
+    chains.append(f"[{audio_index}:a:0]" + ",".join(audio_parts) + "[aout]")
+    return ";\n".join(chains)
+
+
+def _audio_chain(spec: RenderSpec, audio: _AudioInfo) -> list[str]:
+    """The song segment as encoded: exact length, short fades, stereo float at the output rate."""
     duration = _f(spec.duration)
     fade_in = max(0.0, min(spec.audio_fade_in, spec.duration / 4))
     fade_out = max(0.0, min(spec.audio_fade_out, spec.duration / 3))
@@ -762,8 +931,38 @@ def _build_filtergraph(
     if fade_out > 0:
         audio_parts.append(f"afade=t=out:st={_f(spec.duration - fade_out)}:d={_f(fade_out)}")
     audio_parts.append(f"aformat=sample_fmts=fltp:sample_rates={audio.sample_rate}:channel_layouts=stereo")
-    chains.append(f"[{audio_index}:a:0]" + ",".join(audio_parts) + "[aout]")
-    return ";\n".join(chains)
+    return audio_parts
+
+
+def _true_peak_dbtp(audio_path: str, start: float, chain: Sequence[str]) -> float | None:
+    """True peak (dBTP, ITU-R BS.1770 via ``ebur128=peak=true``) of the segment exactly as it
+    would be encoded (same input seek and audio chain), or None when it cannot be measured."""
+    cmd = [FFMPEG, "-nostdin", "-hide_banner", "-nostats", "-v", "info"]
+    if start > 0:
+        cmd += ["-ss", _f(start, 6)]
+    measure = "ebur128=peak=true:framelog=quiet:metadata=1,ametadata=mode=print:key=lavfi.r128.true_peak"
+    cmd += ["-i", audio_path, "-vn", "-af", ",".join([*chain, measure]), "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # ``lavfi.r128.true_peak`` is the running maximum over all channels (linear); the last one counts.
+    values = re.findall(rb"lavfi\.r128\.true_peak=([0-9.eE+-]+|inf|-inf|nan)", proc.stderr)
+    if proc.returncode != 0 or not values:
+        return None
+    linear = _float(values[-1].decode())
+    if linear is None or linear < 0:
+        return None
+    return 20 * math.log10(linear) if linear > 0 else -math.inf
+
+
+def _audio_gain_db(audio_path: str, spec: RenderSpec, audio: _AudioInfo) -> float:
+    """Gain (≤ 0 dB) that brings a segment peaking above ``TRUE_PEAK_CEILING_DBTP`` down to it; 0 otherwise."""
+    peak = _true_peak_dbtp(audio_path, spec.audio_start, _audio_chain(spec, audio))
+    if peak is None:
+        logger.warning("could not measure the true peak of %s; encoding without headroom", audio_path)
+        return 0.0
+    return round(TRUE_PEAK_CEILING_DBTP - peak, 4) if peak > TRUE_PEAK_CEILING_DBTP else 0.0
 
 
 # --------------------------------------------------------------------------- running ffmpeg
@@ -928,7 +1127,8 @@ def render_video(spec: RenderSpec, progress_cb: ProgressCallback | None = None) 
     cmd += ["-i", audio_path]
 
     post_steps = _grade_steps(spec.color_grade, work_dir)
-    graph = _build_filtergraph(spec, plans, xfade, ass_path, audio, audio_index, post_steps)
+    audio_gain_db = _audio_gain_db(audio_path, spec, audio)
+    graph = _build_filtergraph(spec, plans, xfade, ass_path, audio, audio_index, post_steps, audio_gain_db)
     (work_dir / "filtergraph.txt").write_text(graph, encoding="utf-8")
     preset = spec.preset if spec.preset in _ALLOWED_PRESETS else DEFAULT_PRESET
     crf = int(_clamp(spec.crf, 0, 51))
@@ -980,4 +1180,5 @@ def render_video(spec: RenderSpec, progress_cb: ProgressCallback | None = None) 
             "finalize": round(finished - encoded, 3),
             "total": round(finished - started, 3),
         },
+        audio_gain_db=audio_gain_db,
     )

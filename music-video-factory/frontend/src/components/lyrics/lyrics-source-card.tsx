@@ -4,6 +4,7 @@ import { ChevronDown, ChevronUp, FileText, ListPlus, Upload } from "lucide-react
 import * as React from "react";
 import { useSWRConfig } from "swr";
 
+import { recordRightsResets } from "@/components/rights/rights-reset";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,7 @@ import { toast } from "@/components/ui/toast";
 import { apiPaths, errorMessage, updateLyrics, uploadLyrics } from "@/lib/api";
 import { LYRICS_EXTENSIONS, MAX_LYRICS_FILE_BYTES } from "@/lib/constants";
 import { formatBytes } from "@/lib/format";
-import type { LyricsFormatInput, LyricsOut, LyricsParseOut } from "@/lib/types";
+import type { LyricsFormatInput, LyricsOut, LyricsParseOut, ProjectOut } from "@/lib/types";
 import { fileExtension } from "@/lib/utils";
 
 const FORMAT_OPTIONS: { value: LyricsFormatInput; label: string }[] = [
@@ -32,6 +33,8 @@ type Pending = { kind: "text" } | { kind: "file"; file: File };
 
 export interface LyricsSourceCardProps {
   projectId: string;
+  /** The project's rights checklist before the change (a changed lyric text un-confirms `lyrics_rights`). */
+  rights: ProjectOut["rights"];
   lyrics: LyricsOut;
   /** True when replacing the lines would discard timing (saved or unsaved). */
   hasTiming: boolean;
@@ -41,9 +44,11 @@ export interface LyricsSourceCardProps {
 
 /**
  * Lyrics text (stored verbatim) and file import. Parsing replaces the line list;
- * the user is asked first when timing would be lost.
+ * the user is asked first when timing would be lost. The parser's notes (excluded section
+ * headings, LRC line ends estimated before an instrumental break, encoding…) are listed under
+ * 「読み込み時の注意」; a withdrawn rights confirmation is shown by the panel instead.
  */
-export function LyricsSourceCard({ projectId, lyrics, hasTiming, onParsed }: LyricsSourceCardProps) {
+export function LyricsSourceCard({ projectId, rights, lyrics, hasTiming, onParsed }: LyricsSourceCardProps) {
   const { mutate } = useSWRConfig();
   const fileInput = React.useRef<HTMLInputElement>(null);
   const [text, setText] = React.useState<string | null>(null);
@@ -66,13 +71,15 @@ export function LyricsSourceCard({ projectId, lyrics, hasTiming, onParsed }: Lyr
         action.kind === "file"
           ? await uploadLyrics(projectId, action.file)
           : await updateLyrics(projectId, { text: value, format });
-      setWarnings(result.warnings);
       setText(null);
       onParsed(result);
       await mutate<LyricsOut>(apiPaths.lyrics(projectId), (current) =>
         current ? { ...current, format: result.format, lines: result.lines } : current,
       );
-      void mutate(apiPaths.project(projectId));
+      // Fresh rights (the lyrics are saved either way, so a failed refetch only skips the reset notice).
+      const project = await mutate<ProjectOut>(apiPaths.project(projectId)).catch(() => undefined);
+      const reset = recordRightsResets(projectId, rights, project?.rights, result.warnings);
+      setWarnings(result.warnings.filter((warning) => !reset.messages.includes(warning)));
       toast.success(`${result.lines.length}行の歌詞を読み込みました`, `形式: ${FORMAT_LABELS[result.format] ?? result.format}`);
     } catch (error) {
       setProblem(errorMessage(error));

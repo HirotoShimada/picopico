@@ -47,6 +47,14 @@ def test_cors_preflight(client: TestClient) -> None:
     assert "access-control-allow-origin" not in denied.headers
 
 
+def test_cors_exposes_the_headers_the_ui_reads(client: TestClient) -> None:
+    """Cross-origin responses only show the browser the headers listed in Access-Control-Expose-Headers:
+    Retry-After of a 429 (Claude storyboard preview limit) must be readable, like the download headers."""
+    response = client.get("/api/health", headers={"Origin": "http://localhost:3000"})
+    exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+    assert {"retry-after", "content-disposition", "content-length"} <= exposed
+
+
 def test_placeholder_routers_are_mounted() -> None:
     from app.main import API_ROUTERS
     from app.routers import analysis, generation, lyrics, videos

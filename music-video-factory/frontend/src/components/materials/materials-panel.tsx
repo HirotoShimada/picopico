@@ -13,15 +13,18 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { FileDropzone } from "@/components/ui/file-dropzone";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/toast";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useLimits } from "@/hooks/use-capabilities";
 import { useClips } from "@/hooks/use-clips";
-import { apiPaths, deleteClip, errorMessage, isAbortError, uploadClips } from "@/lib/api";
+import { apiPaths, deleteClip, errorMessage, isAbortError, isListKey, uploadClips } from "@/lib/api";
 import { MAX_CLIP_FILES_PER_UPLOAD, VIDEO_EXTENSIONS } from "@/lib/constants";
-import { formatBytes, formatDuration, formatPercent } from "@/lib/format";
+import { formatBytes, formatCount, formatDuration, formatPercent } from "@/lib/format";
+import { isClipActive } from "@/lib/status";
 import type { ClipOut, ProjectOut } from "@/lib/types";
 
 import { ClipCard } from "./clip-card";
@@ -53,7 +56,7 @@ function UploadCard({ projectId }: { projectId: string }) {
         signal: abort.signal,
         onProgress: ({ fraction }) => setUpload((current) => (current ? { ...current, fraction } : current)),
       });
-      await mutate<ClipOut[]>(apiPaths.clips(projectId), (current) => [...created, ...(current ?? [])], { revalidate: true });
+      await mutate<ClipOut[]>(isListKey(apiPaths.clips(projectId)), (current) => [...created, ...(current ?? [])], { revalidate: true });
       void mutate(apiPaths.project(projectId));
       toast.success(`${created.length}本の素材を追加しました`);
     } catch (error) {
@@ -127,10 +130,14 @@ function UploadCard({ projectId }: { projectId: string }) {
   );
 }
 
-/** Tab 「素材」: video materials (uploaded and generated) with upload, preview and delete. */
+/**
+ * Tab 「素材」: video materials (uploaded and generated) with upload, preview and delete. Cancelled clips
+ * (generation stopped) are hidden unless 「キャンセル済みを表示」 is on.
+ */
 export function MaterialsPanel({ project }: { project: ProjectOut }) {
   const { mutate } = useSWRConfig();
-  const { data: clips, error, isLoading, mutate: reload } = useClips(project.id);
+  const [showCancelled, setShowCancelled] = React.useState(false);
+  const { data: clips, error, isLoading, mutate: reload } = useClips(project.id, { include_cancelled: showCancelled ? undefined : false });
   const [filter, setFilter] = React.useState<Filter>("all");
   const [previewId, setPreviewId] = React.useState<string | null>(null);
   const [deleting, setDeleting] = React.useState<ClipOut | null>(null);
@@ -153,13 +160,16 @@ export function MaterialsPanel({ project }: { project: ProjectOut }) {
   }, [clips, filter]);
 
   const preview = previewId ? (clips?.find((clip) => clip.id === previewId) ?? null) : null;
+  // Cancelled clips left out of the list (the project counts every clip; skipped while clips are in flux).
+  const hiddenCancelled =
+    !showCancelled && clips && !clips.some((clip) => isClipActive(clip.status)) ? Math.max(0, project.counts.clips - clips.length) : 0;
 
   async function confirmDelete() {
     if (!deleting) return;
     const target = deleting;
     try {
       await deleteClip(target.id);
-      await mutate<ClipOut[]>(apiPaths.clips(project.id), (current) => current?.filter((clip) => clip.id !== target.id), {
+      await mutate<ClipOut[]>(isListKey(apiPaths.clips(project.id)), (current) => current?.filter((clip) => clip.id !== target.id), {
         revalidate: false,
       });
       void mutate(apiPaths.project(project.id));
@@ -181,6 +191,18 @@ export function MaterialsPanel({ project }: { project: ProjectOut }) {
           <Skeleton key={index} className="aspect-[9/16] w-full" />
         ))}
       </div>
+    );
+  } else if (clips.length === 0 && hiddenCancelled > 0) {
+    body = (
+      <EmptyState
+        title="表示できる素材はありません"
+        description={`生成がキャンセルされた素材 ${formatCount(hiddenCancelled)} 本は非表示にしています。`}
+        action={
+          <Button variant="secondary" size="sm" onClick={() => setShowCancelled(true)}>
+            キャンセル済みを表示
+          </Button>
+        }
+      />
     );
   } else if (clips.length === 0) {
     body = (
@@ -231,9 +253,20 @@ export function MaterialsPanel({ project }: { project: ProjectOut }) {
               生成 {counts.generated}
             </ToggleGroupItem>
           </ToggleGroup>
-          {clips && clips.length > 0 ? (
-            <span className="text-xs text-muted-foreground tabular">利用可能な素材の合計 {formatDuration(counts.seconds)}</span>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            {clips && clips.length > 0 ? (
+              <span className="text-xs text-muted-foreground tabular">利用可能な素材の合計 {formatDuration(counts.seconds)}</span>
+            ) : null}
+            <div className="flex items-center gap-2">
+              <Switch id="materials-show-cancelled" checked={showCancelled} onCheckedChange={setShowCancelled} />
+              <Label htmlFor="materials-show-cancelled" className="text-xs font-normal text-muted-foreground">
+                キャンセル済みを表示
+              </Label>
+              {hiddenCancelled > 0 ? (
+                <span className="text-2xs text-subtle-foreground tabular">キャンセル済み {formatCount(hiddenCancelled)} 本を非表示</span>
+              ) : null}
+            </div>
+          </div>
         </div>
         {body}
       </div>
@@ -245,6 +278,7 @@ export function MaterialsPanel({ project }: { project: ProjectOut }) {
               アップロードした素材は、生成設定でプロバイダー「アップロード素材」を選ぶと、ビートに合わせて切り替わる映像として使われます（AI 生成の費用はかかりません）。
             </li>
             <li>AI で生成したクリップもここに追加され、同じ条件の次回以降の生成で再利用されます。</li>
+            <li>「N本で使用」は、その素材を使っている動画の本数です（キャンセルした動画は数えません）。</li>
             <li>横長の素材は 9:16 に切り抜いて使われます。縦長の素材がおすすめです。</li>
           </ul>
           {counts.readyUploads === 0 && clips ? (

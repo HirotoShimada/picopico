@@ -164,4 +164,5 @@ export const DEFAULT_GENERATION_SETTINGS: GenerationSettings = {
   max_new_clips: null,
   budget_limit_usd: null,
   seed: null,
+  allow_mirror: false,
 };

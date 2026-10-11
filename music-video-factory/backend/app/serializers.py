@@ -78,9 +78,11 @@ def video_clip_ids(plan: dict[str, Any] | None) -> set[str]:
 
 
 def clip_usage_counts(db: Session, project_id: str) -> Counter[str]:
-    """clip_id → number of videos of the project whose plan uses it."""
+    """clip_id → number of videos of the project whose plan uses it (cancelled videos do not count)."""
     usage: Counter[str] = Counter()
-    for plan in db.scalars(select(Video.plan).where(Video.project_id == project_id)):
+    for plan in db.scalars(
+        select(Video.plan).where(Video.project_id == project_id, Video.status != VideoStatus.CANCELLED)
+    ):
         usage.update(video_clip_ids(plan))
     return usage
 

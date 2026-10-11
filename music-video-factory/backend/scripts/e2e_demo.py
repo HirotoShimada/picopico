@@ -8,10 +8,12 @@
 
 Flow: health → create project → upload demo song → wait for analysis → Whisper
 check (503 expected without a local model) → lyrics (demo TXT) → heuristic
-auto-time → rights → upload the 3 demo clips → estimate → batch A (mock, 3 ×
-15 s, lyric style "auto" so the styles differ) → batch B (library, 3 × 15 s) →
-edit one video (style + lyric timing offset + clip swap) and wait for the
-re-render → download every MP4 and both ZIPs → validate each file with ffprobe
+auto-time → rights (then re-saving the same lyrics must keep ids, timing and
+rights) → upload the 3 demo clips → estimate → batch A (mock, 3 × 15 s, lyric
+style "auto" so the styles differ) → batch B (library, 3 × 15 s) → edit one
+video (style + lyric timing offset + clip swap) and wait for the re-render →
+download every MP4 and both ZIPs (batch A through its signed zip-link without
+the API token, batch B through the API) → validate each file with ffprobe
 (1080×1920, H.264, 30 fps, AAC, 15.0 s) and cross-correlate its audio with the
 source song segment → summary table. Exits 1 on any failed check.
 
@@ -260,13 +262,29 @@ def download(api: Api, video_id: str, dest: Path, checks: Checks, expected_name:
     return dest
 
 
-def download_zip(api: Api, batch_id: str, dest: Path, files: list[Path], checks: Checks) -> None:
-    with api.client.stream("GET", f"/api/batches/{batch_id}/zip") as response:
-        if response.status_code != 200:
-            raise E2EFailure(f"zip {batch_id} → {response.status_code}")
-        with dest.open("wb") as fh:
-            for chunk in response.iter_bytes():
-                fh.write(chunk)
+def download_zip(
+    api: Api, batch_id: str, dest: Path, files: list[Path], checks: Checks, *, signed_link: bool = False
+) -> None:
+    """The batch ZIP via ``GET /api/batches/{id}/zip`` or, with ``signed_link``, via the signed
+    ``POST /api/batches/{id}/zip-link`` URL fetched like a browser would: without the API token."""
+    if signed_link:
+        link = api.call("POST", f"/api/batches/{batch_id}/zip-link")
+        log(f"zip link for {batch_id[:8]}: …{link['url'][-40:]} (expires {link['expires_at']})")
+        anonymous = httpx.Client(timeout=api.client.timeout)
+        request = anonymous.stream("GET", link["url"])
+    else:
+        anonymous = None
+        request = api.client.stream("GET", f"/api/batches/{batch_id}/zip")
+    try:
+        with request as response:
+            if response.status_code != 200:
+                raise E2EFailure(f"zip {batch_id} → {response.status_code}")
+            with dest.open("wb") as fh:
+                for chunk in response.iter_bytes():
+                    fh.write(chunk)
+    finally:
+        if anonymous is not None:
+            anonymous.close()
     with zipfile.ZipFile(dest) as archive:
         checks.expect(archive.testzip() is None, f"zip {dest.name}: CRC error")
         digests = sorted(hashlib.sha256(archive.read(n)).hexdigest() for n in archive.namelist())
@@ -432,6 +450,18 @@ def main() -> int:
             f"batch before rights → {guard.status_code} {guard.text[:120]}",
         )
         api.call("PUT", f"/api/projects/{pid}/rights", json={"items": dict.fromkeys(RIGHTS, True)})
+        # Re-saving the same lyrics keeps line ids, timing and the confirmed rights (only new text resets them).
+        resaved = api.call(
+            "PUT",
+            f"/api/projects/{pid}/lyrics",
+            json={"text": (DEMO_DIR / "demo_lyrics_ja.txt").read_text(encoding="utf-8")},
+        )
+        checks.expect(resaved["lines"] == timed["lines"], "re-saved lyrics lost their ids or timing")
+        checks.expect(resaved["warnings"] == [], f"re-saved lyrics warnings {resaved['warnings']}")
+        checks.expect(
+            api.call("GET", f"/api/projects/{pid}")["rights_confirmed_at"] is not None,
+            "re-saving identical lyrics reset the rights checklist",
+        )
         guard = api.client.post(f"/api/projects/{pid}/batches", json={"provider": "veo"})
         if not next(p for p in caps["providers"] if p["id"] == "veo")["configured"]:
             checks.expect(
@@ -494,7 +524,12 @@ def main() -> int:
         reports += collect(api, batch_a, "A", out, checks, artist, title)
         reports += collect(api, batch_b, "B", out, checks, artist, title)
         download_zip(
-            api, batch_a["id"], out / "batch_A.zip", [r.file for r in reports if r.label == "A" and r.file], checks
+            api,
+            batch_a["id"],
+            out / "batch_A.zip",
+            [r.file for r in reports if r.label == "A" and r.file],
+            checks,
+            signed_link=True,
         )
         download_zip(
             api, batch_b["id"], out / "batch_B.zip", [r.file for r in reports if r.label == "B" and r.file], checks

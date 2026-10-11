@@ -15,11 +15,17 @@ world-bible location). Scenes with ``has_subject=False`` are atmosphere
 B-roll without people, which keeps a batch visually varied and is the safest
 material for likeness rules.
 
-Colour grades are *colour-only* point filters (``eq``, ``colorbalance``,
-``colortemperature``, ``curves``, ``hue``, ``vibrance``): vignette and film
-grain are added per grade by the renderer, and runs of point filters are
-baked into a single 3D LUT there, so keeping grades position-independent
-keeps rendering fast.
+Colour grades are *colour-only* point filters that work in RGB
+(``colorchannelmixer`` for saturation, ``colorbalance`` for mid-tone and
+highlight tints, ``colortemperature``, ``vibrance`` and monotone ``curves``):
+vignette and film grain are added per grade by the renderer, and runs of point
+filters are baked into a single 3D LUT there, so keeping grades
+position-independent keeps rendering fast. Grades keep shadow detail: tone
+curves use ``interp=pchip`` (no spline undershoot below black) with a toe
+slope of at least ~0.6, shadows are tinted by lifting channels instead of
+pulling them under black, and ``eq``/``hue`` (an 8-bit YUV round trip, pivoting
+contrast around mid-grey) are not used — on a grey ramp, adjacent input codes
+0–40 stay distinguishable (regression-tested).
 """
 
 from __future__ import annotations
@@ -330,21 +336,38 @@ SECTION_LABELS_JA: dict[str, str] = {
 
 # --- colour grades ---------------------------------------------------------------------
 
+
+def _saturation(amount: float) -> str:
+    """``colorchannelmixer`` that scales chroma around Rec.709 luma (exact, in RGB; 1 = unchanged)."""
+    kr, kg, kb = 0.2126, 0.7152, 0.0722
+    inv = 1.0 - amount
+
+    def c(value: float) -> str:
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+
+    return (
+        f"colorchannelmixer=rr={c(kr + (1 - kr) * amount)}:rg={c(kg * inv)}:rb={c(kb * inv)}"
+        f":gr={c(kr * inv)}:gg={c(kg + (1 - kg) * amount)}:gb={c(kb * inv)}"
+        f":br={c(kr * inv)}:bg={c(kg * inv)}:bb={c(kb + (1 - kb) * amount)}"
+    )
+
+
 COLOR_GRADES: dict[str, ColorGrade] = {
     "natural": {
         "name": "ナチュラル",
         "name_en": "Natural",
         "description_ja": "色を整える程度の自然な補正",
-        "ffmpeg_filter": "eq=contrast=1.03:saturation=1.04,curves=m='0/0 0.25/0.235 0.75/0.765 1/1'",
+        "ffmpeg_filter": f"{_saturation(1.05)},curves=interp=pchip:m='0/0 0.25/0.235 0.75/0.775 1/1'",
     },
     "teal_orange": {
         "name": "ティール＆オレンジ",
         "name_en": "Teal & Orange",
         "description_ja": "影は青緑、肌とハイライトは暖色の映画的な配色",
         "ffmpeg_filter": (
-            "colorbalance=rs=-0.07:gs=-0.01:bs=0.09:rm=0.02:bm=-0.03:rh=0.07:gh=0.02:bh=-0.07,"
-            "eq=contrast=1.06:saturation=1.1,"
-            "curves=m='0/0 0.25/0.22 0.75/0.78 1/1'"
+            "colorbalance=rm=0.04:bm=-0.06:rh=0.07:gh=0.02:bh=-0.07,"
+            f"{_saturation(1.14)},"
+            "curves=interp=pchip:r='0/0 0.2/0.15 0.5/0.5 1/1':g='0/0.01 0.5/0.5 1/1'"
+            ":b='0/0.04 0.2/0.25 0.5/0.48 1/0.96':m='0/0 0.12/0.09 0.25/0.21 0.75/0.8 1/1'"
         ),
     },
     "warm_film": {
@@ -353,8 +376,8 @@ COLOR_GRADES: dict[str, ColorGrade] = {
         "description_ja": "黒が少し浮いた暖かいフィルム調",
         "ffmpeg_filter": (
             "colortemperature=temperature=5200:mix=0.55:pl=0.6,"
-            "curves=r='0/0.05 0.5/0.53 1/0.97':g='0/0.04 0.5/0.5 1/0.95':b='0/0.06 0.5/0.46 1/0.88',"
-            "eq=saturation=0.93"
+            "curves=interp=pchip:r='0/0.05 0.5/0.53 1/0.97':g='0/0.04 0.5/0.5 1/0.95':b='0/0.06 0.5/0.46 1/0.88',"
+            f"{_saturation(0.93)}"
         ),
     },
     "cool_night": {
@@ -363,34 +386,43 @@ COLOR_GRADES: dict[str, ColorGrade] = {
         "description_ja": "青みの強い夜の空気感。影を締めて静けさを出す",
         "ffmpeg_filter": (
             "colortemperature=temperature=9000:mix=0.45:pl=0.5,"
-            "curves=r='0/0 0.5/0.47 1/0.96':g='0/0.01 0.5/0.49 1/0.98':b='0/0.04 0.5/0.54 1/1',"
-            "eq=saturation=0.88:contrast=1.05"
+            "curves=interp=pchip:r='0/0 0.5/0.47 1/0.96':g='0/0.01 0.5/0.49 1/0.98':b='0/0.04 0.5/0.54 1/1'"
+            ":m='0/0 0.12/0.085 0.5/0.49 1/1',"
+            f"{_saturation(0.86)}"
         ),
     },
     "bleach_bypass": {
         "name": "ブリーチバイパス",
         "name_en": "Bleach Bypass",
         "description_ja": "低彩度・高コントラストの硬質なルック",
-        "ffmpeg_filter": "eq=saturation=0.5:contrast=1.18,curves=m='0/0 0.2/0.13 0.5/0.5 0.8/0.87 1/1'",
+        "ffmpeg_filter": (
+            f"{_saturation(0.5)},curves=interp=pchip:m='0/0 0.157/0.094 0.333/0.24 0.5/0.5 0.667/0.76 0.843/0.906 1/1'"
+        ),
     },
     "faded_pastel": {
         "name": "フェードパステル",
         "name_en": "Faded Pastel",
         "description_ja": "淡く褪せたパステル調。柔らかく軽い印象",
-        "ffmpeg_filter": ("eq=saturation=0.78,colorbalance=rh=0.04:bh=0.03:gs=-0.02,curves=m='0/0.1 0.5/0.56 1/0.94'"),
+        "ffmpeg_filter": (
+            f"{_saturation(0.78)},colorbalance=rh=0.04:bh=0.03,"
+            "curves=interp=pchip:g='0/0 0.1/0.085 0.3/0.3 1/1':m='0/0.1 0.5/0.56 1/0.94'"
+        ),
     },
     "mono_noir": {
         "name": "モノクロノワール",
         "name_en": "Mono Noir",
         "description_ja": "コントラストの強いモノクロ",
-        "ffmpeg_filter": "hue=s=0,curves=m='0/0 0.25/0.16 0.5/0.47 0.75/0.83 1/1'",
+        "ffmpeg_filter": (
+            f"{_saturation(0.0)},curves=interp=pchip:m='0/0 0.12/0.075 0.25/0.165 0.5/0.47 0.75/0.83 1/1'"
+        ),
     },
     "vivid": {
         "name": "ビビッド",
         "name_en": "Vivid",
         "description_ja": "鮮やかで抜けの良い発色",
         "ffmpeg_filter": (
-            "vibrance=intensity=0.25,eq=saturation=1.12:contrast=1.05,curves=m='0/0 0.25/0.23 0.75/0.78 1/1'"
+            f"vibrance=intensity=0.25,{_saturation(1.12)},"
+            "curves=interp=pchip:m='0/0 0.1/0.085 0.25/0.225 0.75/0.79 1/1'"
         ),
     },
     "golden_hour": {
@@ -400,7 +432,7 @@ COLOR_GRADES: dict[str, ColorGrade] = {
         "ffmpeg_filter": (
             "colortemperature=temperature=4300:mix=0.45:pl=0.7,"
             "colorbalance=rh=0.05:gh=0.03:bh=-0.05:bs=0.03,"
-            "eq=saturation=1.06,curves=m='0/0.02 0.5/0.52 1/0.98'"
+            f"{_saturation(1.06)},curves=interp=pchip:m='0/0.02 0.5/0.52 1/0.98'"
         ),
     },
     "neon_night": {
@@ -408,9 +440,10 @@ COLOR_GRADES: dict[str, ColorGrade] = {
         "name_en": "Neon Night",
         "description_ja": "マゼンタとシアンが映える夜の街のルック",
         "ffmpeg_filter": (
-            "colorbalance=rs=0.04:gs=-0.03:bs=0.1:rm=0.05:gm=-0.05:bm=0.04:rh=0.03:bh=0.05,"
-            "eq=saturation=1.18:contrast=1.07,"
-            "curves=m='0/0 0.3/0.25 0.7/0.74 1/1'"
+            "colorbalance=rm=0.05:gm=-0.05:rh=0.03:bh=0.05,"
+            f"{_saturation(1.3)},"
+            "curves=interp=pchip:r='0/0.025 0.15/0.16 0.5/0.5 1/1':g='0/0 0.15/0.135 0.5/0.5 1/1'"
+            ":b='0/0.05 0.15/0.19 0.5/0.49 1/1':m='0/0 0.12/0.09 0.3/0.245 0.7/0.765 1/1'"
         ),
     },
     "forest_moody": {
@@ -418,9 +451,10 @@ COLOR_GRADES: dict[str, ColorGrade] = {
         "name_en": "Moody Forest",
         "description_ja": "深い緑と落ち着いた陰影",
         "ffmpeg_filter": (
-            "colorbalance=rs=-0.03:gs=0.04:bs=0.02:gm=0.03:rh=0.03:bh=-0.02,"
-            "eq=saturation=0.86:contrast=1.06,"
-            "curves=m='0/0.02 0.25/0.21 0.75/0.75 1/0.97'"
+            "colorbalance=gm=0.04:rh=0.03:bh=-0.02,"
+            f"{_saturation(0.86)},"
+            "curves=interp=pchip:r='0/0 0.15/0.125 0.5/0.49 1/1':g='0/0.03 0.15/0.17 0.5/0.5 1/1'"
+            ":b='0/0.02 0.15/0.16 0.5/0.49 1/1':m='0/0.02 0.12/0.095 0.25/0.195 0.75/0.775 1/0.97'"
         ),
     },
     "lavender_haze": {
@@ -428,7 +462,8 @@ COLOR_GRADES: dict[str, ColorGrade] = {
         "name_en": "Lavender Haze",
         "description_ja": "淡い紫がかった霞のような夢見心地の色",
         "ffmpeg_filter": (
-            "colorbalance=rs=0.04:bs=0.08:gm=-0.03:rh=0.03:bh=0.05,eq=saturation=0.85,curves=m='0/0.08 0.5/0.55 1/0.96'"
+            "colorbalance=rs=0.04:bs=0.08:gm=-0.03:rh=0.03:bh=0.05,"
+            f"{_saturation(0.85)},curves=interp=pchip:m='0/0.08 0.5/0.55 1/0.96'"
         ),
     },
 }

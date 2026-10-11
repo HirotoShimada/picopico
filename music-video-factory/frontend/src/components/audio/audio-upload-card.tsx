@@ -4,6 +4,8 @@ import { FileAudio, Music, Replace, X } from "lucide-react";
 import * as React from "react";
 import { useSWRConfig } from "swr";
 
+import { recordRightsResets } from "@/components/rights/rights-reset";
+import { RightsResetNotice } from "@/components/rights/rights-reset-notice";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -79,7 +81,12 @@ export function AudioUploadCard({ project }: { project: ProjectOut }) {
       void mutate(apiPaths.analysis(project.id));
       void mutate(apiPaths.projects);
       setReplacing(false);
-      toast.success(audio ? "音源を差し替えました" : "音源をアップロードしました", "楽曲解析を開始しました。");
+      // A new song un-confirms 「音源の権利」 (shown below and on the 権利確認 tab until confirmed again).
+      const rightsReset = recordRightsResets(project.id, project.rights, updated.rights, updated.warnings ?? []).keys.length > 0;
+      toast.success(
+        audio ? "音源を差し替えました" : "音源をアップロードしました",
+        rightsReset ? "楽曲解析を開始しました。権利確認の「音源の権利」を確認し直してください。" : "楽曲解析を開始しました。",
+      );
     } catch (error) {
       if (isAbortError(error)) toast({ title: "アップロードを中止しました" });
       else setProblems([errorMessage(error)]);
@@ -109,6 +116,7 @@ export function AudioUploadCard({ project }: { project: ProjectOut }) {
         ) : null}
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
+        <RightsResetNotice project={project} keys={["audio_rights"]} />
         {audio ? (
           <div className="flex items-start gap-3 rounded-md border border-border bg-surface-raised p-3">
             <div className="flex size-9 shrink-0 items-center justify-center rounded-md border border-border bg-surface">
@@ -146,7 +154,7 @@ export function AudioUploadCard({ project }: { project: ProjectOut }) {
           <>
             {audio ? (
               <Alert tone="warning">
-                差し替えると楽曲解析をやり直します。生成中のジョブがある間は差し替えできません。歌詞と素材はそのまま残ります。
+                差し替えると楽曲解析をやり直し、権利確認の「音源の権利」も確認し直しになります。生成中のジョブがある間は差し替えできません。歌詞と素材はそのまま残ります。
               </Alert>
             ) : null}
             <FileDropzone

@@ -1,7 +1,8 @@
 """Dashboard summary (ARCHITECTURE.md §5.1), scoped to the current user.
 
-Usage figures come from ``CostRecord`` rows: ``clips_generated``/``clips_reused``
-count ``video_generation`` records without/with ``cached``; ``saved_usd`` is
+Usage figures come from the user's ``CostRecord`` rows (by ``owner_id``, so deleting
+a project never lowers them): ``clips_generated``/``clips_reused`` count
+``video_generation`` records without/with ``cached``; ``saved_usd`` is
 Σ ``units × unit_price_usd`` over cached records (spend avoided by reuse).
 """
 
@@ -95,6 +96,8 @@ def get_dashboard(db: DbSession, user: CurrentUser) -> DashboardOut:
         .limit(RECENT_VIDEOS_LIMIT)
     ).all()
 
+    # By owner, not via projects: the records of deleted projects still count (their project_id is NULL).
+    own_costs = CostRecord.owner_id == user.id
     is_generation = CostRecord.kind == CostKind.VIDEO_GENERATION
     generated = case((is_generation & CostRecord.cached.is_(False), 1), else_=0)
     reused = case((is_generation & CostRecord.cached.is_(True), 1), else_=0)
@@ -109,14 +112,12 @@ def get_dashboard(db: DbSession, user: CurrentUser) -> DashboardOut:
             func.coalesce(func.sum(saved), 0.0),
         )
         .select_from(CostRecord)
-        .join(Project, Project.id == CostRecord.project_id)
-        .where(owned)
+        .where(own_costs)
     ).one()
     provider_amount = func.coalesce(func.sum(CostRecord.amount_usd), 0.0)
     provider_rows = db.execute(
         select(CostRecord.provider, provider_amount, func.coalesce(func.sum(generated), 0))
-        .join(Project, Project.id == CostRecord.project_id)
-        .where(owned)
+        .where(own_costs)
         .group_by(CostRecord.provider)
         .order_by(provider_amount.desc(), CostRecord.provider)
     ).all()

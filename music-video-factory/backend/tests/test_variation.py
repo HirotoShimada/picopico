@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from app import schemas
+from app.services import variation
 from app.services.errors import ServiceError
 from app.services.presets import COLOR_GRADES, WORLD_PRESETS
 from app.services.storyboard import generate_storyboard
@@ -392,9 +393,84 @@ def test_existing_clip_duration_bounds_in_points() -> None:
 def test_low_variety_warning() -> None:
     result = plan(settings=settings(count=30, reuse="economy", max_new_clips=2))
     assert result["stats"]["variety_score"] < 0.35
-    assert result["stats"]["variety_warning"] == VARIETY_WARNING_JA
+    assert result["stats"]["variety_warning"].startswith(VARIETY_WARNING_JA)
     rich = plan(settings=settings(count=3, reuse="max_variety"))
     assert rich["stats"]["variety_score"] == 1.0 and rich["stats"]["variety_warning"] is None
+
+
+def _advice(**kwargs: Any) -> str:
+    result = plan(**kwargs)
+    warning = result["stats"]["variety_warning"]
+    assert result["stats"]["variety_score"] < 0.35 and warning is not None
+    assert warning.startswith(VARIETY_WARNING_JA)
+    return warning.removeprefix(VARIETY_WARNING_JA)
+
+
+def test_variety_warning_names_the_actual_cause() -> None:
+    # Regression: the warning always told the user to change the reuse setting, even when
+    # that could not help (library uploads, a max_new_clips cap, the pool limit).
+    library = _advice(
+        settings=settings(provider="library", model=None, count=10, reuse="balanced"), storyboard=None,
+        existing_clips=[{"id": "u1", "duration": 3.0, "source": "upload"}, {"id": "u2", "duration": 2.5, "source": "upload"}],
+    )  # fmt: skip
+    assert "アップロード素材が 2 本" in library and "追加でアップロード" in library and "再利用設定" not in library
+
+    capped = _advice(settings=settings(count=30, reuse="balanced", max_new_clips=2))
+    assert "新規生成の上限（2 本）" in capped and "引き上げる" in capped
+    assert "再利用設定" not in capped and "アップロード" not in capped
+
+    economy = _advice(settings=settings(count=30, reuse="economy"), provider_clip_duration=2.0)
+    assert economy == "再利用設定が「節約」です。「バランス」か「バリエーション重視」にすると改善します。"
+
+    crowded = _advice(
+        settings=settings(count=50, reuse="max_variety", duration_sec=90), analysis=make_analysis(duration=180),
+        provider_clip_duration=2.0,
+    )  # fmt: skip
+    assert f"上限（{MAX_POOL} 本）" in crowded and "本数を減らす" in crowded and "再利用設定" not in crowded
+
+    few_scenes = _advice(settings=settings(count=30, reuse="balanced", max_new_clips=3), storyboard=storyboard(n_scenes=2))
+    assert "新規生成の上限（3 本）" in few_scenes and "絵コンテのシーンが 2 個" in few_scenes
+
+
+def test_no_mirroring_unless_allowed() -> None:
+    # Regression: shots were flipped by default, turning text in the footage into mirror writing.
+    conf = settings(count=12, reuse="economy")
+    assert "allow_mirror" not in conf or conf["allow_mirror"] is False
+    shots = [s for v in plan(settings=conf)["videos"] for s in v["shots"]]
+    assert not any(s["hflip"] for s in shots)
+    mirrored = [s for v in plan(settings=settings(count=12, reuse="economy", allow_mirror=True))["videos"]
+                for s in v["shots"]]  # fmt: skip
+    assert any(s["hflip"] for s in mirrored) and not all(s["hflip"] for s in mirrored)
+
+
+def test_repeated_footage_gets_a_different_camera_move() -> None:
+    # Without flips, variety comes from the camera move: footage that comes back (same clip,
+    # same in-point bucket) is framed with a pan / zoom direction it has not had yet.
+    result = plan(settings=settings(count=30, reuse="economy"), provider_clip_duration=2.0)
+    moves: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    fresh = repeats = 0
+    for shot in (s for v in result["videos"] for s in v["shots"]):
+        move = (shot["pan"], 1 if shot["zoom_to"] > shot["zoom_from"] else -1)
+        earlier = moves.setdefault((_ref(shot), int(shot["src_in"] // 1.0)), [])
+        if earlier:
+            repeats += 1
+            fresh += move not in earlier
+        earlier.append(move)
+    assert repeats > 50
+    assert fresh / repeats >= 0.97  # random moves alone repeated one in ~7 of them
+
+
+def test_variety_score_counts_a_new_camera_move_like_a_mirror() -> None:
+    def shot(pan: str, zoom_to: float, hflip: bool = False, src_in: float = 0.2) -> dict[str, Any]:
+        return {"clip_key": "c01", "clip_id": None, "src_in": src_in, "hflip": hflip, "pan": pan,
+                "zoom_from": 1.0 if pan == "center" else 1.06, "zoom_to": zoom_to}  # fmt: skip
+
+    score = variation._variety_score
+    assert score([{"shots": [shot("left", 1.1), shot("left", 1.1)]}]) == 0.5  # same footage, same framing
+    assert score([{"shots": [shot("left", 1.1), shot("right", 1.1)]}]) == 1.0  # another camera move
+    assert score([{"shots": [shot("left", 1.1), shot("left", 1.1, hflip=True)]}]) == 1.0  # mirrored (opt-in)
+    assert score([{"shots": [shot("left", 1.1), shot("up", 1.1), shot("down", 1.0)]}]) == round(2 / 3, 3)
+    assert score([{"shots": [shot("left", 1.1), shot("left", 1.1, src_in=2.4)]}]) == 1.0  # other in-point
 
 
 def test_requires_storyboard_scenes_for_generation() -> None:
@@ -603,8 +679,7 @@ def test_lyric_style_text_style_and_transitions() -> None:
         assert video["lyric_style"] == "karaoke"
         assert video["text_style"] == {"font_size": 72, "position": "center"}
     assert {v["transition"] for v in result["videos"]} == {"cut", "crossfade"}
-    flips = [s["hflip"] for v in result["videos"] for s in v["shots"]]
-    assert any(flips) and not all(flips)
+    assert not any(s["hflip"] for v in result["videos"] for s in v["shots"])  # mirroring is opt-in
     pans = {s["pan"] for v in result["videos"] for s in v["shots"]}
     assert len(pans) >= 4
     for shot in (s for v in result["videos"] for s in v["shots"]):

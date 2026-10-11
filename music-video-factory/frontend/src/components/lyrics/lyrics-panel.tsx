@@ -5,6 +5,7 @@ import * as React from "react";
 
 import { useAudioHotkeys, useAudioPlayer } from "@/components/audio/audio-player";
 import { AudioTransport } from "@/components/audio/audio-transport";
+import { RightsResetNotice } from "@/components/rights/rights-reset-notice";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -136,8 +137,10 @@ export function LyricsPanel({ project, draft, duration, analysisReady, segment }
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_300px]">
       <div className="flex min-w-0 flex-col gap-6">
+        <RightsResetNotice project={project} keys={["lyrics_rights"]} />
         <LyricsSourceCard
           projectId={project.id}
+          rights={project.rights}
           lyrics={lyrics}
           hasTiming={timed > 0 || draft.dirty}
           onParsed={(result) => {
@@ -281,7 +284,7 @@ export function LyricsPanel({ project, draft, duration, analysisReady, segment }
                 </div>
                 {editText ? (
                   <Alert tone="neutral">
-                    歌詞の表記はここで明示的に編集したときだけ変わります。表記を変えた行は、カラオケ用の文字ごとのタイミングがリセットされ、均等割りで表示されます。
+                    歌詞の表記はここで明示的に編集したときだけ変わります。表記を変えた行は、カラオケ用の文字ごとのタイミングがリセットされ、均等割りで表示されます。表記を変えて保存すると、権利確認の「歌詞の権利」は確認し直しになります。
                   </Alert>
                 ) : null}
 

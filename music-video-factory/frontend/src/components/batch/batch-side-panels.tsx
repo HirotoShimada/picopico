@@ -5,7 +5,7 @@ import * as React from "react";
 
 import { clipSourceLabel } from "@/components/materials/clip-labels";
 import { colorGradeName, COLOR_GRADES_FALLBACK, lyricStyleChoiceName } from "@/components/generate/text-style";
-import { reuseLabel, startStrategyLabel } from "@/components/generate/vocab";
+import { mirrorLabel, reuseLabel, startStrategyLabel } from "@/components/generate/vocab";
 import { LYRIC_STYLES_FALLBACK } from "@/components/lyrics/lyric-styles";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
@@ -54,6 +54,8 @@ export function BatchSettingsCard({ batch }: { batch: BatchDetailOut }) {
             value={`${startStrategyLabel(settings.start_strategy)}${settings.start_strategy === "custom" && settings.start_sec !== null ? `（${formatTime(settings.start_sec)}）` : ""}`}
           />
           <Row label="素材の再利用" value={reuseLabel(settings.reuse)} />
+          {/* Absent on batches from before the option (their shots could be flipped). */}
+          {typeof settings.allow_mirror === "boolean" ? <Row label="左右反転" value={mirrorLabel(settings.allow_mirror)} /> : null}
           {settings.max_new_clips !== null && settings.max_new_clips !== undefined ? (
             <Row label="新規生成の上限" value={`${formatCount(settings.max_new_clips)}本`} />
           ) : null}

@@ -24,15 +24,18 @@ regenerate / edit endpoints, so routers stay thin.
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import inspect
 import json
 import logging
 import math
 import random
+import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -98,11 +101,13 @@ __all__ = [
     "analyze_project_audio",
     "apply_video_edit",
     "cancel_batch",
+    "carry_over_lyric_lines",
     "clean_stale_work_dirs",
     "create_batch",
     "download_filename",
     "effective_lyric_lines",
     "generate_clip",
+    "lyric_ids_in_use",
     "preview_batch",
     "recompute_batch_status",
     "recover_interrupted_jobs",
@@ -111,6 +116,7 @@ __all__ = [
     "reopen_batch",
     "require_rights",
     "retime_line",
+    "revoke_right",
     "run_batch",
     "stored_storyboard",
     "update_batch_budget",
@@ -242,6 +248,114 @@ def retime_line(line: Mapping[str, Any], start: float, end: float) -> dict[str, 
     out["end"] = round(float(end), 3)
     out["source"] = "manual"
     return out
+
+
+# An edited line (not identical text) keeps its id when it is at least this similar to the old line.
+LINE_MATCH_MIN_RATIO = 0.6
+# Larger edited blocks are paired by position instead of the O(m·n) similarity alignment.
+_MAX_LINE_PAIRING_CELLS = 10_000
+_LINE_ID_RE = re.compile(r"^l(\d+)$")
+
+
+def _line_key(text: Any) -> str:
+    """Line text for alignment: NFKC, case-folded, whitespace removed."""
+    return "".join(unicodedata.normalize("NFKC", str(text or "")).casefold().split())
+
+
+def _line_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() if a or b else 1.0
+
+
+def _pair_edited_lines(old_keys: Sequence[str], new_keys: Sequence[str]) -> list[tuple[int, int]]:
+    """Order-preserving pairs (old index, new index) of edited lines, maximising the summed similarity."""
+    m, n = len(old_keys), len(new_keys)
+    if m * n > _MAX_LINE_PAIRING_CELLS:
+        return [
+            (i, i) for i in range(min(m, n)) if _line_similarity(old_keys[i], new_keys[i]) >= LINE_MATCH_MIN_RATIO
+        ]
+    sim = [[_line_similarity(a, b) for b in new_keys] for a in old_keys]
+    best = [[0.0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m - 1, -1, -1):
+        for j in range(n - 1, -1, -1):
+            value = max(best[i + 1][j], best[i][j + 1])
+            if sim[i][j] >= LINE_MATCH_MIN_RATIO:
+                value = max(value, sim[i][j] + best[i + 1][j + 1])
+            best[i][j] = value
+    pairs: list[tuple[int, int]] = []
+    i = j = 0
+    while i < m and j < n:
+        if sim[i][j] >= LINE_MATCH_MIN_RATIO and best[i][j] == sim[i][j] + best[i + 1][j + 1]:
+            pairs.append((i, j))
+            i, j = i + 1, j + 1
+        elif best[i][j] == best[i + 1][j]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def carry_over_lyric_lines(
+    old_lines: Sequence[Mapping[str, Any]] | None,
+    new_lines: Sequence[Mapping[str, Any]],
+    *,
+    reserved_ids: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Freshly parsed lyric lines with the ids (and timing) of the lines they replace.
+
+    Re-saving the lyrics must not renumber lines: per-video ``lyric_offsets``
+    are keyed by line id. Old and new lines are aligned on their normalised
+    text (``difflib`` over the line sequence, so inserted/removed lines and
+    repeated choruses do not shift the others); edited lines in a changed
+    block are paired by similarity (≥ :data:`LINE_MATCH_MIN_RATIO`).
+
+    - A matched line keeps its id. When its text is identical and the new text
+      carries no timing (TXT), it also keeps its timing, words, source and confidence;
+      timed input (LRC/SRT) is authoritative.
+    - Other lines get fresh ids ``lNNN`` numbered after the highest id of the old
+      lines and ``reserved_ids`` (ids still referenced, e.g. by videos' overrides
+      of deleted lines), so a new line never inherits another line's overrides.
+    """
+    old = [dict(line) for line in old_lines or []]
+    new = [copy.deepcopy(dict(line)) for line in new_lines]
+    old_keys = [_line_key(line.get("text")) for line in old]
+    new_keys = [_line_key(line.get("text")) for line in new]
+    match: dict[int, int] = {}  # new index -> old index
+    matcher = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            match.update({j1 + k: i1 + k for k in range(i2 - i1)})
+        elif tag == "replace":
+            match.update({j1 + j: i1 + i for i, j in _pair_edited_lines(old_keys[i1:i2], new_keys[j1:j2])})
+    used = {str(line.get("id")) for line in old if line.get("id") is not None} | {str(i) for i in reserved_ids}
+    numbers = [int(found.group(1)) for found in map(_LINE_ID_RE.match, used) if found]
+    next_number = max(numbers, default=0) + 1
+    for j, line in enumerate(new):
+        i = match.get(j)
+        if i is not None and old[i].get("id") is not None:
+            previous = old[i]
+            line["id"] = str(previous["id"])
+            same_text = line.get("text") == previous.get("text")
+            if same_text and line.get("start") is None and previous.get("start") is not None:
+                for field in ("start", "end", "words", "source", "confidence"):
+                    line[field] = copy.deepcopy(previous.get(field))
+            continue
+        while f"l{next_number:03d}" in used:
+            next_number += 1
+        line["id"] = f"l{next_number:03d}"
+        used.add(line["id"])
+    return new
+
+
+def lyric_ids_in_use(db: Session, project_id: str) -> set[str]:
+    """Line ids the project's videos still reference (``lyric_offsets``, also of the fallback render's plan)."""
+    ids: set[str] = set()
+    for plan in db.scalars(select(Video.plan).where(Video.project_id == project_id)):
+        plans = [plan or {}, ((plan or {}).get("previous") or {}).get("plan") or {}]
+        for item in plans:
+            offsets = item.get("lyric_offsets") if isinstance(item, Mapping) else None
+            if isinstance(offsets, Mapping):
+                ids.update(str(key) for key in offsets)
+    return ids
 
 
 def effective_lyric_lines(
@@ -471,6 +585,30 @@ def require_rights(project: Project) -> None:
     """
     if not all_rights_confirmed(project.rights):
         raise ServiceError(RIGHTS_UNCONFIRMED_MESSAGE, status_code=422, code="rights_unconfirmed")
+
+
+AUDIO_RIGHTS_RESET_MESSAGE = (
+    "音源が変わったため、権利確認の「音源の権利」を未確認に戻しました。"
+    "新しい音源の権利を確認するまで、生成と再レンダリングはできません。"
+)
+LYRICS_RIGHTS_RESET_MESSAGE = (
+    "歌詞の本文が変わったため、権利確認の「歌詞の権利」を未確認に戻しました。"
+    "新しい歌詞の権利を確認するまで、生成と再レンダリングはできません。"
+)
+
+
+def revoke_right(project: Project, key: str) -> bool:
+    """Un-confirm one checklist item (content it vouched for was replaced); True when it was confirmed.
+
+    ``rights_confirmed_at`` is cleared with it, so every generation guard stops until the user confirms again.
+    """
+    rights = dict(project.rights or {})
+    if not rights.get(key):
+        return False
+    rights[key] = False
+    project.rights = rights
+    project.rights_confirmed_at = None
+    return True
 
 
 def preview_batch(db: Session, project: Project, settings: GenerationSettings | Mapping[str, Any]) -> BatchPreview:

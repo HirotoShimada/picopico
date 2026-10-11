@@ -102,3 +102,8 @@ const REUSE_LABELS: Record<string, string> = {
 export function reuseLabel(id: string): string {
   return REUSE_LABELS[id] ?? id;
 }
+
+/** `GenerationSettings.allow_mirror` (左右反転). */
+export function mirrorLabel(allowMirror: boolean): string {
+  return allowMirror ? "使う" : "使わない";
+}

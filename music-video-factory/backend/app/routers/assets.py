@@ -1,7 +1,9 @@
 """Song upload (ARCHITECTURE.md §5.3).
 
 Replacing the audio deletes the previous audio asset and clears the analysis
-and selected segment (they describe the old file); lyrics are kept.
+and selected segment (they describe the old file); lyrics are kept. A new song
+un-confirms the ``audio_rights`` checklist item (the confirmation vouched for
+the previous file); the response says so in ``warnings``.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from app import worker
 from app.config import get_settings
 from app.db import DbSession
 from app.models import AnalysisStatus, Asset, AssetKind, new_id
+from app.pipeline import AUDIO_RIGHTS_RESET_MESSAGE, revoke_right
 from app.routers.projects import has_active_batch
 from app.schemas import ProjectOut
 from app.security import CurrentUser, get_owned_project
@@ -104,6 +107,7 @@ def upload_audio(
         project.analysis_status = AnalysisStatus.QUEUED
         project.segment_start = None
         project.segment_end = None
+        rights_reset = revoke_right(project, "audio_rights")
         db.flush()
         if old_asset is not None:
             db.delete(old_asset)
@@ -126,4 +130,7 @@ def upload_audio(
         project.analysis_status = AnalysisStatus.FAILED
         project.analysis_error = exc.message
         db.commit()
-    return to_project_out(db, project)
+    out = to_project_out(db, project)
+    if rights_reset:
+        out.warnings = [AUDIO_RIGHTS_RESET_MESSAGE]
+    return out

@@ -190,6 +190,7 @@ class LyricLinesUpdate(BaseModel):
 
 class LyricLinesOut(APIModel):
     lines: list[LyricLine]
+    warnings: list[str] = Field(default_factory=list)  # e.g. lyrics_rights reset after a text change
 
 
 class AutoTimeRequest(BaseModel):
@@ -309,6 +310,8 @@ class ProjectOut(APIModel):
     created_at: datetime
     updated_at: datetime
     counts: ProjectCounts
+    # Notices about this request, e.g. the audio upload un-confirming ``audio_rights`` (empty otherwise).
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ProjectSummary(APIModel):
@@ -460,6 +463,11 @@ class GenerationSettings(BaseModel):
     # Extension: with Claude, later batches reuse the project's storyboard for the same world
     # (consistent protagonist, clip cache hits); true asks Claude for a new one.
     new_storyboard: bool = False
+    # Horizontal flips mirror any text/signage in the footage, so the planner flips shots only when allowed.
+    allow_mirror: bool = Field(
+        default=False,
+        description="左右反転を許可する（素材内の文字や看板が鏡文字になるため既定ではオフ）",
+    )
 
     @field_validator("custom_world", "model", mode="before")
     @classmethod
@@ -673,6 +681,13 @@ class VideoZipRequest(BaseModel):
     video_ids: list[str] = Field(min_length=1, max_length=500)
 
 
+class ZipLinkOut(APIModel):
+    """Signed ``GET /media-zip/…`` URL (no auth header needed) that streams the ZIP; valid until ``expires_at``."""
+
+    url: str
+    expires_at: datetime
+
+
 class BatchCounts(APIModel):
     total: int = 0
     done: int = 0
@@ -786,6 +801,27 @@ class LimitsInfo(APIModel):
     max_duration: int = MAX_DURATION_SEC
 
 
+class GenerationOptionInfo(APIModel):
+    """A boolean ``GenerationSettings`` option the generate form can offer."""
+
+    id: str
+    name_ja: str
+    description_ja: str = ""
+    default: bool = False
+
+
+# Boolean GenerationSettings options listed by GET /api/system/capabilities (ids = field names).
+GENERATION_OPTIONS: tuple[GenerationOptionInfo, ...] = (
+    GenerationOptionInfo(
+        id="allow_mirror",
+        name_ja="左右反転を許可",
+        description_ja="ショットを左右反転して動画ごとの変化を増やします。素材に映る文字や看板も鏡文字になるため、"
+        "既定ではオフです。",
+        default=False,
+    ),
+)
+
+
 class CapabilitiesOut(APIModel):
     providers: list[ProviderInfo]
     claude_configured: bool
@@ -797,6 +833,7 @@ class CapabilitiesOut(APIModel):
     durations: list[int] = Field(default_factory=lambda: list(DURATION_CHOICES))
     counts: list[int] = Field(default_factory=lambda: list(COUNT_CHOICES))
     limits: LimitsInfo
+    generation_options: list[GenerationOptionInfo] = Field(default_factory=lambda: list(GENERATION_OPTIONS))
 
 
 class ActiveJob(APIModel):

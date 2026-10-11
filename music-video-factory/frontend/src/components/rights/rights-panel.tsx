@@ -16,6 +16,7 @@ import type { ProjectOut, RightsKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { LIKENESS_POLICY, RIGHTS_CHECKLIST } from "./rights-items";
+import { clearRightsResets, useRightsResets } from "./rights-reset";
 
 type RightsState = Record<RightsKey, boolean>;
 
@@ -39,6 +40,9 @@ export function RightsPanel({ project }: { project: ProjectOut }) {
   const checkedCount = RIGHTS_CHECKLIST.filter((item) => values[item.key]).length;
   const savedCount = RIGHTS_CHECKLIST.filter((item) => saved[item.key]).length;
   const allSaved = project.rights_confirmed_at !== null && savedCount === RIGHTS_CHECKLIST.length;
+  // Items the backend un-confirmed because the song or the lyric text changed.
+  const resets = useRightsResets(project);
+  const resetKeys = new Set(resets.map((reset) => reset.key));
 
   async function save() {
     setSaving(true);
@@ -46,6 +50,10 @@ export function RightsPanel({ project }: { project: ProjectOut }) {
       const updated = await updateRights(project.id, values);
       await mutate(apiPaths.project(project.id), updated, { revalidate: false });
       void mutate(apiPaths.projects);
+      clearRightsResets(
+        project.id,
+        RIGHTS_CHECKLIST.map((item) => item.key).filter((key) => updated.rights[key] === true),
+      );
       setDraft(null);
       if (updated.rights_confirmed_at) toast.success("権利確認を保存しました", "動画生成を開始できます。");
       else toast.success("権利確認を保存しました", "すべての項目を確認すると動画生成を開始できます。");
@@ -59,7 +67,16 @@ export function RightsPanel({ project }: { project: ProjectOut }) {
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(320px,400px)]">
       <div className="flex min-w-0 flex-col gap-6">
-        {allSaved ? (
+        {resets.length > 0 ? (
+          <Alert tone="warning" title="音源または歌詞が変わったため、再確認が必要な項目があります">
+            <ul className="flex flex-col gap-1">
+              {resets.map((reset) => (
+                <li key={reset.key}>{reset.message}</li>
+              ))}
+            </ul>
+            <p className="mt-1">新しい内容について確認し、チェックを入れて保存してください。</p>
+          </Alert>
+        ) : allSaved ? (
           <Alert tone="success" title="権利確認が完了しています">
             {formatDateTime(project.rights_confirmed_at)} に5項目すべての確認が記録されました。項目のチェックを外すと、動画生成は再びできなくなります。
           </Alert>
@@ -100,6 +117,11 @@ export function RightsPanel({ project }: { project: ProjectOut }) {
                         <span className="mr-1.5 font-mono text-xs text-subtle-foreground">{index + 1}.</span>
                         {item.label}
                       </label>
+                      {resetKeys.has(item.key) ? (
+                        <Badge tone="warning" className="mt-0.5">
+                          要再確認
+                        </Badge>
+                      ) : null}
                       <p id={`${id}-description`} className="text-xs leading-5 text-muted-foreground">
                         {item.explanation}
                       </p>
@@ -111,7 +133,11 @@ export function RightsPanel({ project }: { project: ProjectOut }) {
           </CardContent>
           <CardFooter className="justify-between">
             <span className="text-xs text-muted-foreground">
-              {project.rights_confirmed_at ? `最終確認: ${formatDateTime(project.rights_confirmed_at)}` : "まだ確認は記録されていません"}
+              {project.rights_confirmed_at
+                ? `最終確認: ${formatDateTime(project.rights_confirmed_at)}`
+                : resets.length > 0
+                  ? "変更された内容の確認が記録されていません"
+                  : "まだ確認は記録されていません"}
             </span>
             <div className="flex items-center gap-2">
               <Button type="button" variant="ghost" size="sm" onClick={() => setDraft(null)} disabled={!dirty || saving}>

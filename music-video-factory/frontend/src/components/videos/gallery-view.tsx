@@ -1,6 +1,6 @@
 "use client";
 
-import { Clapperboard, Download, Film, FilterX, ListChecks, X } from "lucide-react";
+import { Ban, Clapperboard, Download, Film, FilterX, ListChecks, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import * as React from "react";
@@ -11,10 +11,12 @@ import { ProjectHeader } from "@/components/layout/project-header";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
+import { Label } from "@/components/ui/label";
 import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useProjectBatches } from "@/hooks/use-batches";
 import { useVideos } from "@/hooks/use-videos";
@@ -80,18 +82,23 @@ function batchOptionLabel(batch: BatchOut): string {
   return `${formatDateTime(batch.created_at)} ・ ${formatCount(batch.counts.done)}/${formatCount(batch.counts.total)} 本 ・ ${statusMeta("batch", batch.status).label}`;
 }
 
-/** `/projects/[id]/videos`: filterable 9:16 grid, preview dialog, favourites and ZIP download. */
+/**
+ * `/projects/[id]/videos`: filterable 9:16 grid, preview dialog, favourites and ZIP download.
+ * Cancelled videos are hidden unless 「キャンセル済みを表示」 is on (`?cancelled=1`).
+ */
 export function GalleryView({ projectId }: { projectId: string }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const batchFilter = searchParams.get("batch");
   const favoritesOnly = searchParams.get("fav") === "1";
+  const showCancelled = searchParams.get("cancelled") === "1";
 
   const { data: batches } = useProjectBatches(projectId);
   const { data: videos, error, isLoading, mutate } = useVideos(projectId, {
     batch_id: batchFilter ?? undefined,
     favorite: favoritesOnly ? true : undefined,
+    include_cancelled: showCancelled ? undefined : false,
   });
   const { mutate: globalMutate } = useSWRConfig();
   const actions = useVideoActions();
@@ -111,20 +118,28 @@ export function GalleryView({ projectId }: { projectId: string }) {
     [batches],
   );
   const filterBatch = sortedBatches.find((batch) => batch.id === batchFilter);
+  // How many cancelled videos the list leaves out (unknown for the favourites filter).
+  const hiddenCancelled =
+    showCancelled || favoritesOnly
+      ? 0
+      : (batchFilter ? (filterBatch ? [filterBatch] : []) : sortedBatches).reduce((sum, batch) => sum + batch.counts.cancelled, 0);
   const groups = React.useMemo(() => groupByBatch(sorted, sortedBatches), [sorted, sortedBatches]);
   const runwayBatchIds = React.useMemo(
     () => new Set((batches ?? []).filter((batch) => isRunway(batch.settings.provider)).map((batch) => batch.id)),
     [batches],
   );
 
-  function setFilters(next: { batch?: string | null; fav?: boolean }) {
+  function setFilters(next: { batch?: string | null; fav?: boolean; cancelled?: boolean }) {
     const params = new URLSearchParams(searchParams.toString());
     const batch = next.batch === undefined ? batchFilter : next.batch;
     const fav = next.fav === undefined ? favoritesOnly : next.fav;
+    const cancelled = next.cancelled === undefined ? showCancelled : next.cancelled;
     if (batch) params.set("batch", batch);
     else params.delete("batch");
     if (fav) params.set("fav", "1");
     else params.delete("fav");
+    if (cancelled) params.set("cancelled", "1");
+    else params.delete("cancelled");
     const query = params.toString();
     setSelected(new Set());
     router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
@@ -153,7 +168,6 @@ export function GalleryView({ projectId }: { projectId: string }) {
   };
 
   const filtered = batchFilter !== null || favoritesOnly;
-  const zipName = filterBatch ? `batch_${filterBatch.id.slice(0, 8)}.zip` : "videos.zip";
 
   return (
     <>
@@ -196,6 +210,15 @@ export function GalleryView({ projectId }: { projectId: string }) {
             <ToggleGroupItem value={ALL}>すべて</ToggleGroupItem>
             <ToggleGroupItem value="fav">お気に入り</ToggleGroupItem>
           </ToggleGroup>
+          <div className="flex items-center gap-2 pl-1">
+            <Switch id="gallery-show-cancelled" checked={showCancelled} onCheckedChange={(cancelled) => setFilters({ cancelled })} />
+            <Label htmlFor="gallery-show-cancelled" className="text-xs font-normal text-muted-foreground">
+              キャンセル済みを表示
+            </Label>
+            {hiddenCancelled > 0 ? (
+              <span className="text-2xs text-subtle-foreground tabular">キャンセル済み {formatCount(hiddenCancelled)} 本を非表示</span>
+            ) : null}
+          </div>
           {filtered ? (
             <Button variant="ghost" size="sm" onClick={() => setFilters({ batch: null, fav: false })}>
               <FilterX aria-hidden />
@@ -224,12 +247,12 @@ export function GalleryView({ projectId }: { projectId: string }) {
             )
           ) : null}
           {selectedIds.length > 0 ? (
-            <Button variant="primary" size="sm" loading={zip.busy} onClick={() => void zip.downloadSelection(selectedIds, zipName)}>
+            <Button variant="primary" size="sm" loading={zip.busy} onClick={() => void zip.downloadSelection(selectedIds)}>
               {zip.busy ? null : <Download aria-hidden />}
               選択した {formatCount(selectedIds.length)} 本を ZIP で保存
             </Button>
           ) : filterBatch && filterBatch.counts.done > 0 ? (
-            <Button variant="secondary" size="sm" loading={zip.busy} onClick={() => void zip.downloadBatch(filterBatch.id, zipName)}>
+            <Button variant="secondary" size="sm" loading={zip.busy} onClick={() => void zip.downloadBatch(filterBatch.id)}>
               {zip.busy ? null : <Download aria-hidden />}
               このジョブの完成分を ZIP で保存
             </Button>
@@ -242,7 +265,18 @@ export function GalleryView({ projectId }: { projectId: string }) {
       ) : isLoading && !videos ? (
         <GallerySkeleton />
       ) : sorted.length === 0 ? (
-        filtered ? (
+        hiddenCancelled > 0 ? (
+          <EmptyState
+            icon={Ban}
+            title="表示できる動画はありません"
+            description={`キャンセル済みの動画 ${formatCount(hiddenCancelled)} 本は非表示にしています。`}
+            action={
+              <Button variant="secondary" size="sm" onClick={() => setFilters({ cancelled: true })}>
+                キャンセル済みを表示
+              </Button>
+            }
+          />
+        ) : filtered ? (
           <EmptyState
             icon={FilterX}
             title="条件に一致する動画はありません"

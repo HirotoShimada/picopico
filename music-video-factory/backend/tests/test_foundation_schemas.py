@@ -34,6 +34,7 @@ def test_generation_settings_defaults() -> None:
         "budget_limit_usd": None,
         "seed": None,
         "new_storyboard": False,
+        "allow_mirror": False,
     }
 
 

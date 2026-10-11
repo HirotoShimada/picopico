@@ -8,6 +8,13 @@ not lyric text and is removed. All times are absolute seconds in the song.
 
 Line ids are stable and positional (``l001``, ``l002`` …, in time order for
 LRC/SRT, in text order for TXT).
+
+Section headings (a line that is only ``[サビ]``, ``【Aメロ】``, ``<Chorus>``,
+``＜間奏＞`` … or a section label with a trailing colon such as ``Verse 1:`` /
+``サビ：``) are not sung: they stay in the stored lyrics text but are left out
+of the lines (with a warning listing them), so they get no vocal time and are
+never burned into a video. Parenthesised lines such as ``(Oh oh)`` are sung
+backing vocals and are kept.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import bisect
 import itertools
 import math
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast
@@ -32,6 +40,7 @@ __all__ = [
     "decode_bytes",
     "decode_bytes_with_info",
     "detect_format",
+    "is_heading_line",
     "line_id",
     "make_line",
     "parse_lyrics",
@@ -59,7 +68,16 @@ class LyricLine(TypedDict):
 
 
 DEFAULT_LAST_LINE_SEC = 4.0  # LRC has no end times: the last line is held this long
-LONG_HOLD_WARN_SEC = 15.0
+# A line without an end tag normally lasts until the next line starts. When that is
+# an instrumental break away (≥ LRC_BREAK_GAP_SEC, and ≥ LRC_BREAK_MARGIN_SEC more
+# than the line needs), it ends after its estimated sung duration instead:
+# morae/syllables (the auto-timing estimate) × LRC_SEC_PER_MORA + LRC_TAIL_SEC,
+# clamped to LRC_SUNG_SEC. Explicit end tags (an empty time tag) are always kept.
+LRC_BREAK_GAP_SEC = 10.0
+LRC_BREAK_MARGIN_SEC = 5.0
+LRC_SEC_PER_MORA = 0.3  # unhurried singing, so a line is rather held a bit too long than cut
+LRC_TAIL_SEC = 1.0
+LRC_SUNG_SEC = (2.5, 8.0)
 # Lines starting this close together are one same-time group (translation / duet
 # lines); the renderer stacks them (subtitles._SAME_START uses the same value).
 SAME_TIME_SEC = 0.05
@@ -85,8 +103,41 @@ _SRT_CUE = re.compile(rf"^\s*{_SRT_TC}\s*-->\s*{_SRT_TC}(?:\s.*)?$")
 _SRT_INDEX = re.compile(r"^\s*\d+\s*$")
 _SRT_FORMAT_TAGS = re.compile(r"</?(?:i|b|u|s|font)(?:\s[^>]*)?>|\{\\[^}]*\}", re.IGNORECASE)
 
-# A TXT line that is entirely a bracketed heading, e.g. "[サビ]" or "【Verse 1】".
-_HEADING_LINE = re.compile(r"^(?:\[[^\[\]]{1,30}\]|【[^【】]{1,30}】)$")
+# A line that is entirely a bracketed heading: "[サビ]", "【Verse 1】", "<Chorus>", "＜間奏＞", "〔Aメロ〕" …
+# (round brackets are not headings: "(Oh oh)" is a sung backing vocal).
+_BRACKETS: tuple[tuple[str, str], ...] = tuple(
+    (pair[0], pair[1]) for pair in ("[]", "［］", "【】", "〖〗", "<>", "＜＞", "〈〉", "《》", "≪≫", "〔〕")
+)
+_HEADING_LINE = re.compile(
+    "^(?:" + "|".join(f"{re.escape(o)}[^{re.escape(o + c)}]{{1,30}}{re.escape(c)}" for o, c in _BRACKETS) + ")$"
+)
+# A section label alone with a trailing colon: "Verse 1:", "Pre-Chorus:", "サビ：", "Aメロ:", "2番:" …
+# Matched after NFKC (full-width letters/colons fold to ASCII).
+_SECTION_LABEL = re.compile(
+    r"^(?:"
+    r"(?:pre|post)?[- ]?(?:verse|chorus|hook|refrain)|bridge|intro|outro|interlude|instrumental|break(?:down)?"
+    r"|rap|drop|solo|coda|ad[- ]?libs?|spoken(?: word)?"
+    r"|(?:大|落ち|ラス)?サビ|[a-e]メロ|イントロ|アウトロ|間奏|ブリッジ|ラップ|コーラス|セリフ|語り|\d+番"
+    r")\s*\d*\s*(?:[x×]\s*\d+)?\s*:$",
+    re.IGNORECASE,
+)
+
+
+def is_heading_line(text: str) -> bool:
+    """True for a section heading that is not sung (``[サビ]``, ``【Aメロ】``, ``Verse 1:`` …)."""
+    stripped = text.strip()
+    if _HEADING_LINE.match(stripped):
+        return True
+    return bool(_SECTION_LABEL.match(unicodedata.normalize("NFKC", stripped)))
+
+
+def _heading_warning(headings: Sequence[str]) -> str:
+    shown = "".join(f"「{h}」" for h in headings[:5])
+    more = f" ほか {len(headings) - 5} 行" if len(headings) > 5 else ""
+    return (
+        f"見出しと思われる行 {len(headings)} 行（{shown}{more}）は歌われないため、歌詞の行に含めず、"
+        "タイミングを割り当てず動画にも表示しません（入力した歌詞の本文はそのまま保存しています）。"
+    )
 
 
 # --------------------------------------------------------------------------- line helpers
@@ -269,21 +320,16 @@ def parse_lyrics(text: str, fmt: str = "auto") -> tuple[list[LyricLine], list[st
 
 def _parse_txt(text: str) -> tuple[list[LyricLine], list[str]]:
     lines: list[LyricLine] = []
-    headings = 0
+    headings: list[str] = []
     for raw in _split_lines(text):
         cleaned = _clean(raw)
         if not cleaned:
             continue
-        if _HEADING_LINE.match(cleaned):
-            headings += 1
+        if is_heading_line(cleaned):
+            headings.append(cleaned)
+            continue
         lines.append(make_line(len(lines), cleaned, None, None, source="txt"))
-    warnings: list[str] = []
-    if headings:
-        warnings.append(
-            f"「[サビ]」のような見出しと思われる行が {headings} 行あります。"
-            "歌詞として動画に表示されるため、不要な場合は削除してください。"
-        )
-    return lines, warnings
+    return lines, [_heading_warning(headings)] if headings else []
 
 
 # --------------------------------------------------------------------------- LRC
@@ -304,6 +350,7 @@ class _LrcEntry:
     text: str
     start: float | None
     words: list[WordTiming] | None
+    heading: bool = False  # a timed section heading: a boundary, but not an explicit end tag
 
 
 def _parse_enhanced(body: str) -> tuple[str, list[WordTiming] | None]:
@@ -356,6 +403,7 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
     last_key = -math.inf
     untagged = 0
     clamped = False
+    headings: list[str] = []
     for seq, raw in enumerate(raw_lines):
         stripped = _clean(raw)
         if not stripped:
@@ -364,12 +412,20 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
         if lead is None:
             if _is_lrc_meta(stripped):
                 continue
+            if is_heading_line(stripped):
+                headings.append(stripped)
+                continue
             untagged += 1
             entries.append(_LrcEntry(key=last_key, seq=seq, text=stripped, start=None, words=None))
             continue
         times = list(dict.fromkeys(_lrc_seconds(m.group(1), m.group(2)) for m in _LRC_TIME_TAG.finditer(lead.group(0))))
         body, raw_words = _parse_enhanced(stripped[lead.end() :])
         line_text = _clean(body)
+        heading = bool(line_text) and is_heading_line(line_text)
+        if heading:
+            # A timed section heading is not sung: the previous line ends there at the latest.
+            headings.append(line_text)
+            line_text, raw_words = "", None
         for t in times:
             start = t + shift
             if start < 0:
@@ -387,14 +443,16 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
                     )
                     for w in raw_words
                 ]
-            entries.append(_LrcEntry(key=start, seq=seq, text=line_text, start=start, words=words))
+            entries.append(_LrcEntry(key=start, seq=seq, text=line_text, start=start, words=words, heading=heading))
         last_key = min(times) + shift
 
     entries.sort(key=lambda e: (e.key, e.seq))
     timed_starts = [e.start for e in entries if e.start is not None]
+    end_tags = {e.start for e in entries if e.start is not None and not e.text and not e.heading}
+    sung = _group_sung_ends([e for e in entries if e.start is not None and e.text])
 
     lines: list[LyricLine] = []
-    long_holds = 0
+    held_short: list[float] = []
     pointer = 0  # first timed entry whose start is > the current start
     for entry in entries:
         if not entry.text:
@@ -407,8 +465,13 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
             pointer += 1
         if pointer < len(timed_starts):
             end = timed_starts[pointer]
-            if end - entry.start > LONG_HOLD_WARN_SEC:
-                long_holds += 1
+            group_start, sung_end = sung[id(entry)]
+            if end not in end_tags and end - group_start >= max(
+                LRC_BREAK_GAP_SEC, sung_end - group_start + LRC_BREAK_MARGIN_SEC
+            ):
+                # The next line is an instrumental break away: don't hold this one through it.
+                end = sung_end
+                held_short.append(round(end - entry.start, 3))
         else:
             end = entry.start + DEFAULT_LAST_LINE_SEC
             last_word_end = entry.words[-1]["end"] if entry.words else None
@@ -438,17 +501,57 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
         warnings.append(f"LRC の offset（{offset_ms:+d} ms）を適用しました。")
     if clamped:
         warnings.append("offset 適用後に 0 秒より前になった時刻を 0 秒に補正しました。")
-    if long_holds:
+    if held_short:
+        low, high = min(held_short), max(held_short)
+        span = f"約 {low:.1f} 秒" if high - low < 0.05 else f"約 {low:.1f}〜{high:.1f} 秒"
         warnings.append(
-            f"次の行まで {LONG_HOLD_WARN_SEC:.0f} 秒以上表示され続ける行が {long_holds} 行あります。"
-            "間奏で表示を消したい場合は終了時刻を調整してください。"
+            f"次の行まで間奏などで {LRC_BREAK_GAP_SEC:.0f} 秒以上空く {len(held_short)} 行は、間奏中も表示され続けないよう、"
+            f"文字数から推定した歌唱時間（{span}）で表示を終えるようにしました。表示時間を変えたい場合は、"
+            "終了時刻を手動で調整するか、LRC に終了の時刻タグ（歌詞のない [mm:ss.xx] の行）を入れてください。"
         )
+    if headings:
+        warnings.append(_heading_warning(headings))
     same_time = _same_time_groups([line["start"] for line in lines if line["start"] is not None])
     if same_time:
         warnings.append(
             f"同じ時刻の行が {same_time} 組あります（対訳・デュエットなど）。動画では上下に並べて表示します。"
         )
     return lines, warnings
+
+
+def _sung_seconds(text: str) -> float:
+    """Estimated time to sing ``text`` (the auto-timing mora/syllable count at an unhurried pace)."""
+    from app.services.lyrics_timing import line_weight  # local: lyrics_timing imports this module
+
+    low, high = LRC_SUNG_SEC
+    return min(high, max(low, line_weight(text) * LRC_SEC_PER_MORA + LRC_TAIL_SEC))
+
+
+def _group_sung_ends(timed: Sequence[_LrcEntry]) -> dict[int, tuple[float, float]]:
+    """Per timed lyric entry (keyed by ``id``): (first start of its same-time group, the time
+    the group has been sung by). The longest estimate in the group counts, and word timings
+    (enhanced LRC) are honoured, so lines shown together also end together."""
+    groups: list[list[_LrcEntry]] = []
+    for entry in timed:  # sorted by start
+        assert entry.start is not None
+        if groups and entry.start - cast(float, groups[-1][0].start) <= SAME_TIME_SEC:
+            groups[-1].append(entry)
+        else:
+            groups.append([entry])
+    result: dict[int, tuple[float, float]] = {}
+    for group in groups:
+        first = cast(float, group[0].start)
+        sung_end = first
+        for entry in group:
+            word_times = [t for w in entry.words or [] for t in (w["start"], w["end"]) if t is not None]
+            sung_end = max(
+                sung_end,
+                cast(float, entry.start) + _sung_seconds(entry.text),
+                max(word_times, default=-math.inf) + LRC_TAIL_SEC,
+            )
+        for entry in group:
+            result[id(entry)] = (first, sung_end)
+    return result
 
 
 def _same_time_groups(starts: Sequence[float]) -> int:

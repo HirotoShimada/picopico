@@ -14,6 +14,8 @@ import { countTimed } from "@/components/lyrics/timing";
 import { useLyricsDraft } from "@/components/lyrics/use-lyrics-draft";
 import { MaterialsPanel } from "@/components/materials/materials-panel";
 import { RightsPanel } from "@/components/rights/rights-panel";
+import { rightsResetName, useRightsResets } from "@/components/rights/rights-reset";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -67,6 +69,13 @@ function TabStatus({ tab, readiness }: { tab: WorkspaceTab; readiness: Workspace
     case "materials":
       return readiness.clips > 0 ? <CountBadge>{readiness.clips}</CountBadge> : null;
     case "rights":
+      if (readiness.rightsToRecheck.length > 0) {
+        return (
+          <Badge tone="warning" title={`${readiness.rightsToRecheck.map((name) => `「${name}」`).join("")}の再確認が必要です`}>
+            要再確認
+          </Badge>
+        );
+      }
       return readiness.rightsConfirmed ? <StatusIcon tone="done" label="確認済み" /> : <StatusIcon tone="warning" label="未確認" />;
   }
 }
@@ -136,7 +145,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const { data: analysisOut } = useAnalysis(project?.audio ? projectId : null);
   const analysis = analysisOut?.analysis ?? null;
   const duration = analysis?.duration ?? project?.audio?.duration ?? null;
-  const draft = useLyricsDraft(projectId, lyrics?.lines, duration);
+  const draft = useLyricsDraft(projectId, lyrics?.lines, duration, project?.rights);
   useUnsavedChangesGuard(draft.dirty);
 
   const segment: Segment | null =
@@ -144,8 +153,14 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     (project && project.segment_start !== null && project.segment_end !== null ? { start: project.segment_start, end: project.segment_end } : null);
   const analysisReady = (analysisOut?.status ?? project?.analysis_status) === "done" && analysis !== null;
 
+  const rightsResets = useRightsResets(project);
   const readiness = project
-    ? projectReadiness(project, { lines: draft.lines.length, timed: countTimed(draft.lines), dirty: draft.dirty }, segment !== null)
+    ? projectReadiness(
+        project,
+        { lines: draft.lines.length, timed: countTimed(draft.lines), dirty: draft.dirty },
+        segment !== null,
+        rightsResets.map((reset) => rightsResetName(reset.key)),
+      )
     : null;
 
   // The analysis endpoint polls faster than the project; when it reports the end of the

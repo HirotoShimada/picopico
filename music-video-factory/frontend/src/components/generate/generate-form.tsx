@@ -35,6 +35,7 @@ import type {
   WorldEstimate,
 } from "@/lib/types";
 import { emotionLabel } from "@/components/audio/world-estimate-card";
+import { rightsResetName, useRightsResets } from "@/components/rights/rights-reset";
 
 import { ColorGradeSelect, useColorGrades } from "./color-grade-select";
 import { EstimatePanel, ProviderComparison } from "./estimate-panel";
@@ -58,7 +59,7 @@ import { StoryboardPreview } from "./storyboard-preview";
 import { TextStyleControls } from "./text-style-controls";
 import { autoLyricStyles, colorGradeName, lyricStyleChoiceName, previewStyleId } from "./text-style";
 import { useEstimate } from "./use-estimate";
-import { reuseLabel, startStrategyLabel } from "./vocab";
+import { mirrorLabel, reuseLabel, startStrategyLabel } from "./vocab";
 
 const REUSE_OPTIONS: { value: ReuseMode; title: string; description: string }[] = [
   {
@@ -185,9 +186,11 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
 
   const estimateReason = estimateUnavailableReason(project);
   const estimate = useEstimate(project.id, settings, estimateReason === null);
+  const rightsResets = useRightsResets(project);
 
   const readiness = computeReadiness({
     project,
+    rightsToRecheck: rightsResets.map((reset) => rightsResetName(reset.key)),
     providerName,
     providerReason,
     formInvalid: settings === null,
@@ -454,6 +457,22 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
             <ColorGradeSelect id="generate-color-grade" value={state.colorGrade} onValueChange={(colorGrade) => update({ colorGrade })} includeAuto />
           </Field>
 
+          <div className="flex max-w-2xl items-start gap-3">
+            <Switch
+              id="generate-allow-mirror"
+              checked={state.allowMirror}
+              onCheckedChange={(allowMirror) => update({ allowMirror })}
+              aria-describedby="generate-allow-mirror-note"
+              className="mt-0.5"
+            />
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="generate-allow-mirror">左右反転を使う</Label>
+              <p id="generate-allow-mirror-note" className="text-xs leading-5 text-muted-foreground">
+                一部のショットを左右反転して、動画ごとの見た目の変化を増やします。素材に映る文字や看板も鏡文字になるため、文字が映る素材ではオフのままにしてください。
+              </p>
+            </div>
+          </div>
+
           <div className="flex flex-col gap-2">
             <Label>素材の再利用</Label>
             <RadioCards
@@ -552,6 +571,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
           customWorld={state.preset === CUSTOM ? state.customWorld.trim() || null : null}
           disabledReason={state.preset === CUSTOM && !state.customWorld.trim() ? "カスタム世界観を入力するとプレビューできます。" : null}
           claudeConfigured={capabilities?.claude_configured}
+          lyricsRightsMissing={project.lyric_lines.length > 0 && project.rights.lyrics_rights !== true}
         />
       </div>
 
@@ -576,6 +596,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
               <SummaryRow label="カラー" value={colorGradeName(state.colorGrade, grades)} />
               <SummaryRow label="開始位置" value={startStrategyLabel(state.startStrategy)} />
               <SummaryRow label="素材の再利用" value={reuseLabel(state.reuse)} />
+              <SummaryRow label="左右反転" value={mirrorLabel(state.allowMirror)} />
             </dl>
             <div className="border-t border-border pt-4">
               <ReadinessList items={readiness} />

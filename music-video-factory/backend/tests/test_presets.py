@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import colorsys
+import itertools
 import re
 import shutil
 import subprocess
@@ -192,3 +193,115 @@ def test_get_preset_falls_back_to_cinematic() -> None:
     assert presets.get_preset("dreamy")["id"] == "dreamy"
     assert presets.get_preset("nope")["id"] == "cinematic"
     assert presets.get_preset(None)["id"] == "cinematic"
+
+
+# --------------------------------------------------------------------------- shadow detail & look
+
+_SHADOW_PATCHES = [(224, 172, 140), (141, 85, 60), (120, 170, 220), (60, 110, 60), (240, 200, 120), (200, 60, 90)]
+
+
+def _ramp_card() -> np.ndarray:
+    """Row 0: grey ramp 0..255; rows 1..: the colour patches."""
+    card = np.zeros((1 + len(_SHADOW_PATCHES), 256, 3), np.uint8)
+    card[0] = np.arange(256, dtype=np.uint8)[:, None]
+    for i, rgb in enumerate(_SHADOW_PATCHES):
+        card[1 + i] = rgb
+    return card
+
+
+def _graded_rgb(chain: str, card: np.ndarray) -> np.ndarray:
+    """``chain`` applied the way the renderer does: in planar RGB."""
+    h, w, _ = card.shape
+    cmd = [FFMPEG, "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-i", "-",
+           "-vf", f"format=gbrp,{chain},format=gbrp,format=rgb24", "-frames:v", "1", "-f", "rawvideo", "-"]  # fmt: skip
+    out = subprocess.run(cmd, input=card.tobytes(), capture_output=True, check=True, timeout=60).stdout
+    return np.frombuffer(out, np.uint8).reshape(h, w, 3).astype(float)
+
+
+def _longest_flat_run(values: list[int]) -> int:
+    best = run = 1
+    for a, b in itertools.pairwise(values):
+        run = run + 1 if a == b else 1
+        best = max(best, run)
+    return best
+
+
+def _assert_shadow_detail(name: str, ramp: np.ndarray) -> None:
+    luma = np.round(0.2126 * ramp[:, 0] + 0.7152 * ramp[:, 1] + 0.0722 * ramp[:, 2]).astype(int)
+    shadows = luma[:41].tolist()
+    assert _longest_flat_run(shadows) <= 3, f"{name} merges dark grey steps: {shadows}"
+    for channel in range(3):
+        values = ramp[:41, channel].astype(int).tolist()
+        assert _longest_flat_run(values) <= 4, f"{name} crushes channel {'RGB'[channel]}: {values}"
+    assert luma[40] - luma[0] >= 18, f"{name} compresses the shadows: {shadows}"
+
+
+def _grade_ids_and_chains() -> list[tuple[str, str]]:
+    from app.services.render import FALLBACK_COLOR_GRADES
+
+    chains = [(grade_id, grade["ffmpeg_filter"]) for grade_id, grade in COLOR_GRADES.items()]
+    chains += [(f"fallback:{grade_id}", grade["ffmpeg_filter"]) for grade_id, grade in FALLBACK_COLOR_GRADES.items()]
+    return chains
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("grade_id", "chain"), _grade_ids_and_chains(), ids=[g for g, _ in _grade_ids_and_chains()])
+def test_color_grades_keep_shadow_detail(grade_id: str, chain: str) -> None:
+    # Regression: e.g. bleach_bypass mapped grey 0–21 to black (eq contrast around mid-grey
+    # + an S-curve), teal_orange 0–9, vivid 0–7. Adjacent dark steps must stay distinct.
+    _assert_shadow_detail(grade_id, _graded_rgb(chain, _ramp_card())[0])
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("grade_id", list(COLOR_GRADES))
+def test_rendered_grades_keep_shadow_detail(grade_id: str, tmp_path: typing.Any) -> None:
+    # The renderer's own grade stage (expensive runs baked into a 3D LUT) must keep them too.
+    from app.services import render
+
+    steps = render._grade_steps(grade_id, tmp_path)
+    chain = ",".join(step.value for step in steps if step.kind == "filters")
+    _assert_shadow_detail(f"rendered {grade_id}", _graded_rgb(chain, _ramp_card())[0])
+
+
+# Each grade's character, measured on the grey ramp (Y = luma, R−G / B−G = tint) and the
+# colour patches (saturation relative to the original). The pre-retune grades had the
+# same character; the retune only changed how the shadows are reached.
+_LOOKS: dict[str, dict[str, tuple[float, float]]] = {
+    "natural": {"sat": (1.0, 1.15), "contrast": (1.03, 1.2), "rg128": (-3, 3), "bg128": (-3, 3)},
+    "teal_orange": {"sat": (1.1, 1.4), "contrast": (1.15, 1.45), "rg40": (-20, -3), "bg40": (3, 20),
+                    "rg128": (6, 30), "bg128": (-40, -12)},
+    "warm_film": {"black": (6, 20), "white": (225, 245), "rg128": (4, 20), "bg128": (-30, -8), "bg220": (-40, -15)},
+    "cool_night": {"sat": (0.75, 0.95), "rg128": (-15, -2), "bg128": (8, 30), "bg220": (8, 30)},
+    "bleach_bypass": {"sat": (0.6, 0.8), "contrast": (1.4, 1.8), "rg128": (-6, 6)},
+    "faded_pastel": {"sat": (0.55, 0.75), "black": (18, 35), "white": (230, 245), "contrast": (0.75, 0.95)},
+    "mono_noir": {"sat": (0.0, 0.02), "contrast": (1.3, 1.6)},
+    "vivid": {"sat": (1.25, 1.5), "contrast": (1.1, 1.3)},
+    "golden_hour": {"sat": (1.0, 1.25), "rg128": (8, 25), "bg128": (-35, -15), "rg220": (12, 30)},
+    "neon_night": {"sat": (1.1, 1.4), "contrast": (1.25, 1.55), "rg40": (5, 25), "bg40": (8, 30)},
+    "forest_moody": {"black": (3, 15), "rg40": (-20, -5), "bg128": (-12, -2)},
+    "lavender_haze": {"sat": (0.6, 0.8), "black": (15, 30), "rg128": (1, 10), "bg128": (3, 12)},
+}  # fmt: skip
+
+
+def _look(frame: np.ndarray) -> dict[str, float]:
+    ramp = frame[0]
+    luma = 0.2126 * ramp[:, 0] + 0.7152 * ramp[:, 1] + 0.0722 * ramp[:, 2]
+    look = {"black": luma[0], "white": luma[255], "contrast": (luma[170] - luma[85]) / 85}
+    for code in (40, 128, 220):
+        look[f"rg{code}"] = ramp[code, 0] - ramp[code, 1]
+        look[f"bg{code}"] = ramp[code, 2] - ramp[code, 1]
+    ratios = [
+        colorsys.rgb_to_hsv(*(frame[1 + i, 128] / 255.0))[1] / colorsys.rgb_to_hsv(*(np.array(rgb) / 255.0))[1]
+        for i, rgb in enumerate(_SHADOW_PATCHES)
+    ]
+    look["sat"] = float(np.mean(ratios))
+    return look
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("grade_id", list(COLOR_GRADES))
+def test_color_grades_keep_their_look(grade_id: str) -> None:
+    look = _look(_graded_rgb(COLOR_GRADES[grade_id]["ffmpeg_filter"], _ramp_card()))
+    assert set(_LOOKS) == set(COLOR_GRADES)
+    for key, (low, high) in _LOOKS[grade_id].items():
+        assert low <= look[key] <= high, f"{grade_id}: {key}={look[key]:.3f} not in [{low}, {high}]"

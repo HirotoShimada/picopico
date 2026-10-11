@@ -321,6 +321,62 @@ def test_audio_is_aligned_and_faithful(demo_dir: Path, tmp_path: Path, source: s
     assert rms(rendered[-int(0.05 * SR) :]) < 0.3 * rms(reference[-int(0.05 * SR) :]) + 1e-4
 
 
+def _decode_stereo(path: Path) -> np.ndarray:
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-i", str(path), "-vn", "-f", "f32le", "-ac", "2", "-"]
+    raw = subprocess.run(cmd, capture_output=True, check=True, timeout=120).stdout
+    return np.frombuffer(raw, dtype="<f4").astype(np.float64).reshape(-1, 2)
+
+
+def _audio_chain_of(graph: str) -> str:
+    return next(line for line in graph.splitlines() if "[aout]" in line)
+
+
+def test_hot_master_is_turned_down_to_the_true_peak_ceiling(demo_dir: Path, tmp_path: Path) -> None:
+    # Regression: a 0 dBFS square-ish master went straight into the AAC encoder, whose
+    # overshoot decoded above full scale (clipping). Now the segment's true peak is
+    # measured and only a pure linear gain brings it down to -1 dBTP.
+    import soundfile as sf
+
+    rate = 48000
+    t = np.arange(int(rate * 4.0)) / rate
+    square = np.clip(3.0 * np.sin(2 * np.pi * 220.0 * t), -1.0, 1.0)  # hard-clipped: 0 dBFS, overs between samples
+    hot = tmp_path / "hot master.wav"
+    sf.write(hot, np.stack([square, square], axis=1).astype(np.float32), rate, subtype="PCM_16")
+    spec = small_spec(tmp_path, demo_dir, audio_path=str(hot), audio_start=0.5, duration=3.0,
+                      shots=[RenderShot(clip_path=str(demo_dir / "clip_03.mp4"), src_in=0.0, duration=3.0)])  # fmt: skip
+    result = render_video(spec)
+
+    peak = render_mod._true_peak_dbtp(str(hot), 0.5, render_mod._audio_chain(spec, render_mod._probe_audio(str(hot))))
+    assert peak is not None and peak > -0.1
+    assert result.audio_gain_db == pytest.approx(render_mod.TRUE_PEAK_CEILING_DBTP - peak, abs=1e-3)
+    chain = _audio_chain_of((tmp_path / "work" / "filtergraph.txt").read_text(encoding="utf-8"))
+    assert chain.endswith(f"volume={result.audio_gain_db:.4f}dB[aout]"), chain
+    assert "loudnorm" not in chain and "compand" not in chain and "alimiter" not in chain
+
+    rendered = _decode_stereo(Path(result.output_path))
+    assert float(np.abs(rendered).max()) < 1.0  # no overs after the AAC round trip
+    # A pure gain: the steady middle keeps the source's shape, only quieter by the gain.
+    middle = rendered[int(0.5 * rate) : int(2.0 * rate), 0]
+    source = square[int(1.0 * rate) : int(2.5 * rate)]
+    level_db = 20 * math.log10(float(np.sqrt(np.mean(middle**2))) / float(np.sqrt(np.mean(source**2))))
+    assert level_db == pytest.approx(result.audio_gain_db, abs=0.15)
+
+
+@pytest.mark.parametrize(("source", "start"), [("demo_song.mp3", 24.0), ("demo_song.wav", 8.0)])
+def test_audio_below_the_ceiling_is_not_touched(demo_dir: Path, tmp_path: Path, source: str, start: float) -> None:
+    # The demo song peaks below -1 dBTP here: no gain stage at all (the same encode path as before).
+    spec = small_spec(tmp_path, demo_dir, audio_path=str(demo_dir / source), audio_start=start, duration=3.0,
+                      shots=[RenderShot(clip_path=str(demo_dir / "clip_03.mp4"), src_in=0.0, duration=3.0)])  # fmt: skip
+    audio = render_mod._probe_audio(str(demo_dir / source))
+    peak = render_mod._true_peak_dbtp(str(demo_dir / source), start, render_mod._audio_chain(spec, audio))
+    assert peak is not None and peak < render_mod.TRUE_PEAK_CEILING_DBTP
+    result = render_video(spec)
+    assert result.audio_gain_db == 0.0
+    chain = _audio_chain_of((tmp_path / "work" / "filtergraph.txt").read_text(encoding="utf-8"))
+    assert "volume" not in chain
+    assert chain == "[1:a:0]" + ",".join(render_mod._audio_chain(spec, audio)) + "[aout]"
+
+
 def test_mono_low_rate_audio_is_upmixed_and_resampled(demo_dir: Path, tmp_path: Path) -> None:
     mono = tmp_path / "mono 22k.wav"
     subprocess.run(
@@ -698,17 +754,22 @@ def _centroid(frame: np.ndarray, near: tuple[float, float], radius: int = 90) ->
     return float(xs.mean()) + x0, float(ys.mean()) + y0
 
 
-def _expected(point: tuple[int, int], plan: Any, t: float) -> tuple[float, float]:
-    """Where a source point should be at time ``t`` (same zoom/pan curve as the renderer, unclamped)."""
+def _expected(
+    point: tuple[float, float], plan: Any, t: float, *, source: tuple[int, int] = (_KB_W, _KB_H)
+) -> tuple[float, float]:
+    """Where the centre of source pixel ``point`` should be at time ``t``: the exact
+    (continuous, unclamped) zoom/pan curve, pixel centres at +0.5."""
     seconds = plan.frames / 30
     u = min(max(t / seconds, 0.0), 1.0)
     ease = 0.5 * u + 0.5 * u * u * (3 - 2 * u)
     zoom = plan.zoom_from + (plan.zoom_to - plan.zoom_from) * ease
-    scaled_w, scaled_h = math.ceil(_KB_W * zoom), math.ceil(_KB_H * zoom)
+    cover = max(_KB_W / source[0], _KB_H / source[1])
+    scaled_w, scaled_h = source[0] * cover * zoom, source[1] * cover * zoom
     dir_x, dir_y, travel_x, travel_y = render_mod._pan_travel(plan.shot.pan, seconds, _KB_W, _KB_H)
     crop_x = (scaled_w - _KB_W) / 2 + dir_x * travel_x * (ease - 0.5)
     crop_y = (scaled_h - _KB_H) / 2 + dir_y * travel_y * (ease - 0.5)
-    return point[0] * scaled_w / _KB_W - crop_x, point[1] * scaled_h / _KB_H - crop_y
+    scale = cover * zoom
+    return (point[0] + 0.5) * scale - crop_x - 0.5, (point[1] + 0.5) * scale - crop_y - 0.5
 
 
 def test_ken_burns_zoom_in_stays_centred(tmp_path: Path) -> None:
@@ -742,3 +803,58 @@ def test_ken_burns_pan_with_zoom_in_travels_the_full_distance(tmp_path: Path) ->
     _, _, travel_x, _ = render_mod._pan_travel("right", plan.frames / 30, _KB_W, _KB_H)
     # Panning right moves the content left by the planned travel (plus the zoom's own drift).
     assert first_x - last_x >= 0.9 * (want_first[0] - want_last[0]) > 0.5 * travel_x
+
+
+def _weighted_centroid(frame: np.ndarray, near: tuple[float, float], radius: int = 24) -> tuple[float, float]:
+    """Intensity-weighted centroid (sub-pixel) of the bright dot near ``near`` in a grey frame."""
+    x0, y0 = int(near[0]) - radius, int(near[1]) - radius
+    window = frame[y0 : int(near[1]) + radius, x0 : int(near[0]) + radius].astype(np.float64)
+    window = np.where(window > 16, window, 0.0)
+    ys, xs = np.mgrid[0 : window.shape[0], 0 : window.shape[1]]
+    total = window.sum()
+    assert total > 0, f"no dot near {near}"
+    return float((window * xs).sum() / total) + x0, float((window * ys).sum() / total) + y0
+
+
+@pytest.mark.parametrize(
+    ("zoom_from", "zoom_to", "pan"), [(1.0, 1.08, "center"), (1.0, 1.0, "right"), (1.1, 1.04, "up")]
+)
+def test_ken_burns_motion_is_sub_pixel_smooth(tmp_path: Path, zoom_from: float, zoom_to: float, pan: str) -> None:
+    # Regression: the crop offset and the zoomed size were whole pixels, so a pan moved
+    # 1 px, 2 px, 1 px … per frame and a zoom stepped (≈ 0.9 px off the smooth curve),
+    # which judders on real footage. Every frame must now sit on the eased curve.
+    source = (360, 640)  # upscaled 1.5× like a 720p clip in a 1080p video
+    dots = [(180, 320), (60, 80), (290, 560)]
+    boxes = ",".join(f"drawbox=x={x - 4}:y={y - 4}:w=9:h=9:c=white:t=fill" for x, y in dots)
+    clip = make_clip(tmp_path / "dots.mp4", f"color=c=black:s={source[0]}x{source[1]}:r=30,{boxes}", 2.5,
+                     fps=30, pix_fmt="yuv444p", extra=["-qp", "0"])  # fmt: skip
+    spec = RenderSpec(
+        shots=[RenderShot(clip_path=str(clip), src_in=0.0, duration=2.0, zoom_from=zoom_from, zoom_to=zoom_to,
+                          pan=pan)],
+        audio_path="", audio_start=0.0, duration=2.0, lyric_lines=[], lyric_style="simple", text_style={},
+        color_grade="natural", output_path="", work_dir="", width=_KB_W, height=_KB_H,
+    )  # fmt: skip
+    plans, _ = render_mod._plan_shots(spec, {str(clip): render_mod._probe_clip(str(clip))})
+    chain = render_mod._shot_chain(0, plans[0], spec)
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-i", str(clip), "-filter_complex", chain, "-map", "[s0]",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-"]  # fmt: skip
+    raw = subprocess.run(cmd, capture_output=True, check=True, timeout=120).stdout
+    frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, _KB_H, _KB_W)
+    assert len(frames) == plans[0].frames == 60
+
+    errors: list[float] = []
+    for dot in dots:
+        track: list[tuple[float, float]] = []
+        for n, frame in enumerate(frames):
+            ex, ey = _expected(dot, plans[0], n / 30, source=source)
+            if not (30 < ex < _KB_W - 30 and 30 < ey < _KB_H - 30):
+                break
+            mx, my = _weighted_centroid(frame, (ex, ey))
+            errors += [abs(mx - ex), abs(my - ey)]
+            track.append((mx, my))
+        if len(track) > 10:
+            # Uniform motion: frame-to-frame steps change smoothly (no 1 px / 2 px alternation).
+            steps = np.diff(np.array(track), axis=0)
+            assert float(np.abs(np.diff(steps, axis=0)).max()) < 0.5, (dot, np.diff(steps, axis=0))
+    assert len(errors) > 200
+    assert max(errors) < 0.25, max(errors)

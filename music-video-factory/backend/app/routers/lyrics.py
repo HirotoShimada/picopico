@@ -1,22 +1,33 @@
 """Lyrics: text/file input, manual line edits, auto-timing and LRC/SRT export (ARCHITECTURE.md §5.4).
 
 The user's text is stored verbatim (``lyrics_text``) and never rewritten;
-``lyric_lines`` carry the timing used for rendering.
+``lyric_lines`` carry the timing used for rendering. Re-saved lyrics keep the
+ids of unchanged lines (``pipeline.carry_over_lyric_lines``); a change of the
+lyric text (not of timing) un-confirms the ``lyrics_rights`` checklist item and
+says so in ``warnings``.
 """
 
 from __future__ import annotations
 
 import shutil
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, File, Query, UploadFile
 from fastapi.responses import Response
+from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import DbSession
 from app.models import Project, utcnow
-from app.pipeline import retime_line
+from app.pipeline import (
+    LYRICS_RIGHTS_RESET_MESSAGE,
+    carry_over_lyric_lines,
+    lyric_ids_in_use,
+    retime_line,
+    revoke_right,
+)
 from app.schemas import (
     AutoTimeOut,
     AutoTimeRequest,
@@ -28,7 +39,14 @@ from app.schemas import (
 )
 from app.security import CurrentUser, get_owned_project
 from app.services.errors import MediaValidationError, ServiceError, WhisperUnavailable
-from app.services.lyrics_parse import decode_bytes_with_info, detect_format, parse_lyrics, to_lrc, to_srt
+from app.services.lyrics_parse import (
+    decode_bytes_with_info,
+    detect_format,
+    is_heading_line,
+    parse_lyrics,
+    to_lrc,
+    to_srt,
+)
 from app.services.lyrics_timing import auto_time
 from app.services.media import check_extension, sanitize_filename
 from app.storage import build_content_disposition, get_storage
@@ -41,24 +59,43 @@ _FORMAT_BY_EXTENSION = {".lrc": "lrc", ".srt": "srt", ".txt": "auto"}
 _WORD_SPAN_TOLERANCE = 0.05
 
 
-def _parse_and_store(project: Project, text: str, fmt: str, warnings: list[str]) -> LyricsParseOut:
+def _line_texts(lines: Iterable[Mapping[str, Any]] | None) -> list[str]:
+    """The sung line texts. Section headings (``[サビ]``) are not lyrics: older versions stored them as
+    lines, and the parser now leaves them out, so dropping them is no change of the lyrics."""
+    texts = (str(line.get("text") or "") for line in lines or [])
+    return [text for text in texts if not is_heading_line(text)]
+
+
+def _store_lines(project: Project, lines: list[dict[str, Any]]) -> list[str]:
+    """Store new lyric lines; changed line texts un-confirm ``lyrics_rights`` (returns the warning)."""
+    text_changed = _line_texts(project.lyric_lines) != _line_texts(lines)
+    project.lyric_lines = lines
+    project.updated_at = utcnow()
+    if text_changed and revoke_right(project, "lyrics_rights"):
+        return [LYRICS_RIGHTS_RESET_MESSAGE]
+    return []
+
+
+def _parse_and_store(db: Session, project: Project, text: str, fmt: str, warnings: list[str]) -> LyricsParseOut:
+    """Parse and store the lyrics. Lines keep the ids (and timing) of the lines they replace (re-saving
+    never moves a video's per-line overrides to another lyric); changed text resets ``lyrics_rights``."""
     resolved = detect_format(text) if fmt == "auto" else fmt
     lines, parse_warnings = parse_lyrics(text, resolved)
+    merged = carry_over_lyric_lines(project.lyric_lines, lines, reserved_ids=lyric_ids_in_use(db, project.id))
     project.lyrics_text = text
     project.lyrics_format = resolved
-    project.lyric_lines = [dict(line) for line in lines]
-    project.updated_at = utcnow()
+    rights_warnings = _store_lines(project, merged)
     return LyricsParseOut(
         format=resolved,  # type: ignore[arg-type]
         lines=project.lyric_lines,  # type: ignore[arg-type]
-        warnings=list(dict.fromkeys([*warnings, *parse_warnings])),
+        warnings=list(dict.fromkeys([*rights_warnings, *warnings, *parse_warnings])),
     )
 
 
 @router.put("/projects/{project_id}/lyrics", response_model=LyricsParseOut)
 def put_lyrics(project_id: str, body: LyricsUpdate, db: DbSession, user: CurrentUser) -> LyricsParseOut:
     project = get_owned_project(db, project_id, user)
-    out = _parse_and_store(project, body.text, body.format, [])
+    out = _parse_and_store(db, project, body.text, body.format, [])
     db.commit()
     return out
 
@@ -78,7 +115,7 @@ def upload_lyrics(
     if len(data) > MAX_LYRICS_BYTES:
         raise MediaValidationError("歌詞ファイルが上限（1 MB）を超えています。", status_code=413, code="file_too_large")
     decoded = decode_bytes_with_info(data)
-    out = _parse_and_store(project, decoded.text, _FORMAT_BY_EXTENSION[ext], list(decoded.warnings))
+    out = _parse_and_store(db, project, decoded.text, _FORMAT_BY_EXTENSION[ext], list(decoded.warnings))
     db.commit()
     return out
 
@@ -106,7 +143,7 @@ def put_lyric_lines(project_id: str, body: LyricLinesUpdate, db: DbSession, user
 
     Karaoke word timings follow an edited line (rescaled from the words' own
     span to the new line span) and are dropped when the line text no longer
-    matches them.
+    matches them. Changing a line's text (not only its timing) resets ``lyrics_rights``.
     """
     project = get_owned_project(db, project_id, user)
     lines: list[dict[str, Any]] = []
@@ -128,10 +165,9 @@ def put_lyric_lines(project_id: str, body: LyricLinesUpdate, db: DbSession, user
                 data = retime_line({**data, "start": first, "end": last}, start, end)
                 data["source"] = source
         lines.append(data)
-    project.lyric_lines = lines
-    project.updated_at = utcnow()
+    warnings = _store_lines(project, lines)
     db.commit()
-    return LyricLinesOut(lines=project.lyric_lines)  # type: ignore[arg-type]
+    return LyricLinesOut(lines=project.lyric_lines, warnings=warnings)  # type: ignore[arg-type]
 
 
 @router.post("/projects/{project_id}/lyrics/auto-time", response_model=AutoTimeOut)

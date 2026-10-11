@@ -13,13 +13,21 @@ class ServiceError(Exception):
     status_code: int = 500
     code: str | None = None
 
-    def __init__(self, message: str = "", *, status_code: int | None = None, code: str | None = None):
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         super().__init__(message)
         self.message = message
         if status_code is not None:
             self.status_code = status_code
         if code is not None:
             self.code = code
+        self.headers = dict(headers or {})  # extra response headers, e.g. ``Retry-After`` on a 429
 
     def __str__(self) -> str:
         return self.message

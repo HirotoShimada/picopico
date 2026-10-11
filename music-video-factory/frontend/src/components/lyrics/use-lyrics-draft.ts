@@ -3,8 +3,9 @@
 import * as React from "react";
 import { useSWRConfig } from "swr";
 
+import { recordRightsResets } from "@/components/rights/rights-reset";
 import { apiPaths, updateLyricLines } from "@/lib/api";
-import type { LyricLine, LyricsOut } from "@/lib/types";
+import type { LyricLine, LyricsOut, ProjectOut } from "@/lib/types";
 
 import { fillMissingEnds, linesEqual } from "./timing";
 
@@ -95,8 +96,16 @@ export interface LyricsDraft {
   commit: (lines: LyricLine[]) => Promise<LyricLine[]>;
 }
 
-/** Local editing state for the lyric timing table, kept in sync with `GET /lyrics`. */
-export function useLyricsDraft(projectId: string, serverLines: LyricLine[] | undefined, songDuration: number | null): LyricsDraft {
+/**
+ * Local editing state for the lyric timing table, kept in sync with `GET /lyrics`. `rights` is the
+ * project's checklist: saving changed line texts un-confirms `lyrics_rights` (remembered for the notices).
+ */
+export function useLyricsDraft(
+  projectId: string,
+  serverLines: LyricLine[] | undefined,
+  songDuration: number | null,
+  rights: ProjectOut["rights"] | undefined,
+): LyricsDraft {
   const { mutate } = useSWRConfig();
   const [state, dispatch] = React.useReducer(reducer, serverLines, (lines) => ({
     server: lines,
@@ -118,13 +127,18 @@ export function useLyricsDraft(projectId: string, serverLines: LyricLine[] | und
         await mutate<LyricsOut>(apiPaths.lyrics(projectId), (current) => (current ? { ...current, lines: result.lines } : current), {
           revalidate: false,
         });
-        void mutate(apiPaths.project(projectId));
+        if (result.warnings?.length) {
+          const project = await mutate<ProjectOut>(apiPaths.project(projectId)).catch(() => undefined);
+          recordRightsResets(projectId, rights, project?.rights, result.warnings);
+        } else {
+          void mutate(apiPaths.project(projectId));
+        }
         return result.lines;
       } finally {
         setSaving(false);
       }
     },
-    [mutate, projectId, songDuration],
+    [mutate, projectId, songDuration, rights],
   );
 
   const draft = state.draft;

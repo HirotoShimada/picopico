@@ -22,6 +22,7 @@ from uuid import uuid4
 from sqlalchemy import (
     JSON,
     Boolean,
+    Connection,
     DateTime,
     Dialect,
     Float,
@@ -31,6 +32,8 @@ from sqlalchemy import (
     String,
     Text,
     TypeDecorator,
+    event,
+    select,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
@@ -226,7 +229,9 @@ class Project(Base):
     clips: Mapped[list[Clip]] = relationship(back_populates="project", cascade="all, delete-orphan")
     batches: Mapped[list[Batch]] = relationship(back_populates="project", cascade="all, delete-orphan")
     videos: Mapped[list[Video]] = relationship(back_populates="project", cascade="all, delete")
-    cost_records: Mapped[list[CostRecord]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    # No delete cascade: usage history outlives the project (the ORM sets ``project_id`` to NULL, as does the
+    # database's ON DELETE SET NULL); ``CostRecord.owner_id`` keeps it attributed to the user.
+    cost_records: Mapped[list[CostRecord]] = relationship(back_populates="project")
 
 
 class Asset(Base):
@@ -337,10 +342,18 @@ class Video(Base):
 
 
 class CostRecord(Base):
+    """One billed (or cache-avoided) unit of spend.
+
+    Records are kept when their project is deleted (``project_id`` becomes NULL) so usage totals never
+    shrink; ``owner_id`` is filled from the project on insert (see ``_fill_cost_record_owner``).
+    Both columns are nullable so ``init_db`` can upgrade databases created before (``app.db``).
+    """
+
     __tablename__ = "cost_records"
 
     id: Mapped[str] = mapped_column(ID, primary_key=True, default=new_id)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), index=True)
+    owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     batch_id: Mapped[str | None] = mapped_column(ForeignKey("batches.id", ondelete="SET NULL"), index=True)
     clip_id: Mapped[str | None] = mapped_column(ForeignKey("clips.id", ondelete="SET NULL"), index=True)
     kind: Mapped[str] = mapped_column(String(24))
@@ -354,6 +367,13 @@ class CostRecord(Base):
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
 
-    project: Mapped[Project] = relationship(back_populates="cost_records")
+    project: Mapped[Project | None] = relationship(back_populates="cost_records")
     batch: Mapped[Batch | None] = relationship(back_populates="cost_records")
     clip: Mapped[Clip | None] = relationship(back_populates="cost_records")
+
+
+@event.listens_for(CostRecord, "before_insert")
+def _fill_cost_record_owner(_mapper: Any, connection: Connection, target: CostRecord) -> None:
+    """Every record is attributed to the project's owner, whichever code path created it."""
+    if target.owner_id is None and target.project_id is not None:
+        target.owner_id = connection.scalar(select(Project.owner_id).where(Project.id == target.project_id))

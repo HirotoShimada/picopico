@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, File, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import select
 
 from app.config import get_settings
@@ -65,10 +65,17 @@ class _StagedClip:
 
 
 @router.get("/projects/{project_id}/clips", response_model=list[ClipOut])
-def list_clips(project_id: str, db: DbSession, user: CurrentUser) -> list[ClipOut]:
+def list_clips(
+    project_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    include_cancelled: Annotated[bool, Query(description="false: キャンセルされた素材を除く")] = True,
+) -> list[ClipOut]:
     project = get_owned_project(db, project_id, user)
-    clips = db.scalars(select(Clip).where(Clip.project_id == project.id).order_by(Clip.created_at, Clip.id)).all()
-    return to_clip_outs(db, clips)
+    stmt = select(Clip).where(Clip.project_id == project.id).order_by(Clip.created_at, Clip.id)
+    if not include_cancelled:
+        stmt = stmt.where(Clip.status != ClipStatus.CANCELLED)
+    return to_clip_outs(db, db.scalars(stmt).all())
 
 
 def _stage(upload: UploadFile, max_bytes: int, temp_paths: list[Path]) -> _StagedClip:

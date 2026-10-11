@@ -141,7 +141,7 @@ async def _service_error_handler(_request: Request, exc: Exception) -> JSONRespo
     content: dict[str, object] = {"detail": exc.message or "処理中にエラーが発生しました。"}
     if exc.code:
         content["code"] = exc.code
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers or None)
 
 
 async def _storage_not_found_handler(_request: Request, exc: Exception) -> JSONResponse:
@@ -171,7 +171,8 @@ def create_app() -> FastAPI:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["Content-Disposition", "Content-Range", "Accept-Ranges", "Content-Length"],
+        # Retry-After: browser clients can read when a rate-limited request (429) may be repeated.
+        expose_headers=["Content-Disposition", "Content-Range", "Accept-Ranges", "Content-Length", "Retry-After"],
     )
     application.add_exception_handler(ServiceError, _service_error_handler)
     application.add_exception_handler(StorageNotFound, _storage_not_found_handler)

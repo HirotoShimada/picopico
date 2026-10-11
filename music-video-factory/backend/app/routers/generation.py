@@ -21,22 +21,65 @@ from app.config import get_settings
 from app.db import DbSession
 from app.models import Batch, BatchStatus, utcnow
 from app.pipeline import cancel_batch, create_batch, llm_cost_record, preview_batch, update_batch_budget
-from app.routers.videos import zip_response
-from app.schemas import BatchOut, BatchUpdate, Estimate, GenerationSettings, Storyboard, StoryboardRequest
-from app.security import CurrentUser, get_owned_batch, get_owned_project
+from app.routers.videos import zip_link, zip_response
+from app.schemas import (
+    BatchOut,
+    BatchUpdate,
+    Estimate,
+    GenerationSettings,
+    Storyboard,
+    StoryboardRequest,
+    ZipLinkOut,
+)
+from app.security import CurrentUser, SlidingWindowLimiter, get_owned_batch, get_owned_project
 from app.serializers import to_batch_out
+from app.services.errors import ServiceError
 from app.services.media import sanitize_filename
 
 router = APIRouter(tags=["generation"])
 
 
+# Paid Claude previews per user (template previews are not limited). In-process: one inline API process.
+CLAUDE_PREVIEW_LIMIT = 10
+CLAUDE_PREVIEW_WINDOW_SEC = 600
+claude_preview_limiter = SlidingWindowLimiter(CLAUDE_PREVIEW_LIMIT, CLAUDE_PREVIEW_WINDOW_SEC)
+STORYBOARD_LYRICS_RIGHTS_WARNING = (
+    "権利確認の「歌詞の権利」が未確認のため、歌詞を外部の AI（Claude）に送らず、テンプレートで絵コンテを作成しました。"
+    "Claude の絵コンテを見るには、権利確認タブで歌詞の権利を確認してください。"
+)
+
+
+def _claude_preview_allowed(user_id: str) -> None:
+    wait = claude_preview_limiter.acquire(user_id)
+    if wait is not None:
+        raise ServiceError(
+            f"Claude による絵コンテのプレビューは {CLAUDE_PREVIEW_WINDOW_SEC // 60} 分間に "
+            f"{CLAUDE_PREVIEW_LIMIT} 回までです。約 {wait} 秒後にもう一度お試しください。",
+            status_code=429,
+            code="rate_limited",
+            headers={"Retry-After": str(wait)},
+        )
+
+
 @router.post("/projects/{project_id}/storyboard", response_model=Storyboard)
 def preview_storyboard(project_id: str, body: StoryboardRequest, db: DbSession, user: CurrentUser) -> Any:
-    """Storyboard preview (not stored). Uses Claude when configured; its cost is still recorded."""
+    """Storyboard preview (not stored). Uses Claude when configured; its cost is still recorded.
+
+    Claude receives the lyrics, so it is used only when the ``lyrics_rights`` item is confirmed
+    (otherwise the template is used, with a warning), and at most ``CLAUDE_PREVIEW_LIMIT`` times per
+    ``CLAUDE_PREVIEW_WINDOW_SEC`` per user (429 ``rate_limited``).
+    """
     from app.services.storyboard import generate_storyboard
 
     project = get_owned_project(db, project_id, user)
     settings = get_settings()
+    use_claude = settings.anthropic_configured
+    warnings: list[str] = []
+    if use_claude and project.lyric_lines and not (project.rights or {}).get("lyrics_rights"):
+        use_claude = False
+        warnings.append(STORYBOARD_LYRICS_RIGHTS_WARNING)
+    if use_claude:
+        _claude_preview_allowed(user.id)
     storyboard = generate_storyboard(
         title=project.title,
         artist_name=project.artist_name,
@@ -48,9 +91,11 @@ def preview_storyboard(project_id: str, body: StoryboardRequest, db: DbSession, 
         custom_world=body.custom_world or project.custom_world,
         n_scenes=body.scenes,
         seed=None,
-        use_claude=settings.anthropic_configured,
+        use_claude=use_claude,
         artist_aliases=list(project.artist_aliases or []),
     )
+    if warnings:
+        storyboard["warnings"] = [*warnings, *(storyboard.get("warnings") or [])]
     record = llm_cost_record(project.id, None, storyboard)
     if record is not None:
         record.note = "絵コンテのプレビュー（Claude）"
@@ -109,9 +154,19 @@ def cancel_generation_batch(batch_id: str, db: DbSession, user: CurrentUser) -> 
     return to_batch_out(db, batch, include_children=True)
 
 
+def _batch_zip_name(batch: Batch) -> str:
+    project = batch.project
+    return sanitize_filename(f"{project.artist_name}_{project.title}_videos.zip", default="videos.zip")
+
+
 @router.get("/batches/{batch_id}/zip")
 def download_batch_zip(batch_id: str, db: DbSession, user: CurrentUser) -> StreamingResponse:
     batch = get_owned_batch(db, batch_id, user)
-    project = batch.project
-    name = sanitize_filename(f"{project.artist_name}_{project.title}_videos.zip", default="videos.zip")
-    return zip_response(list(batch.videos), name)
+    return zip_response(list(batch.videos), _batch_zip_name(batch))
+
+
+@router.post("/batches/{batch_id}/zip-link", response_model=ZipLinkOut)
+def batch_zip_link(batch_id: str, db: DbSession, user: CurrentUser) -> ZipLinkOut:
+    """Signed link to the ZIP of the batch's finished videos (browser-native download, also in token mode)."""
+    batch = get_owned_batch(db, batch_id, user)
+    return zip_link(user.id, list(batch.videos), _batch_zip_name(batch))

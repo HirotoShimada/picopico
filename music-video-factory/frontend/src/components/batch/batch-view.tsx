@@ -217,11 +217,7 @@ export function BatchView({ batchId }: { batchId: string }) {
               </Button>
             ) : null}
             {hasDone ? (
-              <Button
-                variant="secondary"
-                onClick={() => void zip.downloadBatch(batch.id, `batch_${batch.id.slice(0, 8)}.zip`)}
-                loading={zip.busy}
-              >
+              <Button variant="secondary" onClick={() => void zip.downloadBatch(batch.id)} loading={zip.busy}>
                 {zip.busy ? null : <Download aria-hidden />}
                 完成分を ZIP で保存
               </Button>

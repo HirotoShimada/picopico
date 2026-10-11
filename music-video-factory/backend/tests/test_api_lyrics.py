@@ -21,16 +21,25 @@ def test_put_text_keeps_it_verbatim(client: TestClient, ready_project: Project, 
     text = (demo_dir / "demo_lyrics_ja.txt").read_text(encoding="utf-8") + "\n\n  最後の行　全角スペース  \n"
     body = client.put(_url(ready_project), json={"text": text}).json()
     assert body["format"] == "txt" and len(body["lines"]) == 11
+    # The ten lines the project already had keep their ids and LRC timing; the added line is new and untimed.
     assert body["lines"][0] == {
         "id": "l001",
         "text": "夜明け前の街を ひとりで歩いた",
+        "start": 8.0,
+        "end": 12.0,
+        "words": None,
+        "source": "lrc",
+        "confidence": None,
+    }
+    assert body["lines"][-1] == {
+        "id": "l011",
+        "text": "最後の行　全角スペース",
         "start": None,
         "end": None,
         "words": None,
         "source": "txt",
         "confidence": None,
     }
-    assert body["lines"][-1]["text"] == "最後の行　全角スペース"
     stored = client.get(_url(ready_project)).json()
     assert stored["text"] == text and stored["format"] == "txt" and len(stored["lines"]) == 11
 
@@ -88,6 +97,7 @@ def test_put_lines_rescales_or_drops_words(client: TestClient, ready_project: Pr
 
 
 def test_heuristic_auto_time_follows_vocals(client: TestClient, ready_project: Project, demo_dir: Path) -> None:
+    client.put(_url(ready_project), json={"text": ""})  # untimed TXT lines (re-saved lines would keep the LRC timing)
     client.put(_url(ready_project), json={"text": (demo_dir / "demo_lyrics_ja.txt").read_text(encoding="utf-8")})
     response = client.post(_url(ready_project, "/auto-time"), json={"method": "heuristic"})
     assert response.status_code == 200

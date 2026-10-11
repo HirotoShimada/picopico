@@ -10,12 +10,15 @@ export interface WorkspaceReadiness {
   lyricsDirty: boolean;
   clips: number;
   rightsConfirmed: boolean;
+  /** Short names of checklist items un-confirmed by a song / lyric text change (「音源の権利」…). */
+  rightsToRecheck: string[];
 }
 
 export function projectReadiness(
   project: ProjectOut,
   lyrics: { lines: number; timed: number; dirty: boolean },
   hasSegment: boolean,
+  rightsToRecheck: string[] = [],
 ): WorkspaceReadiness {
   return {
     hasAudio: project.audio !== null,
@@ -26,6 +29,7 @@ export function projectReadiness(
     lyricsDirty: lyrics.dirty,
     clips: project.counts.clips,
     rightsConfirmed: project.rights_confirmed_at !== null,
+    rightsToRecheck,
   };
 }
 
@@ -34,7 +38,11 @@ export function generationBlockers(readiness: WorkspaceReadiness): string[] {
   const blockers: string[] = [];
   if (!readiness.hasAudio) blockers.push("音源をアップロードしてください");
   else if (readiness.analysisStatus !== "done") blockers.push("楽曲解析の完了を待ってください");
-  if (!readiness.rightsConfirmed) blockers.push("権利確認の5項目をすべて確認してください");
+  if (readiness.rightsToRecheck.length > 0) {
+    blockers.push(`音源・歌詞が変わったため、権利確認の${readiness.rightsToRecheck.map((name) => `「${name}」`).join("")}を確認し直してください`);
+  } else if (!readiness.rightsConfirmed) {
+    blockers.push("権利確認の5項目をすべて確認してください");
+  }
   return blockers;
 }
 

@@ -30,6 +30,8 @@ export interface ReadinessInput {
   estimate: Estimate | undefined;
   estimateError: boolean;
   estimateStale: boolean;
+  /** Short names of checklist items a song / lyric text change un-confirmed (「音源の権利」…). */
+  rightsToRecheck?: string[];
 }
 
 /**
@@ -45,7 +47,7 @@ export function estimateUnavailableReason(project: ProjectOut): string | null {
   return null;
 }
 
-function projectChecks(project: ProjectOut): ReadinessItem[] {
+function projectChecks(project: ProjectOut, rightsToRecheck: readonly string[]): ReadinessItem[] {
   const items: ReadinessItem[] = [];
   const id = project.id;
 
@@ -102,6 +104,15 @@ function projectChecks(project: ProjectOut): ReadinessItem[] {
 
   if (project.rights_confirmed_at) {
     items.push({ id: "rights", level: "ok", title: "権利確認済み" });
+  } else if (rightsToRecheck.length > 0) {
+    items.push({
+      id: "rights",
+      level: "blocked",
+      title: "権利確認のやり直しが必要です",
+      description: `音源または歌詞が変わったため、${rightsToRecheck.map((name) => `「${name}」`).join("")}が未確認に戻りました。新しい内容について確認してください。`,
+      href: projectTabHref(id, "rights"),
+      linkLabel: "権利確認タブへ",
+    });
   } else {
     items.push({
       id: "rights",
@@ -143,7 +154,7 @@ function lyricsCheck(project: ProjectOut): ReadinessItem {
 
 /** Every check shown next to the 生成開始 button, in display order. */
 export function computeReadiness(input: ReadinessInput): ReadinessItem[] {
-  const items = [...projectChecks(input.project), lyricsCheck(input.project)];
+  const items = [...projectChecks(input.project, input.rightsToRecheck ?? []), lyricsCheck(input.project)];
 
   items.push(
     input.providerReason

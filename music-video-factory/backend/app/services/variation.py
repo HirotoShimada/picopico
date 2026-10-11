@@ -13,8 +13,11 @@
   1.5–6 s, pattern varies per video and with section energy) and sum exactly
   to the video duration (millisecond grid).
 * **Variation** — videos differ by start time, clip order, in-points,
-  horizontal flips, Ken Burns zoom/pan, speed, colour grade and transition;
-  clip usage is balanced so every newly generated clip is used.
+  Ken Burns zoom/pan, speed, colour grade and transition (horizontal flips
+  only with ``settings["allow_mirror"]``: mirroring turns any text in the
+  footage into mirror writing); clip usage is balanced so every newly
+  generated clip is used, and footage that comes back gets a different
+  camera move (or a flip, when allowed).
 
 Everything is deterministic for a given ``seed``; the budget is not an input
 (the estimate, not the plan, decides whether a batch is affordable).
@@ -54,10 +57,9 @@ MIN_SHOT_SEC = 1.5
 MAX_SHOT_SEC = 6.0
 SRC_IN_BUCKET_SEC = 1.0  # in-points closer than this count as the same footage for variety_score
 VARIETY_WARNING_THRESHOLD = 0.35
-VARIETY_WARNING_JA = (
-    "素材の再利用率が高いため、動画間の映像バリエーションが限定的です。"
-    "再利用設定を「バランス」か「バリエーション重視」にすると改善します"
-)
+# First sentence of every variety warning; the rest names the cause and what to change.
+VARIETY_WARNING_JA = "素材の再利用率が高いため、動画間の映像バリエーションが限定的です。"
+FEW_SCENES = 3  # storyboards with at most this many scenes repeat the same scenes as alternate takes
 MIN_NATURAL_SPEED = 0.6  # slower than this looks like obvious slow motion
 GENERATED_EDGE_MARGIN = 0.1  # generated clips often have weak first/last frames
 UPLOAD_EDGE_MARGIN = 0.05
@@ -611,14 +613,26 @@ def _generated_pool(
 # --- per-video planning -------------------------------------------------------------------------------
 
 
+Footage = tuple[str, int]  # (clip ref, in-point bucket)
+Framing = tuple[bool, str, int]  # (mirrored, pan, zoom direction: 1 in, -1 out, 0 still)
+
+
+def _framing(hflip: bool, pan: str, zoom_from: float, zoom_to: float) -> Framing:
+    """How a shot frames its footage: mirrored or not, the pan and the zoom direction."""
+    return bool(hflip), str(pan), (zoom_to > zoom_from) - (zoom_to < zoom_from)
+
+
 @dataclass
 class _Usage:
     global_uses: dict[str, int] = field(default_factory=dict)
     positions: dict[tuple[str, int], int] = field(default_factory=dict)
-    combos: set[tuple[str, int, bool]] = field(default_factory=set)
+    framings: dict[Footage, set[Framing]] = field(default_factory=dict)
 
     def copy(self) -> _Usage:
-        return _Usage(dict(self.global_uses), dict(self.positions), set(self.combos))
+        return _Usage(dict(self.global_uses), dict(self.positions), {k: set(v) for k, v in self.framings.items()})
+
+    def add(self, footage: Footage, framing: Framing) -> None:
+        self.framings.setdefault(footage, set()).add(framing)
 
 
 def _speed_and_in(
@@ -646,14 +660,21 @@ def _speed_and_in(
     return speed, src_in, best
 
 
-def _ken_burns(energy: str, rng: random.Random) -> tuple[float, float, str]:
-    delta = rng.uniform(0.06, 0.12) if energy == "high" else rng.uniform(0.03, 0.07)
-    pan = "center" if rng.random() < (0.3 if energy == "high" else 0.45) else rng.choice(_PANS)
-    base = 1.0 if pan == "center" else 1.06  # a pan needs headroom at both ends
-    if rng.random() < 0.65:
-        zoom_from, zoom_to = base, base + delta
-    else:
-        zoom_from, zoom_to = base + delta, base
+def _ken_burns(
+    energy: str, rng: random.Random, avoid: frozenset[tuple[str, int]] = frozenset()
+) -> tuple[float, float, str]:
+    """(zoom_from, zoom_to, pan); a (pan, zoom direction) in ``avoid`` (the moves this footage
+    already had) is re-drawn a few times, so repeated footage looks different."""
+    for _ in range(6):
+        delta = rng.uniform(0.06, 0.12) if energy == "high" else rng.uniform(0.03, 0.07)
+        pan = "center" if rng.random() < (0.3 if energy == "high" else 0.45) else rng.choice(_PANS)
+        base = 1.0 if pan == "center" else 1.06  # a pan needs headroom at both ends
+        if rng.random() < 0.65:
+            zoom_from, zoom_to = base, base + delta
+        else:
+            zoom_from, zoom_to = base + delta, base
+        if (pan, 1 if zoom_to > zoom_from else -1) not in avoid:
+            break
     return round(zoom_from, 3), round(zoom_to, 3), pan
 
 
@@ -691,6 +712,7 @@ def _plan_video_shots(
     usage: _Usage,
     rng: random.Random,
     library: bool,
+    allow_mirror: bool = False,
 ) -> list[dict[str, Any]]:
     shots: list[dict[str, Any]] = []
     in_video: dict[str, int] = {}
@@ -713,15 +735,20 @@ def _plan_video_shots(
         ]
         clip = pool[min(range(len(pool)), key=costs.__getitem__)]
         speed, src_in, position = _speed_and_in(clip, shot_sec, energy, rng, usage)
-        bucket = int(src_in // SRC_IN_BUCKET_SEC)
-        plain, flipped = (clip.ref, bucket, False), (clip.ref, bucket, True)
-        if plain in usage.combos and flipped not in usage.combos:
-            hflip = True
-        elif plain not in usage.combos:
-            hflip = rng.random() < (0.1 if library else 0.2)
-        else:
-            hflip = rng.random() < 0.5
-        zoom_from, zoom_to, pan = _ken_burns(energy, rng)
+        footage = (clip.ref, int(src_in // SRC_IN_BUCKET_SEC))
+        seen = usage.framings.get(footage, set())
+        hflip = False
+        if allow_mirror:  # mirroring is opt-in: it turns text in the footage into mirror writing
+            plain, flipped = any(not f[0] for f in seen), any(f[0] for f in seen)
+            if plain and not flipped:
+                hflip = True
+            elif not plain:
+                hflip = rng.random() < (0.1 if library else 0.2)
+            else:
+                hflip = rng.random() < 0.5
+        # Footage seen before gets a camera move it has not had with this mirroring.
+        avoid = frozenset((f[1], f[2]) for f in seen if f[0] == hflip)
+        zoom_from, zoom_to, pan = _ken_burns(energy, rng, avoid)
         shots.append(
             {
                 "clip_key": None if library else clip.ref,
@@ -740,7 +767,7 @@ def _plan_video_shots(
         in_video[clip.ref] = in_video.get(clip.ref, 0) + 1
         usage.global_uses[clip.ref] = usage.global_uses.get(clip.ref, 0) + 1
         usage.positions[(clip.ref, position)] = usage.positions.get((clip.ref, position), 0) + 1
-        usage.combos.add((clip.ref, bucket, hflip))
+        usage.add(footage, _framing(hflip, pan, zoom_from, zoom_to))
         previous = clip.ref
         t_ms += duration_ms
     return shots
@@ -799,23 +826,69 @@ def _assign_unused(
         )
         usage.global_uses[clip.ref] = usage.global_uses.get(clip.ref, 0) + 1
         usage.positions[(clip.ref, position)] = usage.positions.get((clip.ref, position), 0) + 1
-        usage.combos.add((clip.ref, int(src_in // SRC_IN_BUCKET_SEC), False))
+        usage.add(
+            (clip.ref, int(src_in // SRC_IN_BUCKET_SEC)),
+            _framing(False, shot["pan"], shot["zoom_from"], shot["zoom_to"]),
+        )
 
 
 def _variety_score(videos: Sequence[Mapping[str, Any]]) -> float:
-    combos: set[tuple[str, int, bool]] = set()
+    """Distinct looks per shot: each footage (clip, in-point bucket) counts once, twice when it
+    comes back framed differently (another camera move or a mirror); further repeats add nothing."""
+    framings: dict[Footage, set[Framing]] = {}
     total = 0
     for video in videos:
         for shot in video["shots"]:
             total += 1
-            combos.add(
-                (
-                    str(shot["clip_key"] or shot["clip_id"]),
-                    int(shot["src_in"] // SRC_IN_BUCKET_SEC),
-                    bool(shot["hflip"]),
-                )
+            footage = (str(shot["clip_key"] or shot["clip_id"]), int(shot["src_in"] // SRC_IN_BUCKET_SEC))
+            framings.setdefault(footage, set()).add(
+                _framing(shot["hflip"], shot["pan"], shot["zoom_from"], shot["zoom_to"])
             )
-    return round(len(combos) / total, 3) if total else 0.0
+    return round(sum(min(2, len(f)) for f in framings.values()) / total, 3) if total else 0.0
+
+
+def _variety_warning(
+    *,
+    library: bool,
+    pool_size: int,
+    pool_target: int,
+    max_new: int | None,
+    reuse: str,
+    shots_total: int,
+    n_scenes: int,
+) -> str:
+    """The variety warning with advice for the causes that apply (Japanese)."""
+    advice: list[str] = []
+    if library:
+        advice.append(
+            f"アップロード素材が {pool_size} 本しかなく、{shots_total} ショットで繰り返し使われています。"
+            "素材を追加でアップロードするか、動画の本数を減らすと改善します"
+        )
+    else:
+        if max_new is not None and pool_size < pool_target:
+            advice.append(
+                f"新規生成の上限（{max_new} 本）により素材が {pool_size} 本に抑えられています。"
+                f"上限を {pool_target} 本程度まで引き上げると改善します"
+            )
+        if reuse == "economy":
+            advice.append("再利用設定が「節約」です。「バランス」か「バリエーション重視」にすると改善します")
+        elif pool_size >= MAX_POOL and math.ceil(shots_total / _REUSE_DIVISOR.get(reuse, 3)) > MAX_POOL:
+            advice.append(
+                f"動画の本数が多く、素材数が上限（{MAX_POOL} 本）に達しています。"
+                "本数を減らすか、何回かに分けて生成すると改善します"
+            )
+        if n_scenes <= FEW_SCENES:
+            advice.append(
+                f"絵コンテのシーンが {n_scenes} 個しかなく、同じ場面の別テイクが多くなります。"
+                "カスタム世界観に場面を書き足すか、絵コンテを作り直してシーンを増やすと改善します"
+            )
+    if not advice:
+        advice.append(
+            "動画の本数を減らすか、再利用設定を「バリエーション重視」にすると改善します"
+            if reuse != "max_variety"
+            else "動画の本数を減らすか、動画を短くすると改善します"
+        )
+    return VARIETY_WARNING_JA + "。".join(advice) + "。"
 
 
 # --- public API ------------------------------------------------------------------------------------------
@@ -869,6 +942,7 @@ def plan_batch(
     ready = [c for c in existing_clips if c.get("id") is not None and c.get("status", "ready") == "ready"]
     scenes = [s for s in (storyboard or {}).get("scenes") or [] if isinstance(s, Mapping) and s.get("prompt_en")]
     pool_target = 0
+    max_new = settings.get("max_new_clips")
     if library:
         uploads = [c for c in ready if c.get("source") == "upload" and (_num(c.get("duration")) or 0) > 0]
         if not uploads:
@@ -891,7 +965,6 @@ def plan_batch(
             key = clip.get("cache_key")
             if key and key not in existing_by_key:
                 existing_by_key[str(key)] = clip
-        max_new = settings.get("max_new_clips")
         pool_target = pool_target_size(reuse, shots_total, shots_per_video, len(scenes))
         weights = _scene_weights(scenes, song, list(zip(starts, cut_lists, strict=True)))
         pool = _generated_pool(
@@ -919,6 +992,7 @@ def plan_batch(
     style_cycle = [s for s in preset["lyric_styles"] if s in LYRIC_STYLES] or ["simple"]
     color_grade = str(settings.get("color_grade") or "auto")
     text_style = {k: v for k, v in dict(settings.get("text_style") or {}).items() if v is not None}
+    allow_mirror = bool(settings.get("allow_mirror", False))
 
     for index in range(count):
         shots: list[dict[str, Any]] = []
@@ -927,7 +1001,7 @@ def plan_batch(
             trial_usage = usage.copy()
             shots = _plan_video_shots(
                 song=song, start=starts[index], durations_ms=cut_lists[index], pool=pool, usage=trial_usage,
-                rng=rng, library=library,
+                rng=rng, library=library, allow_mirror=allow_mirror,
             )  # fmt: skip
             if _shot_signature(shots) not in signatures or attempt == 5:
                 usage = trial_usage
@@ -966,6 +1040,17 @@ def plan_batch(
                 shot["clip_key"] = renumber[shot["clip_key"]]
 
     variety = _variety_score(videos)
+    variety_warning = None
+    if variety < VARIETY_WARNING_THRESHOLD:
+        variety_warning = _variety_warning(
+            library=library,
+            pool_size=len(pool),
+            pool_target=pool_target,
+            max_new=int(max_new) if max_new is not None else None,
+            reuse=reuse,
+            shots_total=shots_total,
+            n_scenes=len(scenes),
+        )
     new_clips = sum(1 for spec in clip_specs if spec["existing_clip_id"] is None)
     stats = {
         "videos": count,
@@ -974,7 +1059,7 @@ def plan_batch(
         "new_clips": new_clips,
         "reused_clips": len(used_refs) if library else len(clip_specs) - new_clips,
         "variety_score": variety,
-        "variety_warning": VARIETY_WARNING_JA if variety < VARIETY_WARNING_THRESHOLD else None,
+        "variety_warning": variety_warning,
         "pool_target": pool_target,
         "clip_duration": clip_duration,
         "shots_per_video": [len(v["shots"]) for v in videos],

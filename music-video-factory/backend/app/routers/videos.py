@@ -12,7 +12,7 @@ import logging
 import zipfile
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -31,8 +31,16 @@ from app.pipeline import (
     prepare_retry,
     regenerate_video_plan,
 )
-from app.schemas import VideoDetailOut, VideoEdit, VideoOut, VideoRegenerateRequest, VideoUpdate, VideoZipRequest
-from app.security import CurrentUser, get_owned_project, get_owned_video
+from app.schemas import (
+    VideoDetailOut,
+    VideoEdit,
+    VideoOut,
+    VideoRegenerateRequest,
+    VideoUpdate,
+    VideoZipRequest,
+    ZipLinkOut,
+)
+from app.security import CurrentUser, get_owned_project, get_owned_video, sign_zip_url
 from app.serializers import to_clip_outs, to_video_out, to_video_outs
 from app.services.errors import ServiceError
 from app.storage import Storage, build_content_disposition, get_storage
@@ -119,16 +127,29 @@ def _iter_zip(storage: Storage, entries: Sequence[_ZipEntry]) -> Iterator[bytes]
         yield sink.take()
 
 
+def _no_videos() -> ServiceError:
+    return ServiceError("ダウンロードできる完成済みの動画がありません。", status_code=409, code="no_videos")
+
+
 def zip_response(videos: Sequence[Video], archive_name: str) -> StreamingResponse:
     """Stream the finished videos as an uncompressed ZIP (MP4 does not compress further)."""
     entries = _zip_entries(videos)
     if not entries:
-        raise ServiceError("ダウンロードできる完成済みの動画がありません。", status_code=409, code="no_videos")
+        raise _no_videos()
     return StreamingResponse(
         _iter_zip(get_storage(), entries),
         media_type="application/zip",
         headers={"Content-Disposition": build_content_disposition(archive_name)},
     )
+
+
+def zip_link(owner_id: str, videos: Sequence[Video], archive_name: str) -> ZipLinkOut:
+    """Signed ``/media-zip`` link to the finished ``videos`` (the browser streams it; no auth header needed)."""
+    ids = [video.id for video in videos if video.status == VideoStatus.DONE and video.asset is not None]
+    if not ids:
+        raise _no_videos()
+    url, exp = sign_zip_url(owner_id, ids, archive_name)
+    return ZipLinkOut(url=url, expires_at=datetime.fromtimestamp(exp, UTC))
 
 
 # --- endpoints ----------------------------------------------------------------------------------------------------
@@ -150,6 +171,7 @@ def list_videos(
     user: CurrentUser,
     favorite: Annotated[bool | None, Query()] = None,
     batch_id: Annotated[str | None, Query(max_length=32)] = None,
+    include_cancelled: Annotated[bool, Query(description="false: キャンセルされた動画を除く")] = True,
 ) -> list[VideoOut]:
     project = get_owned_project(db, project_id, user)
     stmt = (
@@ -162,14 +184,27 @@ def list_videos(
         stmt = stmt.where(Video.favorite.is_(favorite))
     if batch_id:
         stmt = stmt.where(Video.batch_id == batch_id)
+    if not include_cancelled:
+        stmt = stmt.where(Video.status != VideoStatus.CANCELLED)
     return to_video_outs(db, list(db.scalars(stmt)))
+
+
+SELECTION_ZIP_NAME = "videos.zip"
 
 
 @router.post("/videos/zip")
 def zip_selected_videos(body: VideoZipRequest, db: DbSession, user: CurrentUser) -> StreamingResponse:
     ids = list(dict.fromkeys(body.video_ids))
     videos = [get_owned_video(db, video_id, user) for video_id in ids]
-    return zip_response(videos, "videos.zip")
+    return zip_response(videos, SELECTION_ZIP_NAME)
+
+
+@router.post("/videos/zip-link", response_model=ZipLinkOut)
+def zip_link_selected_videos(body: VideoZipRequest, db: DbSession, user: CurrentUser) -> ZipLinkOut:
+    """Like ``POST /videos/zip``, but returns a signed link the browser downloads (and streams) by itself."""
+    ids = list(dict.fromkeys(body.video_ids))
+    videos = [get_owned_video(db, video_id, user) for video_id in ids]
+    return zip_link(user.id, videos, SELECTION_ZIP_NAME)
 
 
 @router.get("/videos/{video_id}", response_model=VideoDetailOut)

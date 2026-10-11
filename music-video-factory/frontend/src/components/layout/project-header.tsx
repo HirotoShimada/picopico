@@ -2,6 +2,7 @@
 
 import * as React from "react";
 
+import { useRightsResets } from "@/components/rights/rights-reset";
 import { Badge } from "@/components/ui/badge";
 import { ErrorState } from "@/components/ui/error-state";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -26,6 +27,7 @@ export interface ProjectHeaderProps {
  */
 export function ProjectHeader({ projectId, active, batchId, actions }: ProjectHeaderProps) {
   const { data: project, error, isLoading, mutate } = useProject(projectId);
+  const rightsResets = useRightsResets(project);
 
   if (error && !project) {
     return (
@@ -56,7 +58,13 @@ export function ProjectHeader({ projectId, active, batchId, actions }: ProjectHe
           meta={
             <>
               <StatusBadge kind="analysis" status={project.analysis_status} />
-              {project.rights_confirmed_at ? <Badge tone="success">権利確認済み</Badge> : <Badge>権利未確認</Badge>}
+              {project.rights_confirmed_at ? (
+                <Badge tone="success">権利確認済み</Badge>
+              ) : rightsResets.length > 0 ? (
+                <Badge tone="warning">権利の再確認が必要</Badge>
+              ) : (
+                <Badge>権利未確認</Badge>
+              )}
             </>
           }
           actions={actions}

@@ -8,14 +8,24 @@ Auth modes (``AUTH_MODE``)
 
 Signed media URLs are capabilities: ``/media/{key}?exp=..&sig=..`` where
 ``sig = HMAC-SHA256(SECRET_KEY, key | exp | download | filename)``.
+Signed ZIP links (``/media-zip/{filename}?owner=..&videos=..&exp=..&sig=..``) let
+a browser stream a ZIP natively, also in token mode: ``sig`` covers the owner,
+the sorted video ids, ``exp`` and the file name, and the videos are checked to
+still belong to that owner when the archive is streamed.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
+import math
+import threading
 import time
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Sequence
 from typing import Annotated
 from urllib.parse import quote, urlencode
 
@@ -232,3 +242,103 @@ def verify_media_signature(
         return False
     expected = _signature(key, exp_int, download, filename)
     return hmac.compare_digest(expected, sig)
+
+
+# --- signed ZIP links ---------------------------------------------------------------------
+
+ZIP_LINK_PATH = "/media-zip"
+_ID_BYTES = 16  # ids are uuid4().hex: 32 hex characters
+
+
+def encode_video_ids(video_ids: Iterable[str]) -> str:
+    """Compact URL form of 32-hex ids (base64url of the raw bytes, 22 chars per id instead of 33)."""
+    raw = b"".join(bytes.fromhex(video_id) for video_id in video_ids)
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_video_ids(token: str | None) -> list[str] | None:
+    """Inverse of :func:`encode_video_ids`; ``None`` for malformed input."""
+    if not token:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    except (binascii.Error, ValueError):
+        return None
+    if not raw or len(raw) % _ID_BYTES:
+        return None
+    return [raw[i : i + _ID_BYTES].hex() for i in range(0, len(raw), _ID_BYTES)]
+
+
+def _zip_signature(owner_id: str, video_ids: Iterable[str], exp: int, filename: str) -> str:
+    secret = get_settings().SECRET_KEY or ""
+    ids = ",".join(sorted(set(video_ids)))
+    message = "\n".join(("zip-link", owner_id, ids, str(exp), filename)).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def sign_zip_url(owner_id: str, video_ids: Sequence[str], filename: str, *, ttl: int | None = None) -> tuple[str, int]:
+    """Absolute ``/media-zip/{filename}`` URL streaming ``video_ids`` of ``owner_id``; returns ``(url, exp)``.
+
+    The ids travel in the given order (the ZIP keeps it); the signature covers them sorted.
+    """
+    settings = get_settings()
+    exp = int(time.time()) + int(ttl if ttl is not None else settings.MEDIA_URL_TTL)
+    params = {
+        "owner": owner_id,
+        "videos": encode_video_ids(video_ids),
+        "exp": str(exp),
+        "sig": _zip_signature(owner_id, video_ids, exp, filename),
+    }
+    url = f"{settings.PUBLIC_API_BASE_URL}{ZIP_LINK_PATH}/{quote(filename, safe='')}?{urlencode(params)}"
+    return url, exp
+
+
+def verify_zip_signature(
+    owner_id: str | None,
+    video_ids: Sequence[str] | None,
+    exp: int | str | None,
+    filename: str,
+    sig: str | None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """True when ``sig`` matches the owner, ids, expiry and file name and ``exp`` is in the future."""
+    if not owner_id or not video_ids or not sig or exp is None:
+        return False
+    try:
+        exp_int = int(exp)
+    except (TypeError, ValueError):
+        return False
+    if exp_int < (now if now is not None else time.time()):
+        return False
+    return hmac.compare_digest(_zip_signature(owner_id, video_ids, exp_int, filename), sig)
+
+
+# --- rate limiting --------------------------------------------------------------------------
+
+
+class SlidingWindowLimiter:
+    """At most ``limit`` events per ``window_sec`` and key (per process; e.g. paid Claude calls per user)."""
+
+    def __init__(self, limit: int, window_sec: float, *, clock: Callable[[], float] = time.monotonic):
+        self.limit = limit
+        self.window_sec = window_sec
+        self._clock = clock
+        self._events: defaultdict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def acquire(self, key: str) -> int | None:
+        """Record an event and return ``None``, or return the seconds until one is allowed (nothing recorded)."""
+        now = self._clock()
+        with self._lock:
+            events = self._events[key]
+            while events and events[0] <= now - self.window_sec:
+                events.popleft()
+            if len(events) >= self.limit:
+                return max(1, math.ceil(events[0] + self.window_sec - now))
+            events.append(now)
+            return None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._events.clear()

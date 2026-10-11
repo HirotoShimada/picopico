@@ -8,7 +8,9 @@ chosen times (plus a contact sheet per style) for visual inspection.
 
 Usage (from backend/):
   .venv/bin/python scripts/render_sample.py [--styles simple,karaoke] [--out var/samples]
-         [--times 2.0,6.0,10.0,13.5] [--preset veryfast] [--start 24] [--duration 15]
+         [--times 2.0,6.0,10.0,13.5] [--preset veryfast] [--start 24] [--duration 15] [--mirror]
+
+Shots are not mirrored unless ``--mirror`` is given (like ``GenerationSettings.allow_mirror``).
 """
 
 from __future__ import annotations
@@ -79,8 +81,8 @@ def load_demo_lines() -> list[dict[str, Any]]:
     return result
 
 
-def demo_shots(duration: float, variant: int) -> list[RenderShot]:
-    """One-bar shots (2 s at 120 BPM) cycling the demo clips with varied motion."""
+def demo_shots(duration: float, variant: int, *, mirror: bool = False) -> list[RenderShot]:
+    """One-bar shots (2 s at 120 BPM) cycling the demo clips with varied motion (flips only with ``mirror``)."""
     clips = [DEMO_DIR / "clip_01.mp4", DEMO_DIR / "clip_02.mp4", DEMO_DIR / "clip_03.mp4"]
     pans = ["center", "left", "up", "right", "down"]
     bar = 4 * 60.0 / DEMO_BPM
@@ -95,7 +97,7 @@ def demo_shots(duration: float, variant: int) -> list[RenderShot]:
                 clip_path=str(clips[k % len(clips)]),
                 src_in=0.4 * (k % 4),
                 duration=round(length, 6),
-                hflip=k % 3 == 1,
+                hflip=mirror and k % 3 == 1,
                 zoom_from=1.0 if zoom_in else 1.08,
                 zoom_to=1.08 if zoom_in else 1.0,
                 pan=pans[k % len(pans)],
@@ -138,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--times", default="2.0,6.0,10.0,13.5", help="frame times (s, relative) to extract")
     parser.add_argument("--preset", default=DEFAULT_PRESET)
     parser.add_argument("--audio", default="demo_song.wav", help="demo audio file name (wav or mp3)")
+    parser.add_argument("--mirror", action="store_true", help="flip every third shot horizontally")
     args = parser.parse_args(argv)
 
     ensure_demo_assets()
@@ -153,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         grade, transition = STYLE_LOOKS.get(style, ("natural", "cut"))
         output = out_dir / f"sample_{style}.mp4"
         spec = RenderSpec(
-            shots=demo_shots(args.duration, variant),
+            shots=demo_shots(args.duration, variant, mirror=args.mirror),
             audio_path=str(DEMO_DIR / args.audio),
             audio_start=args.start,
             duration=args.duration,
@@ -187,11 +190,12 @@ def main(argv: list[str] | None = None) -> int:
                 "passed": report["passed"],
                 "failed_checks": failed,
                 "lufs": report["loudness_lufs"],
+                "audio_gain_db": result.audio_gain_db,
             }
         )
         print(
             f"{style:10s} {grade:13s} {transition:9s} render {render_seconds:5.1f}s  "
-            f"{result.size_bytes / 1e6:5.1f} MB  dur {result.duration:.3f}s  "
+            f"{result.size_bytes / 1e6:5.1f} MB  dur {result.duration:.3f}s  gain {result.audio_gain_db:+.2f} dB  "
             f"quality {'OK' if report['passed'] else 'NG ' + ','.join(failed)}",
             flush=True,
         )

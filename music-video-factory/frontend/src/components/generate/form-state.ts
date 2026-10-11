@@ -42,6 +42,8 @@ export interface GenerateFormState {
   budget: number | null;
   /** Ask Claude for a fresh storyboard (never carried over from the previous batch). */
   newStoryboard: boolean;
+  /** Let the planner flip shots horizontally (mirrors text in the footage; off by default). */
+  allowMirror: boolean;
 }
 
 export type FormErrors = Partial<Record<"customWorld" | "duration" | "count" | "startSec" | "maxNewClips" | "budget", string>>;
@@ -111,6 +113,7 @@ export function initialFormState(
     maxNewClips: source.max_new_clips ?? null,
     budget: source.budget_limit_usd ?? null,
     newStoryboard: false,
+    allowMirror: source.allow_mirror === true,
   };
 }
 
@@ -172,6 +175,7 @@ export function validateForm(state: GenerateFormState, limits: LimitsInfo): Vali
     budget_limit_usd: state.budget,
     seed: null,
     new_storyboard: state.newStoryboard,
+    allow_mirror: state.allowMirror,
   };
   return { errors, settings };
 }

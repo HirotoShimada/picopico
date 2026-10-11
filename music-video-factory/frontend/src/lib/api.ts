@@ -16,6 +16,7 @@ import type {
   BatchOut,
   BatchUpdate,
   CapabilitiesOut,
+  ClipListFilters,
   ClipOut,
   DashboardOut,
   Estimate,
@@ -43,6 +44,7 @@ import type {
   VideoRegenerateRequest,
   VideoUpdate,
   WorldEstimate,
+  ZipLinkOut,
 } from "./types";
 import { navigateToDownload, saveBlob } from "./utils";
 
@@ -409,6 +411,14 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   return (await parseBody(response)) as T;
 }
 
+/**
+ * SWR key matcher for a list path and its filtered variants (`/api/projects/{id}/clips`,
+ * `/api/projects/{id}/clips?include_cancelled=false`), for `mutate(matcher, …)`.
+ */
+export function isListKey(path: string): (key: unknown) => boolean {
+  return (key) => typeof key === "string" && (key === path || key.startsWith(`${path}?`));
+}
+
 /** SWR fetcher: the key is an API path (see `apiPaths`). */
 export function swrFetcher<T>(path: string): Promise<T> {
   return apiRequest<T>(path);
@@ -526,7 +536,8 @@ export const apiPaths = {
   lyricsAutoTime: (projectId: string) => `/api/projects/${enc(projectId)}/lyrics/auto-time`,
   lyricsExport: (projectId: string, format: LyricsExportFormat) =>
     withQuery(`/api/projects/${enc(projectId)}/lyrics/export`, { format }),
-  clips: (projectId: string) => `/api/projects/${enc(projectId)}/clips`,
+  clips: (projectId: string, filters: ClipListFilters = {}) =>
+    withQuery(`/api/projects/${enc(projectId)}/clips`, { include_cancelled: filters.include_cancelled }),
   clipsUpload: (projectId: string) => `/api/projects/${enc(projectId)}/clips/upload`,
   clip: (clipId: string) => `/api/clips/${enc(clipId)}`,
   storyboard: (projectId: string) => `/api/projects/${enc(projectId)}/storyboard`,
@@ -534,12 +545,13 @@ export const apiPaths = {
   projectBatches: (projectId: string) => `/api/projects/${enc(projectId)}/batches`,
   batch: (batchId: string) => `/api/batches/${enc(batchId)}`,
   batchCancel: (batchId: string) => `/api/batches/${enc(batchId)}/cancel`,
-  batchZip: (batchId: string) => `/api/batches/${enc(batchId)}/zip`,
-  videosZip: "/api/videos/zip",
+  batchZipLink: (batchId: string) => `/api/batches/${enc(batchId)}/zip-link`,
+  videosZipLink: "/api/videos/zip-link",
   projectVideos: (projectId: string, filters: VideoListFilters = {}) =>
     withQuery(`/api/projects/${enc(projectId)}/videos`, {
       favorite: filters.favorite,
       batch_id: filters.batch_id,
+      include_cancelled: filters.include_cancelled,
     }),
   video: (videoId: string) => `/api/videos/${enc(videoId)}`,
   videoRetry: (videoId: string) => `/api/videos/${enc(videoId)}/retry`,
@@ -653,8 +665,8 @@ export function downloadLyricsExport(projectId: string, format: LyricsExportForm
 
 // --- §5.5 clips ----------------------------------------------------------------------------------------------
 
-export function listClips(projectId: string): Promise<ClipOut[]> {
-  return apiRequest(apiPaths.clips(projectId));
+export function listClips(projectId: string, filters: ClipListFilters = {}): Promise<ClipOut[]> {
+  return apiRequest(apiPaths.clips(projectId, filters));
 }
 
 /** Upload 1..20 video materials (all-or-nothing on the server). */
@@ -701,26 +713,28 @@ export function updateBatchBudget(batchId: string, body: BatchUpdate): Promise<B
   return apiRequest(apiPaths.batch(batchId), { method: "PATCH", json: body });
 }
 
-/** Absolute URL of the batch ZIP (needs no header only in `AUTH_MODE=dev`). */
-export function batchZipUrl(batchId: string): string {
-  return apiUrl(apiPaths.batchZip(batchId));
+/** Signed link (valid for `MEDIA_URL_TTL`) to the ZIP of the batch's finished videos. 409 `no_videos` when none is done. */
+export function createBatchZipLink(batchId: string): Promise<ZipLinkOut> {
+  return apiRequest(apiPaths.batchZipLink(batchId), { method: "POST" });
+}
+
+/** Signed link to the ZIP of the selected finished videos (kept in this order). */
+export function createVideosZipLink(videoIds: string[]): Promise<ZipLinkOut> {
+  return apiRequest(apiPaths.videosZipLink, { method: "POST", json: { video_ids: videoIds } });
 }
 
 /**
- * Download all finished videos of a batch as ZIP. Without a token the browser
- * streams it natively; with a token it is fetched with the Bearer header.
+ * ZIP downloads ask the API (with the Bearer token in token mode) for a signed `/media-zip/…` link and
+ * let the browser download that link itself: the archive is streamed to disk with the browser's own
+ * progress and cancel, never held in page memory. The file name comes from the server.
  */
-export async function downloadBatchZip(batchId: string, filename = `batch_${batchId}.zip`): Promise<void> {
-  if (!getApiToken()) {
-    navigateToDownload(batchZipUrl(batchId));
-    return;
-  }
-  await downloadAuthenticated(apiPaths.batchZip(batchId), filename);
+export async function downloadBatchZip(batchId: string): Promise<void> {
+  navigateToDownload((await createBatchZipLink(batchId)).url);
 }
 
-/** Download a ZIP of the selected videos (`POST /api/videos/zip`). */
-export function downloadVideosZip(videoIds: string[], filename = "videos.zip"): Promise<void> {
-  return downloadAuthenticated(apiPaths.videosZip, filename, { method: "POST", json: { video_ids: videoIds } });
+/** Download a ZIP of the selected videos (see {@link downloadBatchZip}). */
+export async function downloadVideosZip(videoIds: string[]): Promise<void> {
+  navigateToDownload((await createVideosZipLink(videoIds)).url);
 }
 
 // --- §5.7 videos --------------------------------------------------------------------------------------------------
