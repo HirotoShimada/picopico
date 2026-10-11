@@ -19,6 +19,7 @@ from app.services.storyboard import (
     STORYBOARD_SCHEMA,
     SYSTEM_PROMPT,
     claude_cost_usd,
+    estimate_world,
     generate_storyboard,
 )
 
@@ -407,3 +408,123 @@ def test_claude_cost_pricing() -> None:
     assert claude_cost_usd("claude-opus-5-5", {"cache_read_input_tokens": 1_000_000}) == pytest.approx(0.2)
     assert claude_cost_usd("claude-opus-5-5", {"cache_creation_input_tokens": 1_000_000}) == pytest.approx(5.0)
     assert claude_cost_usd(None, None) == 0.0
+
+
+# --- real people in free text (likeness guard) -------------------------------------------------------------
+
+
+def _provider_text(board: dict[str, Any]) -> str:
+    """Everything that can reach a video model."""
+    english = {k: v for k, v in board["world_bible"].items() if k.endswith("_en")}
+    return json.dumps([english, [(s["prompt_en"], s["negative_prompt_en"]) for s in board["scenes"]]])
+
+
+@pytest.mark.parametrize("aliases", [None, ["Kenshi Yonezu"]])
+def test_romanized_artist_name_in_custom_world_never_reaches_prompts(aliases: list[str] | None) -> None:
+    board = _template(artist_name="米津玄師", artist_aliases=aliases, preset_id="custom", n_scenes=4,
+                      custom_world="Kenshi Yonezu singing on a Tokyo rooftop at night")  # fmt: skip
+    text = _provider_text(board)
+    assert "Kenshi" not in text and "Yonezu" not in text
+    assert all("Setting: singing on a Tokyo rooftop at night" in s["prompt_en"] for s in board["scenes"])
+    assert any("カスタム世界観から" in w for w in board["warnings"])
+
+
+def test_kana_artist_name_is_forbidden_in_romaji_too() -> None:
+    board = _template(artist_name="あいみょん", preset_id="custom", custom_world="Aimyon walking by the sea",
+                      n_scenes=3)  # fmt: skip
+    assert "aimyon" not in _provider_text(board).lower()
+    assert any("アーティスト名を削除" in w for w in board["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("custom_world", "names"),
+    [
+        ("Taylor Swift singing on a neon rooftop in Tokyo", ["Taylor", "Swift"]),
+        ("a man who looks exactly like Keanu Reeves walking in rain", ["Keanu", "Reeves"]),
+        ("YOASOBI style, Lilas Ikuta dancing in the rain", ["Lilas", "Ikuta"]),
+        ("木村拓哉似の男性が雨の東京を歩く", ["trees", "木村"]),  # the glossary used to turn 木 into "trees"
+        ("渋谷で Kenshi Yonezu が歩く夜", ["Kenshi", "Yonezu"]),
+    ],
+)
+def test_other_real_people_in_custom_world_are_removed(custom_world: str, names: list[str]) -> None:
+    board = _template(artist_name="Someone Else", preset_id="custom", custom_world=custom_world, n_scenes=3)
+    text = _provider_text(board)
+    assert not any(name in text for name in names), text
+    assert any("削除しました" in w for w in board["warnings"])
+
+
+def test_ascii_mood_with_a_person_is_not_copied_into_prompts() -> None:
+    board = _template(mood="Billie Eilish vibes", n_scenes=3)
+    assert "Billie" not in _provider_text(board) and "Eilish" not in _provider_text(board)
+    assert any("Billie Eilish" in w for w in board["warnings"])
+    moody = _template(mood="dark, moody and cinematic", n_scenes=3)
+    assert all("dark, moody, cinematic mood" in s["prompt_en"] for s in moody["scenes"])
+
+
+def test_claude_gets_names_from_free_text_as_forbidden_and_its_detected_people_are_removed() -> None:
+    data = _claude_storyboard(3)
+    data["detected_real_people"] = ["Kenshi Yonezu", "Taylor Swift"]
+    data["scenes"][0]["prompt_en"] = "Taylor Swift on a rooftop, " + data["scenes"][0]["prompt_en"]
+    tokens = data["world_bible"]["consistency_tokens_en"]
+    data["world_bible"]["consistency_tokens_en"] = f"Kenshi Yonezu concert look, {tokens}"
+    recorder = _Recorder(lambda r: httpx2.Response(200, json=_message(json.dumps(data))))
+    board = _claude(recorder, n_scenes=3, artist_name="米津玄師", artist_aliases=["Kenshi Yonezu"],
+                    mood="Billie Eilish vibes", preset_id="custom",
+                    custom_world="a man who looks exactly like Keanu Reeves on a rooftop")  # fmt: skip
+    user = json.loads(recorder.requests[0][0]["messages"][0]["content"])
+    names = user["forbidden_likeness"]["names"]
+    assert names[:2] == ["米津玄師", "Kenshi Yonezu"] and "Billie Eilish" in names and "Keanu Reeves" in names
+    rest = json.dumps({k: v for k, v in user.items() if k != "forbidden_likeness"}, ensure_ascii=False)
+    assert "Keanu" not in rest and "Billie" not in rest and "Yonezu" not in rest
+    text = _provider_text(board)
+    assert "Taylor" not in text and "Kenshi" not in text and "Yonezu" not in text
+    # The cleaned consistency tokens still appear verbatim in every prompt.
+    assert all(board["world_bible"]["consistency_tokens_en"] in s["prompt_en"] for s in board["scenes"])
+    assert board["world_bible"]["consistency_tokens_en"].endswith(tokens)
+    assert any("Claude が実在の人物名を 1 件検出" in w for w in board["warnings"])
+    assert "detected_real_people" in STORYBOARD_SCHEMA["required"]
+    assert "detected_real_people" in SYSTEM_PROMPT
+
+
+# --- emotion / world estimate (感情・世界観推定) ------------------------------------------------------------
+
+_ENERGETIC = {"energy": 0.9, "tempo_class": "fast", "brightness": 0.7, "mode_guess": "major",
+              "tags": ["energetic", "upbeat", "bright", "uplifting", "danceable"]}  # fmt: skip
+_MELANCHOLIC = {"energy": 0.1, "tempo_class": "slow", "brightness": 0.2, "mode_guess": "minor",
+                "tags": ["calm", "slow", "dark", "melancholic"]}  # fmt: skip
+
+
+def test_estimate_world_maps_mood_to_presets() -> None:
+    sad = estimate_world({"mood": _MELANCHOLIC}, [], None, None)
+    assert {"melancholic", "calm"} <= set(sad["emotions"])
+    assert sad["recommended_presets"][0] in ("emotional", "nostalgic")
+    loud = estimate_world({"mood": _ENERGETIC}, [], None, None)
+    assert loud["emotions"][0] == "energetic"
+    assert set(loud["recommended_presets"][:2]) & {"urban_night", "cinematic"}
+    assert loud["rationale_ja"].startswith("音源:") and "おすすめ" in loud["rationale_ja"]
+    # Lyrics and the user's input are combined with the audio (the user's words weigh most).
+    lyrics = [{"text": "涙の別れ さよなら 思い出の帰り道"}]
+    merged = estimate_world({"mood": _ENERGETIC}, lyrics, "懐かしい夏", None)
+    assert merged["emotions"][0] == "nostalgic" and merged["recommended_presets"][0] == "nostalgic"
+    assert merged["sources"]["lyrics"] and merged["sources"]["user"] == ["nostalgic"]
+    assert estimate_world(None, [], None, "ライブツアーの告知")["recommended_presets"] == ["documentary"]
+    assert estimate_world(None, [], None, None)["recommended_presets"] == ["cinematic"]
+
+
+def test_audio_mood_shapes_the_template_when_the_user_gave_no_mood() -> None:
+    loud = _template(analysis={**ANALYSIS, "mood": _ENERGETIC}, mood=None)
+    sad = _template(analysis={**ANALYSIS, "mood": _MELANCHOLIC}, mood=None)
+    assert loud["scenes"] != sad["scenes"]
+    assert all(f"{loud['world_estimate']['mood_en']} mood" in s["prompt_en"] for s in loud["scenes"])
+    assert "calm" in sad["world_estimate"]["mood_en"] and "推定" in sad["world_bible"]["summary_ja"]
+    # An explicit mood still wins over the estimate.
+    assert _template(analysis={**ANALYSIS, "mood": _ENERGETIC})["scenes"] == _template()["scenes"]
+
+
+def test_claude_receives_audio_mood_and_estimate() -> None:
+    recorder = _Recorder(lambda r: httpx2.Response(200, json=_message(json.dumps(_claude_storyboard(3)))))
+    board = _claude(recorder, n_scenes=3, analysis={**ANALYSIS, "mood": _MELANCHOLIC})
+    song = json.loads(recorder.requests[0][0]["messages"][0]["content"])["song"]
+    assert song["audio_mood"] == _MELANCHOLIC
+    assert song["world_estimate"]["recommended_presets"] == board["world_estimate"]["recommended_presets"]
+    schemas.Storyboard.model_validate(board)

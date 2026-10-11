@@ -60,6 +60,9 @@ class LyricLine(TypedDict):
 
 DEFAULT_LAST_LINE_SEC = 4.0  # LRC has no end times: the last line is held this long
 LONG_HOLD_WARN_SEC = 15.0
+# Lines starting this close together are one same-time group (translation / duet
+# lines); the renderer stacks them (subtitles._SAME_START uses the same value).
+SAME_TIME_SEC = 0.05
 _TIME_DECIMALS = 3
 
 _NEWLINES = re.compile(r"\r\n|[\r\n\u2028\u2029]")
@@ -399,7 +402,8 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
         if entry.start is None:
             lines.append(make_line(len(lines), entry.text, None, None, source="lrc"))
             continue
-        while pointer < len(timed_starts) and timed_starts[pointer] <= entry.start:
+        # A line ends where the next one starts; lines of the same-time group don't end each other.
+        while pointer < len(timed_starts) and timed_starts[pointer] <= entry.start + SAME_TIME_SEC:
             pointer += 1
         if pointer < len(timed_starts):
             end = timed_starts[pointer]
@@ -439,7 +443,26 @@ def _parse_lrc(text: str) -> tuple[list[LyricLine], list[str]]:
             f"次の行まで {LONG_HOLD_WARN_SEC:.0f} 秒以上表示され続ける行が {long_holds} 行あります。"
             "間奏で表示を消したい場合は終了時刻を調整してください。"
         )
+    same_time = _same_time_groups([line["start"] for line in lines if line["start"] is not None])
+    if same_time:
+        warnings.append(
+            f"同じ時刻の行が {same_time} 組あります（対訳・デュエットなど）。動画では上下に並べて表示します。"
+        )
     return lines, warnings
+
+
+def _same_time_groups(starts: Sequence[float]) -> int:
+    """Number of groups of two or more lines starting within ``SAME_TIME_SEC`` of each other."""
+    groups = 0
+    group_start: float | None = None
+    size = 0
+    for start in sorted(starts):
+        if group_start is not None and start - group_start <= SAME_TIME_SEC:
+            size += 1
+            continue
+        groups += size >= 2
+        group_start, size = start, 1
+    return groups + (size >= 2)
 
 
 # --------------------------------------------------------------------------- SRT

@@ -5,9 +5,12 @@ One FFmpeg invocation renders the whole video:
 * every shot is its own input (``-ss``/``-t`` input seeking, ``-stream_loop``
   when a clip is too short) and filter chain: trim → speed → 30 fps CFR →
   scale-to-cover (per-frame size for the Ken Burns zoom, ``eval=frame``) →
-  animated ``crop`` (pan) → optional ``hflip`` → ``setsar=1``. The chain works
-  in planar RGB, so crop positions are pixel exact and the grade/subtitles see
-  true colours; the frame count of each shot is exact (``tpad`` + ``trim``);
+  animated ``crop`` (pan; directly after the scaler, because ``crop`` clamps
+  x/y to the size of its input link and only the scaler's own output link
+  follows the per-frame size) → optional ``hflip`` → ``setsar=1``. The chain
+  works in planar RGB, so crop positions are pixel exact and the
+  grade/subtitles see true colours; the frame count of each shot is exact
+  (``tpad`` + ``trim``);
 * shots are joined with ``concat`` (cut) or a chain of ``xfade`` crossfades
   centred on the planned cut points, with shot lengths compensated so the
   total frame count equals ``duration × fps``;
@@ -647,8 +650,13 @@ def _shot_chain(index: int, plan: _ShotPlan, spec: RenderSpec) -> str:
         "setpts=PTS-STARTPTS",
         f"scale=w='{scaled_w}':h='{scaled_h}':eval=frame:flags=bicubic+full_chroma_int+accurate_rnd"
         f":in_color_matrix={plan.clip.color_matrix}",
-        "format=gbrp",
+        # ``crop`` must follow the per-frame ``scale`` directly: it clamps x/y to its
+        # *input link* size, and a filter in between (e.g. ``format``) keeps the
+        # first frame's size on its output link, which pinned zoom-ins to the
+        # top-left corner and stalled pans. ``format=gbrp`` after the crop still
+        # makes the scaler output planar RGB (crop passes formats through).
         f"crop=w={width}:h={height}:x='{x}':y='{y}'",
+        "format=gbrp",
     ]
     if plan.shot.hflip:
         parts.append("hflip")

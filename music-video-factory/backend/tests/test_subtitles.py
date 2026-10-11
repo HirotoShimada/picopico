@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 import shutil
 import subprocess
@@ -324,7 +325,9 @@ def test_styles_are_distinct_and_horizontal() -> None:
         fontname = style_lines[style].split(",")[1]
         assert not fontname.startswith("@")  # '@' fonts render vertically
     assert len(set(style_lines.values())) == len(LYRIC_STYLE_IDS)
-    assert "Noto Serif CJK JP" in style_lines["cinematic"] and ",3," in style_lines["cinematic"]
+    assert "Noto Serif CJK JP" in style_lines["cinematic"]
+    cinematic = build_ass(LINES, style_id="cinematic", text_style={}, segment_start=24.0, duration=15.0)
+    assert any(line.startswith("Style: LyricBox,") and line.split(",")[15] == "3" for line in cinematic.splitlines())
     assert "Noto Sans CJK JP Light" in style_lines["minimal"]
     assert style_lines["karaoke"].split(",")[3] == "&H00FFA34D"  # highlight (#4DA3FF) is the sweep colour
 
@@ -349,7 +352,9 @@ def test_text_style_overrides_apply() -> None:
     assert style[1] == "Noto Sans CJK JP Light"
     assert style[2] == "80"
     assert style[3] == "&H0000EEFF"
-    assert style[13] == "4" and style[15] == "3"
+    assert style[13] == "4" and style[15] == "1" and style[16] == "2"  # text keeps its outline in box mode
+    box = next(line for line in ass.splitlines() if line.startswith("Style: LyricBox,")).split(",")
+    assert box[15] == "3" and box[5] == "&H80000000"  # 50 % black box under the text
     y = float(POS.search(main_events(ass)[0]["text"]).group(2))
     assert y < 600  # top position
 
@@ -485,3 +490,93 @@ def test_rendered_pixels_inside_safe_area_small_canvas(tmp_path: Path) -> None:
     area = safe_area(width, height)
     assert area.top == 180 and area.bottom == 1280 - 253
     assert rows.min() >= area.top and rows.max() <= area.bottom
+
+
+# --------------------------------------------------------------------------- same-time lines (bilingual / duet LRC)
+
+BILINGUAL = [
+    {"id": "l001", "text": "叫べ 今この瞬間を", "start": 0.5, "end": 2.5},
+    {"id": "l002", "text": "Shout out this very moment", "start": 0.5, "end": 2.5},
+    {"id": "l003", "text": "忘れないように 胸に刻んで", "start": 2.5, "end": 6.5},
+    {"id": "l004", "text": "So that we never forget it", "start": 2.52, "end": 6.5},
+]
+
+
+@pytest.mark.parametrize("style_id", LYRIC_STYLE_IDS)
+def test_same_start_lines_are_stacked_not_overprinted(style_id: str) -> None:
+    ass = build_ass(BILINGUAL, style_id=style_id, text_style={}, segment_start=0.0, duration=8.0)
+    events = main_events(ass)
+    spec = resolve_text_style(style_id, {})
+    placed = [(e["start_s"], e["end_s"], POS.search(e["text"]).groups()) for e in events]
+    assert len(placed) == len(set(placed)), "two events share both a position and a time range"
+    for start, end in ((0.5, 2.5), (2.5, 6.5)):
+        group = [e for e in events if (e["start_s"], e["end_s"]) == (start, end)]
+        assert len(group) >= 2, (start, [(e["start_s"], e["end_s"]) for e in events])
+        ys = sorted(float(POS.search(e["text"]).group(2)) for e in group)
+        sizes = [float(m.group(1)) for e in group if (m := re.search(r"\\fs([\d.]+)", e["text"]))]
+        font_size = min(sizes) if sizes else spec.font_size
+        assert all(b - a >= font_size - 0.5 for a, b in itertools.pairwise(ys)), ys
+    shown = " ".join(visible_text(e["text"]) for e in events if e["start_s"] == 0.5)
+    assert "叫べ" in shown and "Shout" in shown and "moment" in shown
+    # The stacked block still respects the Stories safe area.
+    area = safe_area(1080, 1920)
+    top, bottom = _block_bounds(ass, style_id, {}, 1920)
+    assert top >= area.top - 0.5 and bottom <= area.bottom + 0.5
+
+
+def test_same_start_karaoke_sweeps_only_the_first_line() -> None:
+    lines = [*BILINGUAL[:2]]
+    ass = build_ass(lines, style_id="karaoke", text_style={"primary_color": "#DDEEFF"}, segment_start=0.0,
+                    duration=3.0)  # fmt: skip
+    events = sorted(main_events(ass), key=lambda e: float(POS.search(e["text"]).group(2)))
+    first = [e for e in events if "叫" in visible_text(e["text"]) or "瞬間" in visible_text(e["text"])]
+    second = [e for e in events if e not in first]
+    assert first and second
+    assert all(KARAOKE.search(e["text"]) for e in first)
+    for event in second:
+        assert not KARAOKE.search(event["text"])
+        assert "\\1c&HFFEEDD&" in event["text"]  # static, in the not-yet-sung colour
+
+
+# --------------------------------------------------------------------------- background box
+
+
+def test_background_box_is_black_and_text_keeps_its_outline() -> None:
+    ass = build_ass(LINES, style_id="cinematic", text_style={"outline_color": "#FFFFFF", "outline_width": 3},
+                    segment_start=24.0, duration=4.0)  # fmt: skip
+    styles = {line.split(",")[0][len("Style: "):]: line.split(",") for line in ass.splitlines()
+              if line.startswith("Style: ")}  # fmt: skip
+    box, text = styles["LyricBox"], styles["Lyric"]
+    assert box[15] == "3" and box[5].endswith("000000"), box  # box colour: black at bg_opacity
+    assert box[3].startswith("&HFF")  # glyph fill invisible: the box event draws only the box
+    assert text[15] == "1" and text[16] == "3" and text[5].endswith("FFFFFF"), text  # user's outline kept
+    boxes = [e for e in dialogues(ass) if e["style"] == "LyricBox"]
+    texts = main_events(ass)
+    assert boxes and len(boxes) == len(texts)
+    for box_event, text_event in zip(boxes, texts, strict=True):
+        assert box_event["layer"] == 0 and text_event["layer"] == 1
+        assert POS.search(box_event["text"]).groups() == POS.search(text_event["text"]).groups()
+        assert (box_event["start_s"], box_event["end_s"]) == (text_event["start_s"], text_event["end_s"])
+        assert visible_text(box_event["text"]) == visible_text(text_event["text"])
+
+
+def test_rendered_background_box_is_dark_with_a_coloured_outline(tmp_path: Path) -> None:
+    width, height = 540, 960
+    lines = [{"text": "叫べ 今この瞬間を", "start": 0.0, "end": 3.0}]
+    ass = build_ass(lines, style_id="cinematic", text_style={"outline_color": "#FF0000", "outline_width": 4},
+                    segment_start=0.0, duration=3.0, width=width, height=height)  # fmt: skip
+    ass_path = tmp_path / "box.ass"
+    ass_path.write_text(ass, encoding="utf-8")
+    cmd = [shutil.which("ffmpeg") or "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+           f"color=c=0x808080:s={width}x{height}:r=10:d=2", "-vf", f"subtitles=filename={ass_path}",
+           "-ss", "1.5", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]  # fmt: skip
+    raw = subprocess.run(cmd, capture_output=True, check=True, timeout=60).stdout
+    frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).astype(int)
+    y = float(POS.search(main_events(ass)[0]["text"]).group(2))
+    band = frame[int(y) + 4 : int(y) + 10]
+    changed = np.nonzero(np.abs(band - 128).max(axis=2).max(axis=0) > 20)[0]
+    assert changed.size, "nothing drawn"
+    inside = band[:, changed.min() + 2]  # just inside the box's left edge, left of the first glyph
+    assert inside.max() < 70, inside  # black box at 55 %, not the (red) outline colour
+    red = (frame[..., 0] > 150) & (frame[..., 1] < 90) & (frame[..., 2] < 90)
+    assert red.sum() > 100  # the text outline is drawn inside the box

@@ -499,6 +499,53 @@ def test_start_strategies() -> None:
     assert near_end["videos"][0]["start"] <= 45.0 and any("調整" in w for w in near_end["warnings"])
 
 
+def _demo_like_analysis(*, vocals: bool) -> dict[str, Any]:
+    """Demo song layout with the landmarks that used to leak quiet starts into 'varied'."""
+    analysis = make_analysis()
+    analysis["suggested_segments"] = [
+        {"start": 24.0, "end": 39.0, "duration": 15, "score": 0.9, "reason": "サビ"},
+        {"start": 8.0, "end": 38.0, "duration": 30, "score": 0.8, "reason": "Aメロ〜サビ"},
+        {"start": 0.0, "end": 60.0, "duration": 60, "score": 0.7, "reason": "曲全体"},  # the intro
+    ]
+    analysis["highlights"] = [{"start": 24.0, "end": 40.0, "energy": 0.9}, {"start": 44.0, "end": 60.0, "energy": 0.8}]
+    if vocals:
+        sung = [(8.0, 40.0), (48.0, 56.0)]
+        values = [0.9 if any(a <= i * 0.1 < b for a, b in sung) else 0.05 for i in range(600)]
+        analysis["vocal_activity"] = {"hop": 0.1, "values": values}
+    return analysis
+
+
+VARIED_LYRICS = [
+    {"id": f"l{i + 1:03d}", "text": "歌詞", "start": float(t), "end": float(t + 4)}
+    for i, t in enumerate([8, 12, 16, 20, 24, 28, 32, 36, 48, 52])
+]
+
+
+@pytest.mark.parametrize("source", ["lyrics", "vocal_activity"])
+def test_varied_starts_avoid_quiet_intro_and_bridge(source: str) -> None:
+    analysis = _demo_like_analysis(vocals=source == "vocal_activity")
+    lyrics = VARIED_LYRICS if source == "lyrics" else []
+    result = plan(analysis=analysis, lyric_lines=lyrics, segment=None,
+                  settings=settings(count=30, duration_sec=15, start_strategy="varied"))  # fmt: skip
+    starts = [v["start"] for v in result["videos"]]
+    assert len(set(starts)) >= 2, starts
+    assert all(s >= 8.0 - 0.35 and not 40.0 - 0.35 <= s < 46.0 for s in starts), sorted(set(starts))
+    # Best-scoring start (the chorus: lyrics + highest energy) comes first.
+    assert abs(starts[0] - 24.0) <= 0.35
+
+
+def test_varied_without_vocal_data_and_with_a_user_segment() -> None:
+    analysis = _demo_like_analysis(vocals=False)
+    instrumental = plan(analysis=analysis, lyric_lines=[], segment=None,
+                        settings=settings(count=6, duration_sec=15, start_strategy="varied"))  # fmt: skip
+    assert all(not 0 <= v["start"] < 6.0 for v in instrumental["videos"])  # still no intro opening
+    # The user's own segment is always used first, even if it is quiet.
+    pinned = plan(analysis=analysis, lyric_lines=VARIED_LYRICS, segment=(0.0, 15.0),
+                  settings=settings(count=4, duration_sec=15, start_strategy="varied"))  # fmt: skip
+    starts = [v["start"] for v in pinned["videos"]]
+    assert starts[0] < 0.5 and all(s >= 8.0 - 0.35 for s in starts[1:])
+
+
 def test_song_shorter_than_duration() -> None:
     analysis = make_analysis(duration=9.6, bpm=120)
     conf = settings(count=3, duration_sec=15)

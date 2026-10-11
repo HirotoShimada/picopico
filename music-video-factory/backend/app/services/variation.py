@@ -74,6 +74,11 @@ _VARIANT_HINTS: tuple[str, ...] = (
 _REUSE_DIVISOR = {"max_variety": 1, "balanced": 3, "economy": 6}
 _SOFT_TRANSITION_PRESETS = frozenset({"dreamy", "emotional", "nostalgic", "nature"})
 _PANS = ("left", "right", "up", "down")
+# 'varied' starts: a video should open on singing, not on a quiet intro/bridge.
+_QUIET_SECTIONS = frozenset({"intro", "bridge", "break", "outro"})
+_VARIED_MIN_COVERAGE = 0.5  # share of the video with lyrics on screen (or vocals)
+_VARIED_OPENING_SEC = 3.0  # the first seconds must not be mostly intro/bridge
+_SUGGESTED_DURATION_TOLERANCE = 0.25  # suggested segments within ±25 % of the video length
 
 
 # --- helpers ---------------------------------------------------------------------------------
@@ -153,6 +158,8 @@ class _Song:
     beat: float
     sections: list[_Section]
     lyrics: list[tuple[float, float, str]]  # (start, end, line id), timed lines only
+    vocal_hop: float = 0.0  # analysis.vocal_activity (empty when missing)
+    vocal: list[float] = field(default_factory=list)
 
     def section_at(self, t: float) -> _Section | None:
         for sec in self.sections:
@@ -172,6 +179,43 @@ class _Song:
 
     def lyric_ids(self, t0: float, t1: float) -> set[str]:
         return {line_id for start, end, line_id in self.lyrics if start < t1 and end > t0}
+
+    def sung_coverage(self, t0: float, t1: float) -> float | None:
+        """Share of ``[t0, t1]`` that is sung: lyric lines on screen and vocal activity.
+
+        The smaller of the two measures that are available (an LRC line is often
+        held through an instrumental break, so lyrics alone overstate it); None
+        when neither is known.
+        """
+        if t1 <= t0:
+            return None
+        measures: list[float] = []
+        if self.lyrics:
+            covered, cursor = 0.0, t0
+            for start, end, _ in sorted(self.lyrics):
+                start, end = max(start, cursor), min(end, t1)
+                if end > start:
+                    covered += end - start
+                    cursor = end
+            measures.append(covered / (t1 - t0))
+        if self.vocal_hop > 0 and len(self.vocal) >= 3:
+            ordered = sorted(self.vocal)
+            low, high = ordered[len(ordered) // 5], ordered[round(0.95 * (len(ordered) - 1))]
+            i0, i1 = max(0, int(t0 / self.vocal_hop)), min(len(self.vocal), math.ceil(t1 / self.vocal_hop))
+            window = self.vocal[i0:i1]
+            if high - low >= 0.1 and window:
+                threshold = low + 0.45 * (high - low)
+                measures.append(sum(v >= threshold for v in window) / len(window))
+        return min(measures) if measures else None
+
+    def section_overlap(self, t0: float, t1: float, labels: frozenset[str]) -> float:
+        return sum(max(0.0, min(sec.end, t1) - max(sec.start, t0)) for sec in self.sections if sec.label in labels)
+
+    def mean_energy(self, t0: float, t1: float) -> float:
+        weighted = [(min(sec.end, t1) - max(sec.start, t0), sec.energy) for sec in self.sections]
+        weighted = [(w, e) for w, e in weighted if w > 0]
+        total = sum(w for w, _ in weighted)
+        return sum(w * e for w, e in weighted) / total if total > 0 else 0.5
 
     def snap_to_downbeat(self, t: float, tolerance: float = 0.35) -> float:
         if not self.downbeats:
@@ -217,7 +261,12 @@ def _build_song(analysis: Mapping[str, Any], lyric_lines: Sequence[Mapping[str, 
         start, end = _num(line.get("start")), _num(line.get("end"))
         if start is not None and line.get("id") is not None:
             lyrics.append((start, end if end is not None and end > start else start + 4.0, str(line["id"])))
-    return _Song(duration, beats, downbeats, bar, beat, sections, lyrics)
+    vocal_hop, vocal = 0.0, []
+    raw_vocal = analysis.get("vocal_activity")
+    if isinstance(raw_vocal, Mapping):
+        vocal_hop = _num(raw_vocal.get("hop")) or 0.0
+        vocal = [min(1.0, max(0.0, _num(v) or 0.0)) for v in raw_vocal.get("values") or []]
+    return _Song(duration, beats, downbeats, bar, beat, sections, lyrics, vocal_hop, vocal)
 
 
 # --- start times -------------------------------------------------------------------------------
@@ -290,26 +339,50 @@ def _video_starts(
         return [clamp(song.snap_to_downbeat(fitting[0] if fitting else starts[0]))] * count
 
     if strategy == "varied":
-        raw: list[float | None] = [segment_start, *chorus_starts(), best_suggested()]
-        raw += [_num(s.get("start")) for s in analysis.get("suggested_segments") or []]
+        # Rotate among chorus / verse / highlight starts and the suggested segment that
+        # fits this length. A start must open on singing: candidates whose window has
+        # lyrics (or vocals) less than half the time, or that open on an intro/bridge,
+        # are dropped (unless fewer than two remain); the rest go best-first.
+        pinned = clamp(song.snap_to_downbeat(segment_start)) if segment_start is not None else None
+        raw: list[float | None] = list(chorus_starts())
+        raw += [
+            _num(s.get("start")) for s in analysis.get("suggested_segments") or []
+            if abs((_num(s.get("duration")) or 0.0) - duration) <= _SUGGESTED_DURATION_TOLERANCE * duration
+        ]  # fmt: skip
         raw += [_num(h.get("start")) for h in analysis.get("highlights") or []]
-        raw += [s.start for s in song.sections if s.label in ("verse", "chorus", "bridge")]
+        raw += [s.start for s in song.sections if s.label in ("verse", "chorus")]
         candidates: list[float] = []
-        for value in raw:
+
+        def add(value: float | None) -> None:
             if value is None:
-                continue
+                return
             start = clamp(song.snap_to_downbeat(value))
-            if all(abs(start - c) >= 1.0 for c in candidates):
+            if all(abs(start - c) >= 1.0 for c in [*candidates, *([pinned] if pinned is not None else [])]):
                 candidates.append(start)
-        if len(candidates) < min(count, 4) and max_start >= 2.0:
-            # Few analysis landmarks: spread extra starts over the downbeats that fit.
+
+        def score(start: float) -> float:
+            coverage = song.sung_coverage(start, start + duration)
+            return (0.5 if coverage is None else coverage) + 0.5 * song.mean_energy(start, start + duration)
+
+        def suitable(start: float) -> bool:
+            coverage = song.sung_coverage(start, start + duration)
+            opening = song.section_overlap(start, start + _VARIED_OPENING_SEC, _QUIET_SECTIONS)
+            return (coverage is None or coverage >= _VARIED_MIN_COVERAGE) and opening <= _VARIED_OPENING_SEC / 2
+
+        for value in raw:
+            add(value)
+        good = [c for c in candidates if suitable(c)]
+        wanted = min(count, 4) - (pinned is not None)
+        if len(good) < wanted and max_start >= 2.0:
+            # Few usable landmarks: spread extra starts over the downbeats that fit.
             usable = [d for d in song.downbeats if d <= max_start] or [0.0]
-            for k in range(min(count, 8)):
-                start = clamp(usable[round(k * (len(usable) - 1) / max(1, min(count, 8) - 1))])
-                if all(abs(start - c) >= 1.0 for c in candidates):
-                    candidates.append(start)
-        candidates = candidates or [0.0]
-        return [candidates[i % len(candidates)] for i in range(count)]
+            spread = min(count, 8)
+            for k in range(spread):
+                add(usable[round(k * (len(usable) - 1) / max(1, spread - 1))])
+            good = [c for c in candidates if suitable(c)]
+        pool = sorted(good if len(good) >= 2 else candidates, key=score, reverse=True)
+        ordered = ([pinned] if pinned is not None else []) + pool or [0.0]
+        return [ordered[i % len(ordered)] for i in range(count)]
 
     # "segment" (default)
     if segment_start is None:

@@ -14,7 +14,12 @@ script whose times are relative to the rendered segment. Design rules:
   the block geometry is exact: nothing is drawn above ``safe_top`` or below
   ``safe_bottom`` (Instagram Stories safe area, 270 px / 380 px on
   1080×1920, scaled proportionally for other sizes). One event per line also
-  gives clean, non-overlapping semi-transparent boxes (``BorderStyle=3``).
+  gives clean, non-overlapping semi-transparent boxes: with ``bg_opacity`` a
+  box-only event (``LyricBox``, ``BorderStyle=3``, always black like the
+  editor preview) is drawn under the text event, which keeps its own outline.
+* Lines that start at the same time (bilingual / duet LRC) are shown as one
+  stacked block (one part per lyric line, each wrapped on its own) instead of
+  being drawn on top of each other.
 * ``font_size`` is the ASS ``Fontsize`` in ``PlayRes`` pixels (a 1080×1920
   canvas); with Noto CJK the visible glyph width is about 0.69 × font size.
   ``max_chars_per_line`` counts full-width characters; half-width Latin
@@ -164,6 +169,7 @@ _DEFAULT_FADE_OUT = 0.35
 _FADE_WINDOW = (0.25, 0.42)  # acceptable beat-aligned fade length range (s)
 _DEFAULT_LINE_HOLD = 4.0  # end time for an untimed-end last line
 _MIN_EVENT = 0.05
+_SAME_START = 0.05  # lines starting this close together are shown as one stacked block
 _MIN_SHRINK = 0.6  # never shrink a line below 60 % of the style font size
 
 
@@ -292,6 +298,12 @@ def _ass_color(color: str, opacity: float = 1.0) -> str:
     r, g, b, own_opacity = parsed
     alpha = round(255 * (1 - _clamp(opacity * own_opacity, 0, 1)))
     return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}"
+
+
+def _ass_rgb(color: str) -> str:
+    """Colour for a ``\\1c`` override tag (``&HBBGGRR&``; alpha is not part of it)."""
+    r, g, b, _ = _parse_color(color) or (255, 255, 255, 1.0)
+    return f"&H{b:02X}{g:02X}{r:02X}&"
 
 
 def _ass_alpha(opacity: float) -> str:
@@ -575,6 +587,39 @@ def layout_text(
     return TextLayout(lines=lines, spans=spans, font_size=round(font_size, 1))
 
 
+def _layout_block(
+    text: str,
+    spec: StyleSpec,
+    *,
+    width: int,
+    height: int,
+    forbidden_breaks: Iterable[int] = (),
+) -> TextLayout:
+    """:func:`layout_text` with ``"\\n"`` as a forced break between stacked parts.
+
+    Each part (one lyric line of a same-time group) is wrapped on its own; the
+    block uses the smallest part font size so every line has the same pitch.
+    Spans are offsets in the joined ``text``.
+    """
+    parts = text.split("\n")
+    if len(parts) == 1:
+        return layout_text(text, spec, width=width, height=height, forbidden_breaks=forbidden_breaks)
+    forbidden = frozenset(forbidden_breaks)
+    lines: list[str] = []
+    spans: list[tuple[int, int]] = []
+    sizes: list[float] = []
+    offset = 0
+    for part in parts:
+        local = {i - offset for i in forbidden if offset < i < offset + len(part)}
+        layout = layout_text(part, spec, width=width, height=height, forbidden_breaks=local)
+        lines += layout.lines
+        spans += [(a + offset, b + offset) for a, b in layout.spans]
+        if layout.lines:
+            sizes.append(layout.font_size)
+        offset += len(part) + 1
+    return TextLayout(lines=lines, spans=spans, font_size=min(sizes, default=round(spec.font_size, 1)))
+
+
 # --------------------------------------------------------------------------- vertical layout
 
 
@@ -593,7 +638,8 @@ def _horizontal_extent(spec: StyleSpec, scale: float) -> float:
 
 
 def _box_padding(spec: StyleSpec, scale: float) -> float:
-    return max(spec.box_padding, spec.outline_width) * scale
+    # The text keeps its outline inside the box, so the box always encloses it.
+    return max(spec.box_padding, spec.outline_width + _blur_extent(spec.edge_blur)) * scale
 
 
 def _vertical_extents(spec: StyleSpec, scale: float) -> tuple[float, float]:
@@ -651,6 +697,13 @@ class _Timed:
 
 
 def _timed_lines(lines: Sequence[Mapping[str, Any]]) -> list[_Timed]:
+    """Timed, non-overlapping display units.
+
+    Lines starting within ``_SAME_START`` of each other (an LRC with the
+    translation or a second singer on the same timestamp) become one unit whose
+    text joins the lines with ``"\\n"`` (laid out as stacked parts); its end is
+    the latest end, and word timings are kept for the first line only.
+    """
     raw: list[tuple[float, float | None, str, list[dict[str, Any]] | None]] = []
     for line in lines:
         start = _num(line.get("start"))
@@ -660,15 +713,23 @@ def _timed_lines(lines: Sequence[Mapping[str, Any]]) -> list[_Timed]:
         words = line.get("words")
         raw.append((start, _num(line.get("end")), text, words if isinstance(words, list) else None))
     raw.sort(key=lambda item: item[0])
+    groups: list[list[tuple[float, float | None, str, list[dict[str, Any]] | None]]] = []
+    for item in raw:
+        if groups and item[0] - groups[-1][0][0] <= _SAME_START:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
     result: list[_Timed] = []
-    for index, (start, end, text, words) in enumerate(raw):
-        next_start = raw[index + 1][0] if index + 1 < len(raw) else None
-        if end is None or end <= start:
-            end = next_start if next_start is not None and next_start > start else start + _DEFAULT_LINE_HOLD
-        if next_start is not None and next_start > start:
+    for index, group in enumerate(groups):
+        start = group[0][0]
+        next_start = groups[index + 1][0][0] if index + 1 < len(groups) else None
+        ends = [end for _, end, _, _ in group if end is not None and end > start]
+        end = max(ends) if ends else (next_start if next_start is not None else start + _DEFAULT_LINE_HOLD)
+        if next_start is not None:
             end = min(end, next_start)  # overlapping lines would collide visually
+        text = "\n".join(dict.fromkeys(item[2] for item in group))
         if end - start >= _MIN_EVENT:
-            result.append(_Timed(text=text, start=start, end=end, words=words))
+            result.append(_Timed(text=text, start=start, end=end, words=group[0][3]))
     return result
 
 
@@ -775,11 +836,13 @@ def _even_syllables(text: str, start: float, end: float) -> list[_Syllable]:
 
 
 def _syllables_for(timed: _Timed) -> list[_Syllable]:
+    """Karaoke syllables of the first part (stacked parts after it are shown without a sweep)."""
+    first = timed.text.split("\n", 1)[0]
     if timed.words:
-        mapped = _map_words(timed.text, timed.words)
+        mapped = _map_words(first, timed.words)
         if mapped:
             return mapped
-    return _even_syllables(timed.text, timed.start, timed.end)
+    return _even_syllables(first, timed.start, timed.end)
 
 
 def _karaoke_body(
@@ -822,21 +885,30 @@ def _karaoke_body(
 # --------------------------------------------------------------------------- ASS document
 
 
-def _style_line(name: str, spec: StyleSpec, scale: float, *, karaoke: bool) -> str:
+def _style_line(name: str, spec: StyleSpec, scale: float, *, karaoke: bool, box: bool = False) -> str:
+    """ASS style for the text (``box=False``) or for the background box under it (``box=True``).
+
+    The box is always black at ``bg_opacity`` (as in the editor preview) with an
+    invisible glyph fill; the text style keeps the user's outline colour and
+    width in box mode too.
+    """
     fontname, bold = _font_for(spec)
     font_size = round(spec.font_size * scale, 1)
     spacing = round(spec.letter_spacing * scale, 2)
-    if spec.bg_opacity > 0:
+    if box:
         border_style = 3
         outline = round(_box_padding(spec, scale), 1)
-        outline_colour = _ass_color(spec.outline_color, spec.bg_opacity)
+        outline_colour = _ass_color("#000000", spec.bg_opacity)
         shadow = 0
     else:
         border_style = 1
         outline = round(spec.outline_width * scale, 2)
         outline_colour = _ass_color(spec.outline_color, spec.outline_opacity)
-        shadow = round(spec.shadow * scale, 2) if spec.shadow_mode == "hard" else 0
-    if karaoke:
+        hard = spec.shadow_mode == "hard" and spec.bg_opacity <= 0
+        shadow = round(spec.shadow * scale, 2) if hard else 0
+    if box:
+        primary = secondary = _ass_color("#000000", 0.0)  # glyphs invisible: only the box is drawn
+    elif karaoke:
         primary = _ass_color(spec.highlight_color)  # sung (sweep target)
         secondary = _ass_color(spec.primary_color)  # not yet sung
     else:
@@ -874,7 +946,8 @@ def build_ass(
     spec = resolve_text_style(style_id, text_style)
     scale = _ui_scale(width, height)
     karaoke = style_id == "karaoke"
-    soft_shadow = spec.shadow_mode == "soft" and spec.shadow > 0 and spec.bg_opacity <= 0
+    boxed = spec.bg_opacity > 0
+    soft_shadow = spec.shadow_mode == "soft" and spec.shadow > 0 and not boxed
 
     header = [
         "[Script Info]",
@@ -892,6 +965,7 @@ def build_ass(
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
         _style_line("Lyric", spec, scale, karaoke=karaoke),
+        *([_style_line("LyricBox", spec, scale, karaoke=False, box=True)] if boxed else []),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -909,7 +983,7 @@ def build_ass(
             continue
         syllables = _syllables_for(timed) if karaoke else []
         forbidden = {i for s in syllables for i in range(s.start_idx + 1, s.end_idx)}
-        layout = layout_text(timed.text, spec, width=width, height=height, forbidden_breaks=forbidden)
+        layout = _layout_block(timed.text, spec, width=width, height=height, forbidden_breaks=forbidden)
         if not layout.lines:
             continue
         tops = _line_tops(len(layout.lines), layout.font_size, spec, width, height)
@@ -933,6 +1007,7 @@ def build_ass(
         start_s, end_s = _ass_time(rel_start), _ass_time(rel_end)
 
         event_start_abs, event_end_abs = rel_start + segment_start, rel_end + segment_start
+        first_part_end = timed.text.find("\n") if "\n" in timed.text else len(timed.text)
         for line_text, span, top in zip(layout.lines, layout.spans, tops, strict=True):
             x = round(center_x, 1)
             y = round(top, 1)
@@ -941,13 +1016,23 @@ def build_ass(
             else:
                 placement = f"\\an8\\pos({x:g},{y:g})"
             # \\blur softens only the outline while a border exists; without one it would blur the fill.
-            has_edge = spec.edge_blur > 0 and spec.bg_opacity <= 0 and spec.outline_width > 0
+            has_edge = spec.edge_blur > 0 and spec.outline_width > 0
             blur = f"\\blur{spec.edge_blur * scale:g}" if has_edge else ""
-            if karaoke:
+            colour = ""
+            if karaoke and span[0] < first_part_end:
                 body = _karaoke_body(timed.text, span, syllables, event_start_abs, event_end_abs)
             else:
                 body = escape_ass_text(line_text)
-            events.append(f"Dialogue: 1,{start_s},{end_s},Lyric,,0,0,0,,{{{placement}{fad}{fs_tag}{blur}}}{body}")
+                if karaoke:  # stacked translation/duet part: static, in the not-yet-sung colour
+                    colour = f"\\1c{_ass_rgb(spec.primary_color)}"
+            events.append(
+                f"Dialogue: 1,{start_s},{end_s},Lyric,,0,0,0,,{{{placement}{fad}{fs_tag}{blur}{colour}}}{body}"
+            )
+            if boxed:
+                events.append(
+                    f"Dialogue: 0,{start_s},{end_s},LyricBox,,0,0,0,,{{{placement}{fad}{fs_tag}}}"
+                    f"{escape_ass_text(line_text)}"
+                )
             if soft_shadow:
                 offset = spec.shadow * scale
                 if rise > 0 and fade_in > 0:

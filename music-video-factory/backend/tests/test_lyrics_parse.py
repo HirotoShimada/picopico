@@ -117,6 +117,21 @@ def test_lrc_multiple_tags_sorted_with_end_markers() -> None:
     assert any("15 秒以上" in w for w in warnings)  # サビ is shown for 20 s
 
 
+def test_lrc_same_timestamp_lines_warn_and_share_their_span() -> None:
+    # Bilingual / duet LRC: the original and its translation share a timestamp.
+    text = (
+        "[00:00.50]叫べ 今この瞬間を\n[00:00.50]Shout out this very moment\n"
+        "[00:02.50]忘れないように 胸に刻んで\n[00:02.52]So that we never forget it\n[00:06.50]次の行\n"
+    )
+    lines, warnings = parse_lyrics(text)
+    assert times(lines)[:4] == [(0.5, 2.5), (0.5, 2.5), (2.5, 6.5), (2.52, 6.5)]
+    assert [w for w in warnings if "同じ時刻の行" in w] == [
+        "同じ時刻の行が 2 組あります（対訳・デュエットなど）。動画では上下に並べて表示します。"
+    ]
+    _, plain = parse_lyrics("[00:01.00]一\n[00:02.00]二\n[00:02.10]三\n")
+    assert not any("同じ時刻" in w for w in plain)
+
+
 @pytest.mark.parametrize(
     ("offset", "expected", "clamped"),
     [("+500", (9.5, 11.5), False), ("-250", (10.25, 12.25), False), ("+10500", (0.0, 1.5), True)],

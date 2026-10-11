@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import shutil
 import subprocess
 import time
@@ -656,3 +657,88 @@ def test_expensive_grade_is_baked_into_an_equivalent_lut(tmp_path: Path, monkeyp
     assert ("vignette", "vignette") in kinds
     assert any(kind == "filters" and value.startswith("noise") for kind, value in kinds)
     assert not any(kind == "grain" for kind, _ in kinds)  # the preset brings its own grain
+
+
+# --------------------------------------------------------------------------- Ken Burns geometry
+
+_KB_W, _KB_H = 540, 960
+_KB_CENTRE = (270, 480)
+_KB_CORNER = (75, 100)
+
+
+def _dot_clip(path: Path) -> Path:
+    """Static 540×960 clip: black with two 11×11 white dots (centre and top-left)."""
+    boxes = ",".join(
+        f"drawbox=x={x - 5}:y={y - 5}:w=11:h=11:c=white:t=fill" for x, y in (_KB_CENTRE, _KB_CORNER)
+    )
+    return make_clip(path, f"color=c=black:s={_KB_W}x{_KB_H}:r=30,{boxes}", 2.5, fps=30, pix_fmt="yuv444p")
+
+
+def _shot_frames(clip: Path, shot: RenderShot) -> tuple[np.ndarray, Any]:
+    """All frames of one shot rendered through the real ``_plan_shots`` + ``_shot_chain``."""
+    spec = RenderSpec(
+        shots=[shot], audio_path="", audio_start=0.0, duration=shot.duration, lyric_lines=[], lyric_style="simple",
+        text_style={}, color_grade="natural", output_path="", work_dir="", width=_KB_W, height=_KB_H,
+    )  # fmt: skip
+    plans, _ = render_mod._plan_shots(spec, {str(clip): render_mod._probe_clip(str(clip))})
+    chain = render_mod._shot_chain(0, plans[0], spec)
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-i", str(clip), "-filter_complex", chain, "-map", "[s0]",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]  # fmt: skip
+    raw = subprocess.run(cmd, capture_output=True, check=True, timeout=120).stdout
+    frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, _KB_H, _KB_W, 3)
+    assert len(frames) == plans[0].frames
+    return frames, plans[0]
+
+
+def _centroid(frame: np.ndarray, near: tuple[float, float], radius: int = 90) -> tuple[float, float]:
+    x0, y0 = max(0, int(near[0]) - radius), max(0, int(near[1]) - radius)
+    window = frame[y0 : int(near[1]) + radius, x0 : int(near[0]) + radius].min(axis=2) > 128
+    ys, xs = np.nonzero(window)
+    assert len(xs) > 20, f"no dot near {near}"
+    return float(xs.mean()) + x0, float(ys.mean()) + y0
+
+
+def _expected(point: tuple[int, int], plan: Any, t: float) -> tuple[float, float]:
+    """Where a source point should be at time ``t`` (same zoom/pan curve as the renderer, unclamped)."""
+    seconds = plan.frames / 30
+    u = min(max(t / seconds, 0.0), 1.0)
+    ease = 0.5 * u + 0.5 * u * u * (3 - 2 * u)
+    zoom = plan.zoom_from + (plan.zoom_to - plan.zoom_from) * ease
+    scaled_w, scaled_h = math.ceil(_KB_W * zoom), math.ceil(_KB_H * zoom)
+    dir_x, dir_y, travel_x, travel_y = render_mod._pan_travel(plan.shot.pan, seconds, _KB_W, _KB_H)
+    crop_x = (scaled_w - _KB_W) / 2 + dir_x * travel_x * (ease - 0.5)
+    crop_y = (scaled_h - _KB_H) / 2 + dir_y * travel_y * (ease - 0.5)
+    return point[0] * scaled_w / _KB_W - crop_x, point[1] * scaled_h / _KB_H - crop_y
+
+
+def test_ken_burns_zoom_in_stays_centred(tmp_path: Path) -> None:
+    # Regression: crop used to be clamped to the first (smallest) frame of a zoom-in,
+    # so the image grew from the top-left corner instead of the centre.
+    clip = _dot_clip(tmp_path / "dots.mp4")
+    frames, plan = _shot_frames(clip, RenderShot(clip_path=str(clip), src_in=0.0, duration=2.0,
+                                                 zoom_from=1.0, zoom_to=1.08, pan="center"))  # fmt: skip
+    assert (plan.zoom_from, plan.zoom_to) == (1.0, 1.08)
+    last = frames[-1]
+    cx, cy = _centroid(last, _KB_CENTRE)
+    assert abs(cx - _KB_CENTRE[0]) <= 2 and abs(cy - _KB_CENTRE[1]) <= 2, (cx, cy)
+    # The corner dot moves outward (away from the centre), as a centred push-in should.
+    ex, ey = _expected(_KB_CORNER, plan, (plan.frames - 1) / 30)
+    kx, ky = _centroid(last, _KB_CORNER)
+    assert kx < _KB_CORNER[0] - 8 and ky < _KB_CORNER[1] - 15, (kx, ky)
+    assert abs(kx - ex) <= 2 and abs(ky - ey) <= 2, ((kx, ky), (ex, ey))
+
+
+def test_ken_burns_pan_with_zoom_in_travels_the_full_distance(tmp_path: Path) -> None:
+    # Regression: the pan used to stall once x reached the first frame's headroom.
+    clip = _dot_clip(tmp_path / "dots.mp4")
+    frames, plan = _shot_frames(clip, RenderShot(clip_path=str(clip), src_in=0.0, duration=2.0,
+                                                 zoom_from=1.06, zoom_to=1.14, pan="right"))  # fmt: skip
+    first_x, _ = _centroid(frames[0], _KB_CENTRE)
+    last_x, last_y = _centroid(frames[-1], _KB_CENTRE, radius=120)
+    want_first = _expected(_KB_CENTRE, plan, 0.0)
+    want_last = _expected(_KB_CENTRE, plan, (plan.frames - 1) / 30)
+    assert abs(first_x - want_first[0]) <= 2 and abs(last_x - want_last[0]) <= 2, (first_x, last_x)
+    assert abs(last_y - want_last[1]) <= 2
+    _, _, travel_x, _ = render_mod._pan_travel("right", plan.frames / 30, _KB_W, _KB_H)
+    # Panning right moves the content left by the planned travel (plus the zoom's own drift).
+    assert first_x - last_x >= 0.9 * (want_first[0] - want_last[0]) > 0.5 * travel_x

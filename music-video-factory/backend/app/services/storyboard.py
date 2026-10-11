@@ -14,7 +14,16 @@ generated independently and still look like part of the same music video.
   energy.
 
 Every ``prompt_en`` passes through :func:`prompting.sanitize_prompt` with the
-artist name forbidden.
+artist name (its kana romanisations and any aliases) forbidden, plus every
+person named in the user's free text (custom world, mood, purpose) and every
+real person Claude reports in ``detected_real_people``. In the template path
+free text is screened first (:func:`prompting.screen_free_text`) and the mood
+only contributes allow-listed mood words, never raw Latin-script text.
+
+:func:`estimate_world` merges the audio mood, the lyrics and the user's
+mood/purpose into an emotion estimate with recommended world presets (included
+in the storyboard as ``world_estimate`` and sent to Claude as context; the
+template uses it as the mood when the user gave none).
 """
 
 from __future__ import annotations
@@ -35,18 +44,23 @@ from app.services.presets import (
     CAMERA_MOVES,
     SCENE_TYPES,
     SECTION_LABELS_JA,
+    WORLD_PRESETS,
     WorldPreset,
     get_preset,
 )
 from app.services.prompting import (
     FALLBACK_BETA,
     MAX_PROMPT_CHARS,
+    artist_name_variants,
     first_text_block,
     glossary_keywords,
     make_claude_client,
+    mood_keywords,
     prompt_body_budget,
     sanitize_prompt,
+    screen_free_text,
     strip_forbidden_names,
+    strip_person_references,
     translate_to_english,
 )
 
@@ -61,6 +75,7 @@ __all__ = [
     "STORYBOARD_SCHEMA",
     "SYSTEM_PROMPT",
     "claude_cost_usd",
+    "estimate_world",
     "generate_storyboard",
 ]
 
@@ -287,6 +302,173 @@ def _lyric_refs(slots: list[_Slot], lyrics: Sequence[Mapping[str, Any]]) -> list
     return refs
 
 
+# --- emotion / world estimate ----------------------------------------------------------------------
+#
+# 感情・世界観推定: audio mood (analysis.mood), a small lexicon over the lyrics and
+# the user's mood/purpose text are merged into emotion scores, which map to the
+# world presets that suit the song. Deterministic, no API call; Claude receives
+# the estimate as context.
+
+_EMOTIONS = ("melancholic", "nostalgic", "hopeful", "energetic", "romantic", "calm", "dark", "dreamy")
+_THEMES = ("night", "nature")
+_EMOTION_JA = {
+    "melancholic": "切ない", "nostalgic": "懐かしい", "hopeful": "前向き", "energetic": "エネルギッシュ",
+    "romantic": "ロマンチック", "calm": "穏やか", "dark": "ダーク", "dreamy": "幻想的", "night": "夜・都会",
+    "nature": "自然",
+}  # fmt: skip
+_LEXICON_JA: dict[str, tuple[str, ...]] = {
+    "melancholic": ("切な", "涙", "泣", "悲し", "寂し", "さみし", "孤独", "別れ", "さよなら", "サヨナラ", "消え",
+                    "痛", "哀", "失", "傷", "戻れない", "届かない"),
+    "nostalgic": ("懐かし", "思い出", "記憶", "あの頃", "あの日", "昔", "帰り道", "故郷", "ふるさと", "放課後",
+                  "夏祭り", "セピア", "レトロ", "昭和"),
+    "hopeful": ("希望", "未来", "明日", "信じ", "輝", "笑顔", "前を向", "羽ばた", "翼", "光", "夜明け", "始まり",
+                "叶", "前向き"),
+    "energetic": ("叫", "走", "燃", "炎", "熱", "衝動", "瞬間", "爆", "踊", "跳", "全力", "疾走", "激し", "力強"),
+    "romantic": ("愛", "恋", "好き", "キス", "抱きしめ", "君と", "二人", "ふたり", "手を繋", "ときめ", "ロマンチック"),
+    "calm": ("静か", "穏やか", "優し", "そっと", "ゆっくり", "眠", "安らぎ", "やすらぎ", "凪", "癒"),
+    "dark": ("闇", "嘘", "罪", "壊", "狂", "呪", "毒", "絶望", "憎", "裏切", "ダーク"),
+    "dreamy": ("夢", "幻", "浮", "宇宙", "天使", "魔法", "銀河", "ふわふわ", "不思議", "幻想"),
+    "night": ("夜", "ネオン", "都会", "終電", "深夜", "交差点", "ビル", "東京", "渋谷", "路地", "街"),
+    "nature": ("海", "空", "森", "風", "花", "桜", "山", "川", "雨", "雪", "波", "草原", "季節"),
+}  # fmt: skip
+_LEXICON_EN: dict[str, tuple[str, ...]] = {
+    "melancholic": ("sad", "tears", "cry", "lonely", "goodbye", "lost", "broken", "melancholy", "melancholic",
+                    "bittersweet", "pain", "emotional"),
+    "nostalgic": ("memories", "memory", "remember", "yesterday", "nostalgic", "nostalgia", "retro", "vintage"),
+    "hopeful": ("hope", "hopeful", "future", "tomorrow", "believe", "shine", "smile", "rise", "uplifting", "bright"),
+    "energetic": ("run", "running", "fire", "burn", "dance", "dancing", "shout", "energetic", "upbeat", "wild",
+                  "intense", "powerful"),
+    "romantic": ("love", "kiss", "romantic", "together", "darling"),
+    "calm": ("calm", "quiet", "gentle", "peaceful", "sleep", "chill", "mellow", "serene"),
+    "dark": ("dark", "darkness", "lies", "sin", "poison", "evil", "moody", "gloomy"),
+    "dreamy": ("dream", "dreams", "dreamy", "galaxy", "magic", "floating", "ethereal"),
+    "night": ("night", "city", "neon", "midnight", "street", "streets", "urban"),
+    "nature": ("sea", "ocean", "forest", "flower", "flowers", "rain", "snow", "wind", "river", "mountain"),
+}  # fmt: skip
+_PRESET_AFFINITY: dict[str, dict[str, float]] = {
+    "melancholic": {"emotional": 1.0, "nostalgic": 0.6, "dark": 0.4, "cinematic": 0.3},
+    "nostalgic": {"nostalgic": 1.0, "emotional": 0.5, "documentary": 0.3},
+    "hopeful": {"cinematic": 0.8, "nature": 0.7, "emotional": 0.4, "documentary": 0.3},
+    "energetic": {"urban_night": 0.9, "cinematic": 0.7, "documentary": 0.3},
+    "romantic": {"emotional": 0.8, "dreamy": 0.7, "nostalgic": 0.3},
+    "calm": {"nature": 0.8, "dreamy": 0.6, "emotional": 0.4},
+    "dark": {"dark": 1.0, "urban_night": 0.5, "cinematic": 0.3},
+    "dreamy": {"dreamy": 1.0, "nature": 0.4},
+    "night": {"urban_night": 1.0, "dark": 0.4, "cinematic": 0.3},
+    "nature": {"nature": 1.0, "dreamy": 0.3, "emotional": 0.2},
+}
+_DOCUMENTARY_HINT = re.compile(
+    r"ライブ|ツアー|密着|ドキュメン|舞台裏|リハーサル|\blive\b|\btour\b|backstage|documentary", re.IGNORECASE
+)
+
+
+def _lexicon_hits(text: str) -> dict[str, int]:
+    hits: dict[str, int] = {}
+    lowered = text.lower()
+    words = re.findall(r"[a-z]+", lowered)
+    for key in (*_EMOTIONS, *_THEMES):
+        count = sum(text.count(term) for term in _LEXICON_JA[key])
+        count += sum(1 for word in words if word in _LEXICON_EN[key])
+        if count:
+            hits[key] = count
+    return hits
+
+
+def _audio_emotions(mood: Mapping[str, Any] | None) -> dict[str, float]:
+    if not isinstance(mood, Mapping):
+        return {}
+    tags = {str(t) for t in mood.get("tags") or []}
+    energy = _num(mood.get("energy"))
+    scores: dict[str, float] = {}
+
+    def add(key: str, value: float) -> None:
+        scores[key] = scores.get(key, 0.0) + value
+
+    if "energetic" in tags or (energy is not None and energy >= 0.65):
+        add("energetic", 1.0)
+    if tags & {"upbeat", "danceable"}:
+        add("energetic", 0.5)
+    if "calm" in tags or (energy is not None and energy <= 0.35):
+        add("calm", 1.0)
+    if "slow" in tags:
+        add("calm", 0.5)
+    if mood.get("mode_guess") == "minor" or "melancholic" in tags:
+        add("melancholic", 0.8)
+    if mood.get("mode_guess") == "major" or "uplifting" in tags:
+        add("hopeful", 0.8)
+    if "dark" in tags:
+        add("dark", 0.5)
+        add("night", 0.3)
+    if "bright" in tags:
+        add("hopeful", 0.4)
+    if "dynamic" in tags:
+        add("energetic", 0.2)
+    return scores
+
+
+def estimate_world(
+    analysis: Mapping[str, Any] | None,
+    lyrics: Sequence[Mapping[str, Any]],
+    mood: str | None,
+    purpose: str | None,
+) -> dict[str, Any]:
+    """Emotion/world estimate from audio mood, lyrics and the user's mood/purpose (感情・世界観推定).
+
+    Returns ``{"emotions": [ids], "themes": [ids], "mood_en": str,
+    "recommended_presets": [preset ids, best first], "sources": {"audio",
+    "lyrics", "user": [ids]}, "rationale_ja": str}``. Emotion ids:
+    ``melancholic nostalgic hopeful energetic romantic calm dark dreamy``;
+    themes ``night nature``. Explicit user input weighs most, then lyrics,
+    then audio.
+    """
+    audio = _audio_emotions((analysis or {}).get("mood"))
+    lyric_text = " ".join(str(line.get("text") or "") for line in lyrics)
+    lyric_hits = _lexicon_hits(lyric_text)
+    top_hits = max(lyric_hits.values(), default=0)
+    lyric_scores = {k: 1.5 * v / top_hits for k, v in lyric_hits.items()} if top_hits else {}
+    user_text = " ".join(t for t in (mood, purpose) if t)
+    user_scores = {k: min(2.0, 2.0 * v) for k, v in _lexicon_hits(user_text).items()}
+
+    totals: dict[str, float] = {}
+    for scores in (audio, lyric_scores, user_scores):
+        for key, value in scores.items():
+            totals[key] = totals.get(key, 0.0) + value
+
+    def ranked(keys: Sequence[str], limit: int) -> list[str]:
+        kept = [k for k in keys if totals.get(k, 0.0) >= 0.5]
+        return sorted(kept, key=lambda k: (-totals[k], keys.index(k)))[:limit]
+
+    emotions, themes = ranked(_EMOTIONS, 3), ranked(_THEMES, 2)
+    preset_scores: dict[str, float] = {}
+    for key, value in totals.items():
+        for preset_id, affinity in _PRESET_AFFINITY.get(key, {}).items():
+            preset_scores[preset_id] = preset_scores.get(preset_id, 0.0) + value * affinity
+    if _DOCUMENTARY_HINT.search(user_text):
+        preset_scores["documentary"] = preset_scores.get("documentary", 0.0) + 2.0
+    order = list(WORLD_PRESETS)
+    recommended = sorted((p for p, v in preset_scores.items() if v > 0 and p in WORLD_PRESETS and p != "custom"),
+                         key=lambda p: (-preset_scores[p], order.index(p)))[:3] or ["cinematic"]  # fmt: skip
+
+    def labels(scores: Mapping[str, float]) -> list[str]:
+        return [k for k in (*_EMOTIONS, *_THEMES) if scores.get(k, 0.0) >= 0.5]
+
+    sources = {"audio": labels(audio), "lyrics": labels(lyric_scores), "user": labels(user_scores)}
+    parts = []
+    for name, keys in (("音源", sources["audio"]), ("歌詞", sources["lyrics"]), ("入力", sources["user"])):
+        if keys:
+            parts.append(f"{name}: {'・'.join(_EMOTION_JA[k] for k in keys)}")
+    preset_names = "・".join(WORLD_PRESETS[p]["name_ja"] for p in recommended)
+    basis = "／".join(parts) if parts else "手がかりが少ないため汎用的な推定"
+    return {
+        "emotions": emotions,
+        "themes": themes,
+        "mood_en": ", ".join(emotions),
+        "recommended_presets": recommended,
+        "sources": sources,
+        "rationale_ja": f"{basis} → おすすめの世界観: {preset_names}",
+    }
+
+
 # --- template generator ---------------------------------------------------------------------------
 
 
@@ -316,6 +498,7 @@ def _template_world(
     custom_world: str | None,
     custom_world_en: str,
     mood: str | None,
+    estimated_mood_ja: str = "",
 ) -> dict[str, Any]:
     protagonist = rng.choice(preset["protagonists"])
     location = rng.choice(preset["locations"])
@@ -326,6 +509,8 @@ def _template_world(
         location_ja = (custom_world or "").strip()[:40]
         look_en = f"{custom_world_en}, {look_en}"
     mood_ja = f"ムードは「{mood.strip()[:40]}」。" if mood and mood.strip() else ""
+    if not mood_ja and estimated_mood_ja:
+        mood_ja = f"ムードは推定で「{estimated_mood_ja}」。"
     return {
         "summary_ja": (
             f"{preset['name_ja']}の世界観。主人公は{protagonist['ja']}。舞台は{location_ja}。"
@@ -473,6 +658,13 @@ footage, natural skin texture, realistic hands, subtle natural motion") -> the c
 the full protagonist description in every scene where the protagonist appears.
 - Never mention real people, celebrities, the artist or any name listed under forbidden_likeness, brands, \
 logos, readable signs or any text in frame.
+- song.audio_mood (from audio analysis) and song.world_estimate (emotions merged from audio, lyrics and the \
+user's mood) describe the emotional tone; combine them with the lyrics and the user's mood.
+
+detected_real_people: every real person (the artist, celebrities, public figures, private individuals) named \
+or alluded to anywhere in the input, in every spelling you know (original script, romanization, katakana, \
+English name), including the romanized and kana spellings of the names under forbidden_likeness. Empty list \
+if none. These names are removed from all prompts.
 - negative_prompt_en: comma-separated, max 300 characters (artifacts to avoid: deformed hands, extra \
 fingers, warped face, morphing, flicker, text, watermark, cartoon, CGI, oversaturated, plus scene-specific \
 items).
@@ -540,8 +732,9 @@ STORYBOARD_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
+        "detected_real_people": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["world_bible", "scenes"],
+    "required": ["world_bible", "scenes", "detected_real_people"],
     "additionalProperties": False,
 }
 
@@ -571,7 +764,6 @@ def _usage_dict(response: Any) -> dict[str, int] | None:
 def _user_message(
     *,
     title: str,
-    artist_name: str,
     mood: str | None,
     purpose: str | None,
     lyrics: Sequence[Mapping[str, Any]],
@@ -579,8 +771,11 @@ def _user_message(
     preset: WorldPreset,
     custom_world: str | None,
     n_scenes: int,
+    forbidden: list[str],
+    estimate: Mapping[str, Any] | None = None,
 ) -> str:
-    forbidden = [artist_name] if artist_name.strip() else []
+    """User message for Claude. ``forbidden`` (artist name + spellings + people named
+    in the user's text) is removed from every field and sent only as forbidden_likeness."""
 
     def clean(value: str | None) -> str | None:
         return strip_forbidden_names(value, forbidden)[0] or None if value else None
@@ -608,6 +803,12 @@ def _user_message(
             "duration_sec": _num((analysis or {}).get("duration")),
             "bpm": _num((analysis or {}).get("bpm")),
             "sections": sections,
+            "audio_mood": (analysis or {}).get("mood") if isinstance((analysis or {}).get("mood"), Mapping) else None,
+            "world_estimate": (
+                {k: estimate[k] for k in ("emotions", "themes", "recommended_presets") if k in estimate}
+                if estimate
+                else None
+            ),
         },
         "lyrics": lyric_items,
         "world_preset": {
@@ -623,7 +824,7 @@ def _user_message(
             "extra_notes_ja": clean(custom_world) if preset["id"] != "custom" else None,
         },
         "forbidden_likeness": {
-            "names": [artist_name] if artist_name.strip() else [],
+            "names": list(forbidden),
             "rule": "Never depict, name or resemble these people (the performing artist) or any real person.",
         },
     }
@@ -695,12 +896,24 @@ def _normalize_claude(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     raw_world = data["world_bible"]
+    detected = [
+        str(name).strip() for name in data.get("detected_real_people") or []
+        if isinstance(name, str) and 2 <= len(name.strip()) <= 60
+    ][:30]  # fmt: skip
+    extra = [name for name in dict.fromkeys(detected) if name not in forbidden]
+    if extra:
+        forbidden = [*forbidden, *extra]
+        warnings.append(f"Claude が実在の人物名を {len(extra)} 件検出したため、プロンプトに使わないよう除外しました")
 
     def text(key: str, fallback: str = "") -> str:
         value = raw_world.get(key)
         return str(value).strip() if isinstance(value, str) and value.strip() else fallback
 
-    protagonist, _ = strip_forbidden_names(text("protagonist_en", preset["protagonists"][0]["en"]), forbidden)
+    def clean_en(value: str) -> str:
+        """World-bible text without forbidden names or real-person references (kept verbatim in prompts)."""
+        return strip_person_references(strip_forbidden_names(value, forbidden)[0]).text
+
+    protagonist = clean_en(text("protagonist_en", preset["protagonists"][0]["en"]))
     if "fictional" not in protagonist.lower():
         protagonist = (
             f"a fictional {protagonist[:1].lower()}{protagonist[1:]}"
@@ -710,13 +923,13 @@ def _normalize_claude(
     palette = [str(c).upper() for c in raw_world.get("palette") or [] if isinstance(c, str) and _HEX.match(c.strip())]
     world = {
         "summary_ja": strip_forbidden_names(text("summary_ja", preset["description_ja"]), forbidden)[0],
-        "look_en": strip_forbidden_names(text("look_en", preset["look_en"]), forbidden)[0],
+        "look_en": clean_en(text("look_en", preset["look_en"])),
         "protagonist_en": protagonist,
-        "location_en": strip_forbidden_names(text("location_en", preset["locations"][0]["en"]), forbidden)[0],
+        "location_en": clean_en(text("location_en", preset["locations"][0]["en"])),
         "palette": palette[:3] if len(palette) >= 3 else list(preset["palette"]),
-        "consistency_tokens_en": strip_forbidden_names(
-            text("consistency_tokens_en", f"{preset['palette_en']} color palette, {preset['film_en']}"), forbidden
-        )[0][:240],
+        "consistency_tokens_en": clean_en(
+            text("consistency_tokens_en", f"{preset['palette_en']} color palette, {preset['film_en']}")
+        )[:240],
     }
 
     line_by_id = {str(line.get("id")): line for line in lyrics if line.get("id") is not None}
@@ -776,6 +989,16 @@ def _normalize_claude(
 # --- public API --------------------------------------------------------------------------------------
 
 
+def _forbidden_names(artist_name: str, aliases: Sequence[str] | None) -> list[str]:
+    """Artist name and aliases with their kana romanisations (あいみょん → aimyon)."""
+    names: list[str] = []
+    for name in (artist_name, *(aliases or ())):
+        for variant in artist_name_variants(str(name or "")):
+            if variant not in names:
+                names.append(variant)
+    return names
+
+
 def generate_storyboard(
     *,
     title: str,
@@ -790,29 +1013,45 @@ def generate_storyboard(
     seed: int | None = None,
     use_claude: bool = True,
     client: Any | None = None,
+    artist_aliases: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build a Storyboard (ARCHITECTURE.md §6.3).
 
     Claude is used when ``use_claude`` is true and an Anthropic client is
     available (``client`` argument — used by tests — or ``ANTHROPIC_API_KEY``).
     The template path is deterministic for a given ``seed`` (``None`` derives
-    a stable seed from title/preset/custom world). The artist name is only
-    ever used as a forbidden-likeness constraint.
+    a stable seed from title/preset/custom world). The artist name (plus
+    ``artist_aliases``, e.g. romanised or English names, and kana
+    romanisations) is only ever used as a forbidden-likeness constraint, as
+    are people named in the custom world / mood / purpose. The result also
+    carries ``world_estimate`` (:func:`estimate_world`).
     """
     preset = get_preset(preset_id)
     n = max(1, min(MAX_SCENES, int(n_scenes or DEFAULT_SCENES)))
-    forbidden = [artist_name] if artist_name and artist_name.strip() else []
+    forbidden = _forbidden_names(artist_name, artist_aliases)
     lyrics = list(lyrics or [])
     warnings: list[str] = []
     claude_model: str | None = None
     claude_usage: dict[str, int] | None = None
 
+    # People named in the user's free text are forbidden everywhere (prompts, Claude, lyric excerpts).
+    custom_world_clean, world_names, world_warnings = screen_free_text(
+        custom_world, forbidden, where="カスタム世界観から"
+    )
+    mood_clean, mood_names, mood_warnings = screen_free_text(mood, forbidden, where="雰囲気から")
+    _, purpose_names, _ = screen_free_text(purpose, forbidden)
+    for name in (*world_names, *mood_names, *purpose_names):
+        if name not in forbidden:
+            forbidden.append(name)
+    screen_warnings = [*world_warnings, *mood_warnings]
+    estimate = estimate_world(analysis, lyrics, mood_clean, purpose)
+
     if use_claude:
         claude = client if client is not None else make_claude_client()
         if claude is not None:
             message = _user_message(
-                title=title, artist_name=artist_name, mood=mood, purpose=purpose, lyrics=lyrics,
-                analysis=analysis, preset=preset, custom_world=custom_world, n_scenes=n,
+                title=title, mood=mood, purpose=purpose, lyrics=lyrics, analysis=analysis, preset=preset,
+                custom_world=custom_world, n_scenes=n, forbidden=forbidden, estimate=estimate,
             )  # fmt: skip
             try:
                 data, claude_model, claude_usage = _call_claude(claude, user_message=message)
@@ -826,9 +1065,10 @@ def generate_storyboard(
                     "cost_usd": claude_cost_usd(claude_model, claude_usage),
                     "world_bible": world,
                     "scenes": scenes,
-                    "warnings": list(dict.fromkeys(normalize_warnings)),
+                    "warnings": list(dict.fromkeys([*screen_warnings, *normalize_warnings])),
                     "preset": preset["id"],
                     "seed": seed,
+                    "world_estimate": estimate,
                 }
             except _ClaudeFailure as failure:
                 warnings.append(failure.warning)
@@ -836,16 +1076,14 @@ def generate_storyboard(
 
     effective_seed = seed if seed is not None else _stable_int(title, preset["id"], custom_world or "")
     rng = random.Random(_stable_int("storyboard", effective_seed, preset["id"]))
-    # Names are removed from free text before translation (a glossary may split them into separate words).
-    custom_world = strip_forbidden_names(custom_world, forbidden)[0] if custom_world else custom_world
-    mood = strip_forbidden_names(mood, forbidden)[0] if mood else mood
+    warnings.extend(screen_warnings)
 
     custom_world_en = ""
     if preset["id"] == "custom":
         if custom_world and custom_world.strip():
-            custom_world_en, source = translate_to_english(custom_world, use_claude=False)
-            custom_world_en, _ = strip_forbidden_names(custom_world_en, forbidden)
-            custom_world_en = custom_world_en[:300]
+            custom_world_en, source = translate_to_english(custom_world_clean, use_claude=False)
+            # Names were removed before translation (a glossary may split them into separate words).
+            custom_world_en = screen_free_text(custom_world_en, forbidden)[0][:300]
             if not custom_world_en:
                 warnings.append(
                     "カスタム世界観を英語に変換できなかったため、汎用的な設定で作成しました。"
@@ -855,20 +1093,22 @@ def generate_storyboard(
                 warnings.append("カスタム世界観は簡易辞書で英訳しました（Claude API を設定すると精度が上がります）")
         else:
             warnings.append("カスタム世界観が未入力のため、汎用的な設定で作成しました")
-    mood_en = ""
-    if mood and mood.strip():
-        mood_en = (
-            ", ".join(glossary_keywords(mood, limit=4, include_ascii=False))
-            if not mood.isascii()
-            else mood.strip()[:80]
-        )
-        mood_en, _ = strip_forbidden_names(mood_en, forbidden)
+    # Mood: glossary translations and allow-listed English mood words only (never raw
+    # Latin-script text, which could name a person); without a usable mood, the estimate.
+    mood_en = ", ".join(mood_keywords(mood_clean, limit=4)) if mood_clean else ""
+    estimated_mood_ja = ""
+    if not mood_en and estimate["emotions"]:
+        mood_en = estimate["mood_en"]
+        estimated_mood_ja = "・".join(_EMOTION_JA[e] for e in estimate["emotions"])
 
     if not _song_sections(analysis):
         warnings.append("楽曲解析の結果がないため、一般的な曲構成を想定してシーンを割り当てました")
     slots = _scene_slots(analysis, n)
     refs = _lyric_refs(slots, lyrics)
-    world = _template_world(preset, rng=rng, custom_world=custom_world, custom_world_en=custom_world_en, mood=mood)
+    world = _template_world(
+        preset, rng=rng, custom_world=custom_world_clean, custom_world_en=custom_world_en, mood=mood_clean,
+        estimated_mood_ja=estimated_mood_ja,
+    )  # fmt: skip
     scenes, scene_warnings = _template_scenes(
         preset, world, rng=rng, slots=slots, refs=refs, custom_world_en=custom_world_en, mood_en=mood_en,
         forbidden=forbidden,
@@ -885,4 +1125,5 @@ def generate_storyboard(
         "warnings": list(dict.fromkeys(warnings)),
         "preset": preset["id"],
         "seed": effective_seed,
+        "world_estimate": estimate,
     }
