@@ -40,3 +40,22 @@ export function fileExtension(filename: string): string {
   const index = filename.lastIndexOf(".");
   return index >= 0 ? filename.slice(index + 1).toLowerCase() : "";
 }
+
+
+/** Artist aliases typed as "Kenshi Yonezu, Hachi" (comma / 読点 / newline separated) → trimmed, de-duplicated list. */
+export function parseAliases(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of text.split(/[,、，\n]/)) {
+    const alias = part.replace(/\s+/g, " ").trim();
+    if (alias && !seen.has(alias.toLowerCase())) {
+      seen.add(alias.toLowerCase());
+      out.push(alias);
+    }
+  }
+  return out;
+}
+
+export function formatAliases(aliases: readonly string[] | null | undefined): string {
+  return (aliases ?? []).join(", ");
+}

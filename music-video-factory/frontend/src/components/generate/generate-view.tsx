@@ -6,6 +6,7 @@ import { ProjectHeader } from "@/components/layout/project-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useProjectBatches } from "@/hooks/use-batches";
 import { useProject } from "@/hooks/use-projects";
+import { useWorldEstimate } from "@/hooks/use-world-estimate";
 
 import { GenerateForm } from "./generate-form";
 
@@ -29,20 +30,28 @@ export function GenerateSkeleton() {
 export function GenerateView({ projectId }: { projectId: string }) {
   const { data: project, error: projectError } = useProject(projectId);
   const { data: batches, error: batchesError } = useProjectBatches(projectId);
+  const worldEstimate = useWorldEstimate(
+    project ? projectId : null,
+    project ? `${project.updated_at}:${project.analysis_status}` : "",
+  );
 
   const previous = React.useMemo(() => {
     if (!batches || batches.length === 0) return null;
     return [...batches].sort((a, b) => b.created_at.localeCompare(a.created_at))[0].settings;
   }, [batches]);
 
-  // Wait for the batch list (best effort) so the form can start from the last settings.
-  const ready = project !== undefined && (batches !== undefined || batchesError !== undefined);
+  // Wait for the batch list and the world estimate (best effort) so the form can start from
+  // the last settings, or from the estimated preset on a first run.
+  const ready =
+    project !== undefined &&
+    (batches !== undefined || batchesError !== undefined) &&
+    (worldEstimate.data !== undefined || worldEstimate.error !== undefined);
 
   return (
     <>
       <ProjectHeader projectId={projectId} active="generate" />
       {projectError && !project ? null : ready ? (
-        <GenerateForm key={project.id} project={project} previous={previous} />
+        <GenerateForm key={project.id} project={project} previous={previous} worldEstimate={worldEstimate.data ?? null} />
       ) : (
         <GenerateSkeleton />
       )}

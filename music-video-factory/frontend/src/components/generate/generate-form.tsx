@@ -25,7 +25,16 @@ import { useClips } from "@/hooks/use-clips";
 import { apiPaths, createBatch, errorMessage } from "@/lib/api";
 import { DEFAULT_COUNTS, DEFAULT_DURATIONS, providerLabel } from "@/lib/constants";
 import { formatCount, formatDuration, formatUsd } from "@/lib/format";
-import type { EstimateComparison, GenerationSettings, PresetId, ProjectOut, ProviderId, ReuseMode } from "@/lib/types";
+import type {
+  EstimateComparison,
+  GenerationSettings,
+  PresetId,
+  ProjectOut,
+  ProviderId,
+  ReuseMode,
+  WorldEstimate,
+} from "@/lib/types";
+import { emotionLabel } from "@/components/audio/world-estimate-card";
 
 import { ColorGradeSelect, useColorGrades } from "./color-grade-select";
 import { EstimatePanel, ProviderComparison } from "./estimate-panel";
@@ -35,6 +44,7 @@ import {
   formCount,
   formDuration,
   initialFormState,
+  suggestedInitialPreset,
   validateForm,
   type GenerateFormState,
 } from "./form-state";
@@ -46,7 +56,7 @@ import { computeReadiness, estimateUnavailableReason, isReady, ReadinessList } f
 import { StartPositionField } from "./start-position-field";
 import { StoryboardPreview } from "./storyboard-preview";
 import { TextStyleControls } from "./text-style-controls";
-import { colorGradeName } from "./text-style";
+import { autoLyricStyles, colorGradeName, lyricStyleChoiceName, previewStyleId } from "./text-style";
 import { useEstimate } from "./use-estimate";
 import { reuseLabel, startStrategyLabel } from "./vocab";
 
@@ -68,6 +78,12 @@ const REUSE_OPTIONS: { value: ReuseMode; title: string; description: string }[] 
   },
 ];
 
+function randomSeed(): number {
+  const values = new Uint32Array(1);
+  crypto.getRandomValues(values);
+  return (values[0] % 2_147_483_646) + 1;
+}
+
 function SummaryRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
@@ -77,14 +93,56 @@ function SummaryRow({ label, value }: { label: string; value: React.ReactNode })
   );
 }
 
+function WorldEstimateHint({
+  estimate,
+  presetName,
+  current,
+  suggestedPreset,
+  onPick,
+}: {
+  estimate: WorldEstimate;
+  presetName: (id: string) => string;
+  current: PresetId;
+  suggestedPreset: PresetId | null;
+  onPick: (preset: PresetId) => void;
+}) {
+  const emotions = [...estimate.emotions, ...estimate.themes].map(emotionLabel).join("・");
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-border bg-surface-raised/50 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
+      <p>
+        <span className="text-foreground">感情・世界観の推定</span>
+        {emotions ? `: ${emotions}` : ""}（{estimate.analysis_used ? "楽曲解析・" : ""}歌詞・ムードと目的から）
+        {suggestedPreset && current === suggestedPreset ? " ・ 推定に基づいておすすめの世界観を選んでいます。" : null}
+      </p>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span>おすすめ</span>
+        {estimate.recommended_presets.map((id) => (
+          <Button
+            key={id}
+            type="button"
+            size="xs"
+            variant={id === current ? "secondary" : "ghost"}
+            aria-pressed={id === current}
+            onClick={() => onPick(id as PresetId)}
+          >
+            {presetName(id)}
+          </Button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export interface GenerateFormProps {
   project: ProjectOut;
   /** Settings of the project's latest batch (start from them), if any. */
   previous: Partial<GenerationSettings> | null;
+  /** 感情・世界観推定 of the project (recommendations; pre-selects the preset on a first run). */
+  worldEstimate?: WorldEstimate | null;
 }
 
 /** All generation settings, the live estimate, readiness checks and the 生成開始 action. */
-export function GenerateForm({ project, previous }: GenerateFormProps) {
+export function GenerateForm({ project, previous, worldEstimate = null }: GenerateFormProps) {
   const router = useRouter();
   const { mutate } = useSWRConfig();
   const { data: capabilities, error: capabilitiesError, mutate: reloadCapabilities, isLoading: capabilitiesLoading } = useCapabilities();
@@ -97,10 +155,19 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
   const durations = capabilities?.durations?.length ? capabilities.durations : DEFAULT_DURATIONS;
   const counts = capabilities?.counts?.length ? capabilities.counts : DEFAULT_COUNTS;
 
-  const [state, setState] = React.useState<GenerateFormState>(() => initialFormState(project, previous, { durations, counts }));
+  // On a first run the world estimate may pick the starting preset (see suggestedInitialPreset).
+  const [suggestedPreset] = React.useState(() => suggestedInitialPreset(project, previous, worldEstimate?.recommended_presets));
+  const [state, setState] = React.useState<GenerateFormState>(() =>
+    initialFormState(project, previous, { durations, counts, suggestedPreset }),
+  );
   const update = React.useCallback((patch: Partial<GenerateFormState>) => setState((current) => ({ ...current, ...patch })), []);
 
-  const { errors, settings } = React.useMemo(() => validateForm(state, limits), [state, limits]);
+  // One random seed per form: the estimate and the batch then describe exactly the same plan
+  // (the server would otherwise estimate with seed 0 and run with a random one).
+  const [seed, setSeed] = React.useState(randomSeed);
+  const validated = React.useMemo(() => validateForm(state, limits), [state, limits]);
+  const errors = validated.errors;
+  const settings = React.useMemo(() => (validated.settings ? { ...validated.settings, seed } : null), [validated.settings, seed]);
   const duration = formDuration(state);
   const count = formCount(state);
   const songDuration = project.analysis?.duration ?? project.audio?.duration ?? null;
@@ -131,7 +198,11 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
   const canStart = isReady(readiness) && settings !== null && estimate.current && !!capabilities;
   const firstBlocker = readiness.find((item) => item.level === "blocked" || item.level === "pending");
 
-  const palette = presets.find((preset) => preset.id === state.preset)?.palette;
+  const presetInfo = presets.find((preset) => preset.id === state.preset);
+  const palette = presetInfo?.palette;
+  // `auto` rotates the preset's styles per video; previews and placeholders show the first video's style.
+  const autoStyles = React.useMemo(() => autoLyricStyles(presetInfo), [presetInfo]);
+  const previewStyle = previewStyleId(state.lyricStyle, autoStyles);
   const budgetSource = state.budget !== null ? "この生成" : project.budget_limit_usd !== null ? "プロジェクト設定" : "既定";
 
   const [confirmOpen, setConfirmOpen] = React.useState(false);
@@ -144,6 +215,7 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
     setSubmitError(null);
     try {
       const batch = await createBatch(project.id, settings);
+      setSeed(randomSeed()); // a later batch from this form is a new variation
       toast.success("生成を開始しました", `${formatCount(count)}本の動画を生成します。進捗はこの画面で確認できます。`);
       void mutate(apiPaths.projectBatches(project.id));
       void mutate(apiPaths.project(project.id));
@@ -185,6 +257,15 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
             </Button>
           }
         >
+          {worldEstimate ? (
+            <WorldEstimateHint
+              estimate={worldEstimate}
+              presetName={(id) => presets.find((preset) => preset.id === id)?.name_ja ?? id}
+              current={state.preset}
+              suggestedPreset={suggestedPreset}
+              onPick={(preset) => update({ preset })}
+            />
+          ) : null}
           <WorldPresetPicker
             presets={presets}
             value={state.preset}
@@ -339,20 +420,26 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
           <LyricStylePicker
             value={state.lyricStyle}
             onValueChange={(lyricStyle) => update({ lyricStyle })}
+            autoStyles={autoStyles}
             textStyle={state.textStyle}
             palette={palette}
           />
           <div className="grid grid-cols-1 gap-6 border-t border-border pt-5 md:grid-cols-[minmax(0,1fr)_168px]">
             <TextStyleControls
               idPrefix="generate-text"
-              styleId={state.lyricStyle}
+              styleId={previewStyle}
               value={state.textStyle}
               onValueChange={(textStyle) => update({ textStyle })}
             />
             <div className="flex flex-col gap-1.5">
               <span className="text-xs text-muted-foreground">配置プレビュー</span>
-              <LyricStyleSample variant="frame" showSafeArea styleId={state.lyricStyle} textStyle={state.textStyle} palette={palette} />
-              <span className="text-2xs leading-4 text-subtle-foreground">点線の外は IG の UI に隠れる範囲です（近似表示）。</span>
+              <LyricStyleSample variant="frame" showSafeArea styleId={previewStyle} textStyle={state.textStyle} palette={palette} />
+              <span className="text-2xs leading-4 text-subtle-foreground">
+                点線の外は IG の UI に隠れる範囲です（近似表示）。
+                {state.lyricStyle === "auto"
+                  ? `1 本目のスタイル（${lyricStyleChoiceName(previewStyle, lyricStyles)}）を表示しています。文字の設定はすべての動画に適用されます。`
+                  : null}
+              </span>
             </div>
           </div>
         </FormSection>
@@ -442,6 +529,23 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
           </div>
         </FormSection>
 
+        {capabilities?.claude_configured && state.provider !== "library" ? (
+          <div className="flex items-start justify-between gap-4 rounded-md border border-border bg-surface px-4 py-3">
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="generate-new-storyboard">絵コンテを Claude で新しく作り直す</Label>
+              <p className="text-xs leading-5 text-muted-foreground">
+                オフの場合、同じ世界観・楽曲・歌詞で前回 Claude が作った絵コンテを再利用します（主人公や世界観がバッチ間で揃い、生成済みの素材も再利用できます）。オンにすると Claude
+                の利用料と、新しい素材の生成費用がかかります。この設定は次回の生成には引き継がれません。
+              </p>
+            </div>
+            <Switch
+              id="generate-new-storyboard"
+              checked={state.newStoryboard}
+              onCheckedChange={(newStoryboard) => update({ newStoryboard })}
+            />
+          </div>
+        ) : null}
+
         <StoryboardPreview
           projectId={project.id}
           preset={state.preset}
@@ -468,7 +572,7 @@ export function GenerateForm({ project, previous }: GenerateFormProps) {
                 label="生成エンジン"
                 value={`${providerName}${modelInfo && providerInfo?.kind === "api" ? ` / ${modelInfo.name || modelInfo.id}` : ""}`}
               />
-              <SummaryRow label="歌詞スタイル" value={lyricStyles.find((s) => s.id === state.lyricStyle)?.name_ja ?? state.lyricStyle} />
+              <SummaryRow label="歌詞スタイル" value={lyricStyleChoiceName(state.lyricStyle, lyricStyles)} />
               <SummaryRow label="カラー" value={colorGradeName(state.colorGrade, grades)} />
               <SummaryRow label="開始位置" value={startStrategyLabel(state.startStrategy)} />
               <SummaryRow label="素材の再利用" value={reuseLabel(state.reuse)} />

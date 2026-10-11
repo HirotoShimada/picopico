@@ -56,6 +56,8 @@ LEGACY_PRICING_URL = "https://kling.ai/document-api/pricing/base/video"
 USD_PER_UNIT = 0.14
 JWT_TTL_SEC = 1800
 _PROMPT_MAX_CHARS = 2500
+# Consecutive task lookups (new API) that do not list the task before giving up (~1.5 min on the poll schedule).
+MAX_LOOKUP_MISSES = 6
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 # Words in a failed task's message that suggest a transient server-side problem.
 _TRANSIENT_HINTS = ("internal", "timeout", "timed out", "busy", "try again", "temporar", "unavailable", "system error")
@@ -302,6 +304,26 @@ class KlingProvider(ApiVideoProvider):
             data={"external_id": external_id, "task_id": task_id},
         )
 
+    def resume_token(self, job: SubmittedJob) -> str:
+        """New API: ``new:<external_task_id>:<task id>`` (polling needs the external id); legacy: ``legacy:<task id>``."""
+        if "external_id" in job.data:
+            return f"new:{job.data['external_id']}:{job.data.get('task_id') or ''}"
+        return f"legacy:{job.id}"
+
+    def _job_from_token(self, token: str, req: ClipRequest, model: ProviderModel) -> SubmittedJob:
+        kind, _, rest = token.partition(":")
+        if kind == "new" and model.params["api"] == "new":
+            external_id, _, task_id = rest.partition(":")
+            external_id = safe_path_id(external_id, provider_name=self.name, what="タスク ID")
+            task_id = safe_path_id(task_id, provider_name=self.name, what="タスク ID") if task_id else ""
+            return SubmittedJob(id=task_id or external_id, raw={"resumed": True},
+                                data={"external_id": external_id, "task_id": task_id})  # fmt: skip
+        if kind == "legacy" and model.params["api"] == "legacy":
+            task_id = safe_path_id(rest, provider_name=self.name, what="タスク ID")
+            return SubmittedJob(id=task_id, raw={"resumed": True},
+                                data={"kind": "image2video" if req.image_path else "text2video"})  # fmt: skip
+        raise ProviderError(f"{self.name}: 再開するジョブの情報が不正です", retryable=False, code="provider_bad_input")
+
     def _poll(self, client: httpx.Client, job: SubmittedJob, model: ProviderModel) -> PollOutcome:
         if model.params["api"] == "legacy":
             return self._poll_legacy(client, job, model)
@@ -309,15 +331,26 @@ class KlingProvider(ApiVideoProvider):
                                  params={"external_task_ids": job.data["external_id"]},
                                  headers=self._headers(model))  # fmt: skip
         items = self._checked(response, "進捗の確認").get("data") or []
-        if isinstance(items, dict):
+        if isinstance(items, dict) and ("id" in items or "status" in items or "external_id" in items):
             items = [items]
+        if not isinstance(items, list):
+            raise ProviderError(f"{self.name}: 進捗の確認の応答形式が想定外です", retryable=True,
+                                code="provider_bad_response")  # fmt: skip
         task = next(
             (t for t in items if isinstance(t, dict)
              and (t.get("external_id") == job.data["external_id"] or (job.data["task_id"] and t.get("id") == job.data["task_id"]))),
             None,
         )  # fmt: skip
         if task is None:
+            misses = int(job.data.get("misses") or 0) + 1
+            job.data["misses"] = misses
+            if misses >= MAX_LOOKUP_MISSES:
+                raise ProviderTaskError(
+                    f"{self.name}: 作成したタスクが照会で見つかりません（{misses} 回）。Kling のコンソールで確認してください",
+                    retryable=False, code="provider_bad_response", external_job_id=job.id,
+                )  # fmt: skip
             return PollOutcome(state="queued", raw={"status": None})
+        job.data["misses"] = 0
         status = str(task.get("status") or "").lower()
         raw = {"status": status, "id": task.get("id")}
         if status in ("submitted", "pending", "queued"):

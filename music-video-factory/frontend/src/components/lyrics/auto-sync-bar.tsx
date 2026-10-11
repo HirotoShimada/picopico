@@ -15,6 +15,8 @@ import { autoTimeLyrics, errorMessage } from "@/lib/api";
 import { formatTime } from "@/lib/format";
 import type { AutoTimeMethod, AutoTimeOut, LyricLine, Segment } from "@/lib/types";
 
+import { linesEqual } from "./timing";
+
 export interface AutoSyncBarProps {
   projectId: string;
   lines: readonly LyricLine[];
@@ -63,8 +65,13 @@ export function AutoSyncBar({ projectId, lines, analysisReady, segment, dirty, s
         end: effectiveScope === "segment" && segment ? segment.end : null,
         overwrite_timed: overwrite,
       });
-      await commit(response.lines);
       setResult(response);
+      if (linesEqual(response.lines, lines)) {
+        // Nothing to apply: no save, no undo step, no success claim.
+        toast({ title: "変更はありませんでした", description: "「タイミング設定済みの行も上書きする」をオンにすると再推定します。" });
+        return;
+      }
+      await commit(response.lines);
       toast.success(
         response.method_used === "whisper" ? "Whisper でタイミングを合わせました" : "タイミングを自動で推定しました",
         "結果を再生して確認し、必要に応じて調整してください。元に戻すこともできます。",

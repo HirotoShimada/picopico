@@ -33,6 +33,7 @@ def test_generation_settings_defaults() -> None:
         "max_new_clips": None,
         "budget_limit_usd": None,
         "seed": None,
+        "new_storyboard": False,
     }
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -81,6 +81,25 @@ def _strip_or_none(value: Any) -> Any:
         value = value.strip()
         return value or None
     return value
+
+
+MAX_ARTIST_ALIASES = 10
+
+
+def _clean_aliases(value: Any) -> Any:
+    """Artist aliases: stripped, blanks dropped, de-duplicated (case-insensitive), order kept."""
+    if value is None or not isinstance(value, list):
+        return value
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return value  # let the type check report it
+        text = " ".join(item.split())
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            out.append(text)
+    return out
 
 
 class APIModel(BaseModel):
@@ -198,6 +217,7 @@ class AutoTimeOut(APIModel):
 class ProjectCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     artist_name: str = Field(min_length=1, max_length=200)
+    artist_aliases: list[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=MAX_ARTIST_ALIASES)
     mood: str | None = Field(default=None, max_length=2000)
     purpose: str | None = Field(default=None, max_length=2000)
     notes: str | None = Field(default=None, max_length=10_000)
@@ -215,12 +235,18 @@ class ProjectCreate(BaseModel):
     def _strip_optional(cls, value: Any) -> Any:
         return _strip_or_none(value)
 
+    @field_validator("artist_aliases", mode="before")
+    @classmethod
+    def _aliases(cls, value: Any) -> Any:
+        return _clean_aliases(value)
+
 
 class ProjectUpdate(BaseModel):
     """Partial update: only fields present in the request body are applied."""
 
     title: str | None = Field(default=None, min_length=1, max_length=200)
     artist_name: str | None = Field(default=None, min_length=1, max_length=200)
+    artist_aliases: list[Annotated[str, Field(max_length=100)]] | None = Field(default=None, max_length=MAX_ARTIST_ALIASES)
     mood: str | None = Field(default=None, max_length=2000)
     purpose: str | None = Field(default=None, max_length=2000)
     notes: str | None = Field(default=None, max_length=10_000)
@@ -238,9 +264,14 @@ class ProjectUpdate(BaseModel):
     def _strip_optional(cls, value: Any) -> Any:
         return _strip_or_none(value)
 
+    @field_validator("artist_aliases", mode="before")
+    @classmethod
+    def _aliases(cls, value: Any) -> Any:
+        return _clean_aliases(value)
+
     @model_validator(mode="after")
     def _non_nullable(self) -> ProjectUpdate:
-        for name in ("title", "artist_name", "world_preset"):
+        for name in ("title", "artist_name", "world_preset", "artist_aliases"):
             if name in self.model_fields_set and getattr(self, name) is None:
                 raise ValueError(f"{name} は null にできません")
         return self
@@ -256,6 +287,7 @@ class ProjectOut(APIModel):
     id: str
     title: str
     artist_name: str
+    artist_aliases: list[str] = Field(default_factory=list)
     mood: str | None = None
     purpose: str | None = None
     notes: str | None = None
@@ -312,6 +344,24 @@ class AnalysisOut(APIModel):
     error: str | None = None
     analysis: dict[str, Any] | None = None
     segment: Segment | None = None
+
+
+class WorldEstimateSources(APIModel):
+    audio: list[str] = Field(default_factory=list)
+    lyrics: list[str] = Field(default_factory=list)
+    user: list[str] = Field(default_factory=list)
+
+
+class WorldEstimateOut(APIModel):
+    """感情・世界観推定 (``storyboard.estimate_world``): deterministic, no API call."""
+
+    emotions: list[str] = Field(default_factory=list)
+    themes: list[str] = Field(default_factory=list)
+    mood_en: str = ""
+    recommended_presets: list[str] = Field(default_factory=list)
+    sources: WorldEstimateSources = Field(default_factory=WorldEstimateSources)
+    rationale_ja: str = ""
+    analysis_used: bool = False  # false while the song analysis is not done (lyrics/user input only)
 
 
 class AnalysisRerunOut(APIModel):
@@ -407,6 +457,9 @@ class GenerationSettings(BaseModel):
     max_new_clips: int | None = Field(default=None, ge=0, le=500)
     budget_limit_usd: float | None = Field(default=None, ge=0, le=100_000)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    # Extension: with Claude, later batches reuse the project's storyboard for the same world
+    # (consistent protagonist, clip cache hits); true asks Claude for a new one.
+    new_storyboard: bool = False
 
     @field_validator("custom_world", "model", mode="before")
     @classmethod
@@ -575,6 +628,12 @@ class VideoRegenerateRequest(BaseModel):
     new_clips: bool = False
 
 
+class BatchUpdate(BaseModel):
+    """``PATCH /api/batches/{id}`` (extension): a new budget cap, e.g. to retry after ``budget_exceeded``."""
+
+    budget_limit_usd: float = Field(ge=0, le=100_000)
+
+
 class LyricOffset(BaseModel):
     start: float = Field(ge=0)
     end: float = Field(gt=0)
@@ -645,6 +704,9 @@ class BatchOut(APIModel):
     finished_at: datetime | None = None
     counts: BatchCounts
     clip_counts: ClipCounts
+    # While a finished batch is re-opened for a re-render: the status and reason it had before.
+    reopened_from: BatchStatusT | None = None
+    previous_error: str | None = None
     videos: list[VideoOut] | None = None
     clips: list[ClipOut] | None = None
 
@@ -695,6 +757,8 @@ class WorldPresetInfo(LooseModel):
     name_en: str = ""
     description_ja: str = ""
     palette: list[str] = Field(default_factory=list)
+    color_grades: list[str] = Field(default_factory=list)  # grades ``color_grade: "auto"`` rotates
+    lyric_styles: list[str] = Field(default_factory=list)  # recommended, best first (``lyric_style: "auto"``)
 
 
 class LyricStyleInfo(APIModel):

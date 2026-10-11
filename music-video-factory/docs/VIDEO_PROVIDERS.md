@@ -85,6 +85,9 @@
 ### 2.2 アダプタ共通の設計メモ（全社共通。[C] 設計判断）
 
 - **作成 → ポーリング → 即ダウンロード**。出力 URL は 24 時間〜2 日で失効するため、成功を検知したらすぐ `out_path` へ保存する。保存後の参照には自前の Storage を使う。
+- **成功したジョブは課金済みなので、再送信しない**。ダウンロードや ffprobe での検証が一時的に失敗したときは、取得だけを最大 3 回（`OUTPUT_FETCH_ATTEMPTS`）までやり直す。間隔はポーリングと同じで、タイムアウトの範囲内に限る。やり直す前にジョブをもう一度取得し、新しい出力 URL を使う（Runway の署名付き URL は失効するため。Veo と Kling は同じ URI が返る）。それでも取得できない場合は、`cost_usd`（実額か表の単価）を持つ再試行不可の `ProviderTaskError` にする。取得中のキャンセル（`ProviderCancelled`）にも `cost_usd` を付ける。パイプラインはこの金額を CostRecord と `batch.cost_usd` に計上し、同じクリップを新しいジョブで作り直さない。
+- **ジョブ ID は作成直後に保存する**（`generate(..., on_submitted=)` が `on_submitted(job_id, resume_token)` を呼び、パイプラインが `Clip.external_job_id` と `params.open_job` に保存する）。プロセスやワーカーが落ちた後は、`resume(resume_token, ...)` で同じジョブのポーリングと取得を再開し、新しいジョブを送信しない。`resume_token` はジョブ ID と同じだが、Kling は照会に `external_task_id` が要るため `new:<external_task_id>:<task id>` / `legacy:<task id>` とする。ジョブ ID を報告しない古いアダプタでは、中断した試行を課金済みとみなして計上してから再送信する。
+- **失敗したジョブの課金**: Runway の FAILED / CANCELLED タスクは、報告された `cost.credits × $0.01`（多くは 0）を `ProviderTaskError.cost_usd` に載せ、パイプラインはこれを確定値として計上する（0 なら計上なし）。リモートでエラー終了したジョブ（`provider_failed`）は課金なしとみなして再試行できる。キャンセル API がない Veo / Kling でタイムアウト・ポーリング喪失・キャンセルにより放棄したジョブは、課金されたものとみなして表の単価で計上し、再送信しない（`supports_remote_cancel = False`）。いずれも実キーでは未検証。
 - ポーリング間隔は 5 秒から始め、指数バックオフで最大 30 秒、ジッタ ±20%。Runway は「同じタスクを 5 秒未満の間隔で取得しても更新されない」と明記しており [A]、SDK は 6±1.5 秒間隔でポーリングしている [A]。`timeout=900` 秒を超えたら、Runway は `DELETE /v1/tasks/{id}` でキャンセルする。
 - `cancel_check()` が真になったら同様にキャンセルを試みる（Runway のみ API がある。Veo と Kling ではキャンセル方法を確認できていない）。
 - **再試行可否の分類**（`ProviderError(retryable=...)`）:
@@ -144,6 +147,7 @@
   - 実費はタスクの `cost.credits × $0.01` で記録する。
 - **Kling**
   - 新 API の照会には、公式例で確認できた `external_task_ids` を使う。`external_task_id` は毎回 `mvf-<uuid>` を発行する。
+  - 照会結果に作成したタスクが 6 回続けて含まれない場合（`MAX_LOOKUP_MISSES`、約 1.5 分）は、900 秒のタイムアウトを待たずに再試行不可のエラーにする（照会の仕様違いで 15 分待ったうえに再送信して重複課金するのを防ぐ）。想定外の応答形状は再試行可の `provider_bad_response`（連続 5 回まで）とする。
   - 画像→動画の `contents[].url` には生の Base64 を送る。data URI を受け付けるかは未確認 [C]。
   - 失敗タスクの再試行可否は暫定のヒューリスティックで判定する。メッセージに internal、timeout、busy、try again などの語があれば再試行可とする。
   - 業務コード 1302 と 1303、5xxx は再試行可。1102 を含むそれ以外の 1xxx は再試行不可。
@@ -407,7 +411,7 @@ GET https://api.dev.runwayml.com/v1/tasks/{id}     （同じヘッダ）
 |---|---|---|
 | `PENDING` / `THROTTLED` | `estimatedCost.credits` | 待機を続ける。`THROTTLED` は同時実行の上限超過で待機中 |
 | `RUNNING` | `progress`（0〜1）、`estimatedCost.credits` | 待機を続け、進捗を通知 |
-| `SUCCEEDED` | `output: string[]`（動画 URL）、`cost.credits` | `output[0]` をダウンロード。**URL は 24〜48 時間で失効**するので、期限が切れたらタスクを再取得する |
+| `SUCCEEDED` | `output: string[]`（動画 URL）、`cost.credits` | `output[0]` をダウンロード。**URL は 24〜48 時間で失効**するので、ダウンロードに失敗したらタスクを再取得し、新しい URL で取り直す（タスクは再送信しない） |
 | `FAILED` | `failure`（人向けの文）、`failureCode?`、`cost.credits` | 再試行可否を判定（下記） |
 | `CANCELLED` | `cost.credits` | キャンセル済み |
 
@@ -446,7 +450,7 @@ GET https://api.dev.runwayml.com/v1/tasks/{id}     （同じヘッダ）
 - 他の利用者に似た出力が生成される可能性がある。
 - API を組み込んだ製品のエンドユーザーには、同等以上の規約に同意させる必要がある。
 - Enterprise 契約では学習に利用しないことと IP 補償が付く。
-- API 利用時は UI に **"Powered by Runway"** の表記と runwayml.com へのリンクを求めている（https://docs.dev.runwayml.com/usage/attribution/ 。必須かどうかの最終確認は §6）。
+- API 利用時は UI に **"Powered by Runway"** の表記と runwayml.com へのリンクを求めている（https://docs.dev.runwayml.com/usage/attribution/ 。必須かどうかの最終確認は §6）。本アプリは runwayml.com へのリンク付きで表示する: Runway のプロバイダーカード（カード自体がラジオボタンのためテキストのみ）と選択時の詳細、Runway で生成したジョブの設定欄・動画一覧・プレビュー、Runway の素材（素材カード・プレビュー・差し替え候補・エディター）、設定画面のプロバイダー一覧。
 - 全生成物に不可視透かしと C2PA を付与すると、2 年前の研究ページに記載がある（https://runwayml.com/research/foundations-for-safe-generative-media ）。
 
 ### 4.4 Kling AI API
@@ -562,7 +566,7 @@ GET https://api-singapore.klingai.com/tasks?external_task_ids=<id>    // 公式�
 | 商用利用 | 可。Vertex の preview は原則として本番不可、ただし Veo 3.1 Lite は例外 [B] | 可 [B] | 可とする記載あり（規約本文は未確認）[B][C] |
 | 実在人物・著名人 | `personGeneration` で制御。禁止使用ポリシーあり [B] | 肖像権の処理は利用者責任。`publicFigureThreshold` で著名人判定を調整できる（本アプリは既定の `auto` 固定）[A][B] | ガイドラインで肖像権の尊重を要求 [B] |
 | 透かし・来歴 | SynthID（不可視）、Vertex は C2PA [B] | 不可視透かしと C2PA [B（古い記事）] | 既定は透かしなし、`watermark_url` は任意 [B] |
-| 帰属表示 | 不要とみられる [C] | UI に "Powered by Runway" を表示 [B] | 未確認 [C] |
+| 帰属表示 | 不要とみられる [C] | UI に "Powered by Runway" を表示 [B]（本アプリは表示済み） | 未確認 [C] |
 
 いずれの不可視透かし・メタデータも、本アプリの FFmpeg 再エンコードで**メタデータは失われる可能性が高い**。SynthID のような画素に埋め込む透かしは残る可能性がある [C]。Instagram（Meta）の「AI 情報」ラベルが自動で付くかどうかはこの影響を受けるため、投稿者が手動で AI 生成を表示する運用を推奨する [C]。
 

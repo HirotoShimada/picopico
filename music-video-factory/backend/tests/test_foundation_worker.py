@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -87,3 +88,45 @@ def test_shutdown_recreates_executor(clean_registry: None) -> None:
     assert worker.enqueue("test.one").result(timeout=10) == 1
     worker.shutdown(wait=True)
     assert worker.enqueue("test.one").result(timeout=10) == 1
+
+
+def test_inline_pools_keep_analysis_flowing_while_batches_generate(clean_registry: None) -> None:
+    """run_batch waits on provider APIs for minutes; it must not occupy the analysis/render threads."""
+    release = threading.Event()
+    started: dict[str, float] = {}
+
+    def slow_batch(batch_id: str) -> None:
+        release.wait(5)
+
+    def analyze(project_id: str) -> None:
+        started[project_id] = time.monotonic()
+
+    worker.register_task("run_batch", slow_batch)
+    worker.register_task("analyze", analyze)
+    try:
+        batches = [worker.enqueue("run_batch", f"b{i}") for i in range(2)]
+        begin = time.monotonic()
+        worker.enqueue("analyze", "p1").result(timeout=5)
+        assert started["p1"] - begin < 0.5
+    finally:
+        release.set()
+    for future in batches:
+        future.result(timeout=10)
+
+
+def test_celery_routes_run_batch_to_its_own_queue() -> None:
+    queues = worker.celery_app.amqp.queues
+    assert set(queues) == {worker.DEFAULT_QUEUE, worker.BATCH_QUEUE}  # a worker without -Q consumes both
+    route = worker.celery_app.amqp.router.route
+    assert route({}, worker.CELERY_TASK_NAMES["run_batch"])["queue"].name == worker.BATCH_QUEUE
+    assert route({}, worker.CELERY_TASK_NAMES["render_video"])["queue"].name == worker.DEFAULT_QUEUE
+    assert queues[worker.BATCH_QUEUE].routing_key != queues[worker.DEFAULT_QUEUE].routing_key
+
+
+def test_worker_ready_runs_the_recovery_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import pipeline
+
+    seen: list[float | None] = []
+    monkeypatch.setattr(pipeline, "recover_interrupted_jobs", lambda *, stale_after=None: seen.append(stale_after))
+    worker._recover_after_worker_start(sender=None)
+    assert seen == [pipeline.STALE_TASK_SEC]

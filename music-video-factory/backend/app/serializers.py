@@ -107,8 +107,27 @@ def to_clip_out(clip: Clip, *, used_in_videos: int = 0) -> ClipOut:
     )
 
 
+def prefetch_assets(db: Session, rows: Iterable[Clip | Video]) -> list[Asset]:
+    """Load the assets/thumbnails of ``rows`` in one query.
+
+    ``row.asset`` / ``row.thumbnail_asset`` are many-to-one by primary key, so
+    SQLAlchemy then resolves them from the identity map instead of issuing one
+    query per row (lists of 30+ videos/clips are polled every few seconds).
+    The session's identity map holds objects weakly: keep the returned list
+    alive while serializing.
+    """
+    ids = {asset_id for row in rows for asset_id in (row.asset_id, row.thumbnail_asset_id) if asset_id}
+    return list(db.scalars(select(Asset).where(Asset.id.in_(ids)))) if ids else []
+
+
+def to_video_outs(db: Session, videos: Sequence[Video]) -> list[VideoOut]:
+    assets = prefetch_assets(db, videos)  # noqa: F841 - keeps the prefetched rows in the identity map
+    return [to_video_out(v) for v in videos]
+
+
 def to_clip_outs(db: Session, clips: Sequence[Clip]) -> list[ClipOut]:
     """Serialize clips (of one or more projects) with ``used_in_videos`` filled in."""
+    assets = prefetch_assets(db, clips)  # noqa: F841 - keeps the prefetched rows in the identity map
     usage: Counter[str] = Counter()
     for project_id in {c.project_id for c in clips}:
         usage.update(clip_usage_counts(db, project_id))
@@ -206,9 +225,11 @@ def to_batch_out(db: Session, batch: Batch, *, include_children: bool = False) -
         finished_at=batch.finished_at,
         counts=batch_counts(db, batch.id),
         clip_counts=_clip_counts(db, batch, clip_ids),
+        reopened_from=(batch.plan or {}).get("reopened_from"),
+        previous_error=(batch.plan or {}).get("previous_error"),
     )
     if include_children:
-        out.videos = [to_video_out(v) for v in videos]
+        out.videos = to_video_outs(db, videos)
         clips = list(db.scalars(select(Clip).where(Clip.id.in_(clip_ids)))) if clip_ids else []
         order = {cid: i for i, cid in enumerate(clip_ids)}
         clips.sort(key=lambda c: order.get(c.id, len(order)))
@@ -232,6 +253,7 @@ def to_project_out(db: Session, project: Project) -> ProjectOut:
         id=project.id,
         title=project.title,
         artist_name=project.artist_name,
+        artist_aliases=list(project.artist_aliases or []),
         mood=project.mood,
         purpose=project.purpose,
         notes=project.notes,

@@ -165,7 +165,8 @@ function rgba(hex: string, alpha: number): string {
 export function lyricTextStyle(spec: LyricStyleSpec, scale: number): React.CSSProperties {
   const fontPx = spec.fontSize * GLYPH_EM_RATIO * scale;
   const shadows: string[] = [];
-  if (spec.shadow > 0 && spec.shadowOpacity > 0) {
+  // In box mode (bg_opacity > 0) the renderer draws a black box and the text outline, but no shadow.
+  if (spec.shadow > 0 && spec.shadowOpacity > 0 && spec.bgOpacity <= 0) {
     const offset = spec.shadow * scale;
     shadows.push(
       spec.shadowMode === "soft"
@@ -190,7 +191,7 @@ export function lyricTextStyle(spec: LyricStyleSpec, scale: number): React.CSSPr
   };
 }
 
-/** Background box for the cinematic style (per visual line). */
+/** Background box (cinematic, or any style with `bg_opacity` > 0): always black, like the renderer's LyricBox layer. */
 export function lyricBoxStyle(spec: LyricStyleSpec, scale: number): React.CSSProperties | undefined {
   if (spec.bgOpacity <= 0) return undefined;
   const padding = spec.boxPadding * scale;

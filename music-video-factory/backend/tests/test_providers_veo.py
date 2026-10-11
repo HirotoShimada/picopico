@@ -109,6 +109,19 @@ def test_happy_path_submit_poll_download(provider: VeoProvider, clock: FakeClock
 
 
 @respx.mock
+def test_failed_download_of_a_finished_operation_is_retried_not_resubmitted(
+    provider: VeoProvider, mp4_bytes: bytes, tmp_path: Path
+) -> None:
+    submit = respx.post(SUBMIT_URL).mock(return_value=httpx.Response(200, json={"name": OP}))
+    poll = respx.get(POLL_URL).mock(return_value=_done())
+    file_route = respx.get(FILE_URL).mock(side_effect=[httpx.Response(503), httpx.Response(200, content=mp4_bytes)])
+    result = provider.generate(_req(), str(tmp_path / "clip.mp4"))
+    assert submit.call_count == 1 and poll.call_count == 2 and file_route.call_count == 2
+    assert all(c.request.headers["x-goog-api-key"] == KEY for c in file_route.calls)
+    assert result.cost_usd == pytest.approx(6 * 0.05) and result.external_job_id == OP
+
+
+@respx.mock
 def test_1080p_variant_and_image_to_video(provider: VeoProvider, mp4_bytes: bytes, tmp_path: Path) -> None:
     submit = respx.post(SUBMIT_URL).mock(return_value=httpx.Response(200, json={"name": OP}))
     respx.get(POLL_URL).mock(return_value=_done(STORAGE_URL))

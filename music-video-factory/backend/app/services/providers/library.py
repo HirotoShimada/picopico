@@ -10,6 +10,7 @@ from app.services.providers.base import (
     ClipResult,
     ProgressCallback,
     ProviderModel,
+    SubmitCallback,
     VideoProvider,
     snap_duration,
 )
@@ -68,6 +69,7 @@ class LibraryProvider(VideoProvider):
         timeout: float = 900,
         on_progress: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        on_submitted: SubmitCallback | None = None,  # no remote job: never called
     ) -> ClipResult:
         raise ProviderError(
             "アップロード素材モードでは新しい映像を生成しません。素材タブから動画をアップロードしてください",

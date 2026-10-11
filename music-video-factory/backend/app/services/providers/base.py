@@ -15,7 +15,15 @@ construction with the contract fields keeps working.
 * ``cancel_check()`` is honoured before submitting, between polls and while
   downloading (-> :class:`ProviderCancelled`);
 * transient errors *while polling* are tolerated (a paid job keeps running
-  server-side), up to ``MAX_CONSECUTIVE_POLL_ERRORS`` in a row.
+  server-side), up to ``MAX_CONSECUTIVE_POLL_ERRORS`` in a row;
+* once the job has succeeded it is billed and never submitted again: the
+  download/probe step alone is retried (``OUTPUT_FETCH_ATTEMPTS``, re-reading
+  the job's output via ``_refresh_output`` in between), and an error raised
+  after success carries the job's ``cost_usd`` and is not retryable, so the
+  caller books the spend instead of paying for a new job;
+* ``on_submitted(job_id, resume_token)`` reports a job as soon as it exists,
+  and :meth:`ApiVideoProvider.resume` finishes such a job after a crash
+  (poll → download) instead of submitting the request again.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 from urllib.parse import urljoin, urlsplit
@@ -44,6 +52,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_ASPECT_RATIO",
     "MAX_CONSECUTIVE_POLL_ERRORS",
+    "OUTPUT_FETCH_ATTEMPTS",
     "PRICING_AS_OF",
     "ApiVideoProvider",
     "CancelCheck",
@@ -55,6 +64,7 @@ __all__ = [
     "ProviderCancelled",
     "ProviderModel",
     "ProviderTaskError",
+    "SubmitCallback",
     "SubmittedJob",
     "VideoProvider",
     "classify_http_status",
@@ -71,6 +81,8 @@ DEFAULT_ASPECT_RATIO = "9:16"
 # Date of the price research in docs/VIDEO_PROVIDERS.md that the model tables quote.
 PRICING_AS_OF = "2026-10-11"
 MAX_CONSECUTIVE_POLL_ERRORS = 5
+# Download/probe tries for the video of a finished (billed) job; the job itself is never resubmitted.
+OUTPUT_FETCH_ATTEMPTS = 3
 DEFAULT_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
 _MAX_REDIRECTS = 5
 _DOWNLOAD_CHUNK = 1024 * 1024
@@ -80,6 +92,13 @@ ProgressCallback = Callable[[float, str], None]
 """``on_progress(fraction 0..1, stage)``; stages: submitted, queued, running, downloading, done."""
 CancelCheck = Callable[[], bool]
 """Returns True when the caller wants the generation abandoned."""
+SubmitCallback = Callable[[str, str], None]
+"""``on_submitted(job_id, resume_token)``: called right after a remote job was created.
+
+``job_id`` is the provider's id (``Clip.external_job_id``); ``resume_token`` is
+what :meth:`ApiVideoProvider.resume` needs to pick the job up again after a
+crash (equal to ``job_id`` except for Kling's new API).
+"""
 
 
 # --- contract dataclasses ------------------------------------------------------------------
@@ -158,7 +177,12 @@ class ClipResult:
 
 
 class ProviderTaskError(ProviderError):
-    """A submitted remote job failed, timed out or was cancelled."""
+    """A submitted remote job failed, timed out or was cancelled.
+
+    ``cost_usd`` is set when the job is known to be billed: it finished but its
+    video could not be fetched (or the fetch was cancelled). The caller must
+    book that amount and must not submit the clip again.
+    """
 
     def __init__(
         self,
@@ -167,11 +191,13 @@ class ProviderTaskError(ProviderError):
         retryable: bool = False,
         external_job_id: str | None = None,
         failure_code: str | None = None,
+        cost_usd: float | None = None,
         **kwargs: Any,
     ):
         super().__init__(message, retryable=retryable, **kwargs)
         self.external_job_id = external_job_id
         self.failure_code = failure_code
+        self.cost_usd = cost_usd
 
 
 class ProviderCancelled(ProviderTaskError):
@@ -420,6 +446,12 @@ def download_file(
         tmp_path.unlink(missing_ok=True)
 
 
+def _job_cost(outcome: PollOutcome, model: ProviderModel, duration: float) -> float:
+    """What a succeeded job costs: the provider-reported amount, else the table price."""
+    cost = outcome.cost_usd if outcome.cost_usd is not None else model.cost_for(duration)
+    return round(cost, 4)
+
+
 def _max_download_bytes() -> int:
     try:
         from app.config import get_settings
@@ -586,13 +618,22 @@ class VideoProvider(ABC):
         timeout: float = 900,
         on_progress: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        on_submitted: SubmitCallback | None = None,
     ) -> ClipResult: ...
 
 
 class ApiVideoProvider(VideoProvider):
-    """Template for hosted APIs: subclasses implement submit / poll / cancel."""
+    """Template for hosted APIs: subclasses implement submit / poll / cancel.
+
+    ``generate`` reports every created job through ``on_submitted`` and
+    :meth:`resume` picks such a job up again (poll → download → probe) without
+    submitting a new one, so a crashed worker never pays twice for a clip.
+    ``supports_remote_cancel`` tells the caller whether an abandoned job is
+    stopped remotely (Runway) or may keep running and be billed (Veo, Kling).
+    """
 
     kind: ClassVar[str] = "api"
+    supports_remote_cancel: ClassVar[bool] = False
     api_timeout: ClassVar[httpx.Timeout] = httpx.Timeout(30.0, connect=10.0)
     download_timeout: ClassVar[httpx.Timeout] = httpx.Timeout(120.0, connect=10.0)
     supported_aspects: ClassVar[tuple[str, ...]] = ("9:16", "16:9")
@@ -608,8 +649,27 @@ class ApiVideoProvider(VideoProvider):
     def _cancel_remote(self, client: httpx.Client, job: SubmittedJob) -> None:
         """Best-effort remote cancel; default: the API has no cancel endpoint."""
 
+    def _refresh_output(
+        self, client: httpx.Client, job: SubmittedJob, model: ProviderModel, outcome: PollOutcome
+    ) -> PollOutcome:
+        """The finished job's output again, before another download try (``outcome`` = the last one).
+
+        Default: poll the job again. Runway hands out fresh pre-signed URLs this
+        way (they expire); Veo and Kling return the same URI, which stays valid
+        for days, and a late-arriving URL is picked up too.
+        """
+        return self._poll(client, job, model)
+
     def _download_headers(self, url: str) -> dict[str, str]:
         return {}
+
+    def resume_token(self, job: SubmittedJob) -> str:
+        """What :meth:`resume` needs to find ``job`` again (default: its id)."""
+        return job.id
+
+    def _job_from_token(self, token: str, req: ClipRequest, model: ProviderModel) -> SubmittedJob:
+        """Inverse of :meth:`resume_token` (``req`` is the original request)."""
+        return SubmittedJob(id=safe_path_id(token, provider_name=self.name), raw={"resumed": True})
 
     # -- HTTP -------------------------------------------------------------------------------------
 
@@ -663,49 +723,99 @@ class ApiVideoProvider(VideoProvider):
         timeout: float = 900,
         on_progress: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        on_submitted: SubmitCallback | None = None,
     ) -> ClipResult:
-        model = self.require_model(req.model, has_image=bool(req.image_path))
-        if req.aspect_ratio not in self.supported_aspects:
-            raise ProviderError(
-                f"{self.name} はアスペクト比 {req.aspect_ratio} に対応していません", retryable=False, code="provider_bad_input"
-            )
-        duration = model.snap_duration(req.duration)
+        model, duration = self._prepare(req)
         if _cancelled(cancel_check):
             raise ProviderCancelled()
         deadline = self._clock() + float(timeout)
         with self._client() as client:
             job = self._submit(client, req, model, duration)
             logger.info("%s: submitted job %s (model=%s, %.1fs)", self.id, job.id, model.id, duration)
+            self._notify_submitted(on_submitted, job)
             notify_progress(on_progress, 0.05, "submitted")
-            try:
-                outcome = self._wait(client, job, model, deadline=deadline, timeout=float(timeout),
-                                     on_progress=on_progress, cancel_check=cancel_check)  # fmt: skip
-            except ProviderTaskError as exc:
-                if exc.code in ("provider_cancelled", "provider_timeout"):
-                    self._try_cancel_remote(client, job)
-                raise
-            if not outcome.video_url:
-                raise ProviderTaskError(
-                    f"{self.name}: 生成は完了しましたが動画の URL が返されませんでした",
-                    retryable=True, code="provider_bad_response", external_job_id=job.id,
-                )  # fmt: skip
-            notify_progress(on_progress, 0.9, "downloading")
-            with httpx.Client(timeout=self.download_timeout, transport=self._transport, follow_redirects=False) as dl:
-                size = download_file(
-                    dl, outcome.video_url, out_path, provider_name=self.name,
-                    headers=self._download_headers(outcome.video_url), max_bytes=_max_download_bytes(),
-                    cancel_check=cancel_check, external_job_id=job.id,
-                )  # fmt: skip
-        media = self._probe_output(out_path, job.id)
+            return self._complete(
+                client, job, model, out_path, duration=duration, deadline=deadline, timeout=float(timeout),
+                on_progress=on_progress, cancel_check=cancel_check,
+            )  # fmt: skip
+
+    def resume(
+        self,
+        job_id: str,
+        req: ClipRequest,
+        out_path: str,
+        *,
+        timeout: float = 900,
+        cancel_check: CancelCheck | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> ClipResult:
+        """Finish a job submitted earlier (``job_id`` = its ``resume_token``) without submitting again.
+
+        Polls the existing job and fetches its output; errors are the same as
+        :meth:`generate` (a job the provider no longer knows fails with a
+        non-retryable :class:`ProviderTaskError`).
+        """
+        model, duration = self._prepare(req)
+        if _cancelled(cancel_check):
+            raise ProviderCancelled(external_job_id=str(job_id))
+        job = self._job_from_token(str(job_id), req, model)
+        deadline = self._clock() + float(timeout)
+        logger.info("%s: resuming job %s (model=%s)", self.id, job.id, model.id)
+        with self._client() as client:
+            return self._complete(
+                client, job, model, out_path, duration=duration, deadline=deadline, timeout=float(timeout),
+                on_progress=on_progress, cancel_check=cancel_check,
+            )  # fmt: skip
+
+    def _prepare(self, req: ClipRequest) -> tuple[ProviderModel, float]:
+        model = self.require_model(req.model, has_image=bool(req.image_path))
+        if req.aspect_ratio not in self.supported_aspects:
+            raise ProviderError(
+                f"{self.name} はアスペクト比 {req.aspect_ratio} に対応していません", retryable=False, code="provider_bad_input"
+            )
+        return model, model.snap_duration(req.duration)
+
+    def _notify_submitted(self, on_submitted: SubmitCallback | None, job: SubmittedJob) -> None:
+        if on_submitted is None:
+            return
+        try:
+            on_submitted(job.id, self.resume_token(job))
+        except Exception:  # noqa: BLE001 - persisting the id is best effort; the job runs anyway
+            logger.warning("%s: on_submitted callback failed for job %s", self.id, job.id, exc_info=True)
+
+    def _complete(
+        self,
+        client: httpx.Client,
+        job: SubmittedJob,
+        model: ProviderModel,
+        out_path: str,
+        *,
+        duration: float,
+        deadline: float,
+        timeout: float,
+        on_progress: ProgressCallback | None,
+        cancel_check: CancelCheck | None,
+    ) -> ClipResult:
+        """Wait for ``job``, then fetch its video (shared by :meth:`generate` and :meth:`resume`)."""
+        try:
+            outcome = self._wait(client, job, model, deadline=deadline, timeout=timeout,
+                                 on_progress=on_progress, cancel_check=cancel_check)  # fmt: skip
+        except ProviderTaskError as exc:
+            if exc.code in ("provider_cancelled", "provider_timeout"):
+                self._try_cancel_remote(client, job)
+            raise
+        notify_progress(on_progress, 0.9, "downloading")
+        outcome, size, media = self._fetch_output(
+            client, job, model, outcome, out_path, duration=duration, deadline=deadline, cancel_check=cancel_check
+        )
         notify_progress(on_progress, 1.0, "done")
-        cost = outcome.cost_usd if outcome.cost_usd is not None else model.cost_for(duration)
         return ClipResult(
             path=str(out_path),
             duration=float(media.get("duration") or duration),
             width=int(media.get("width") or 0),
             height=int(media.get("height") or 0),
             model=model.id,
-            cost_usd=round(cost, 4),
+            cost_usd=_job_cost(outcome, model, duration),
             external_job_id=job.id,
             raw={
                 "provider": self.id,
@@ -766,6 +876,78 @@ class ApiVideoProvider(VideoProvider):
                 )  # fmt: skip
             self._sleep(min(self.poll.interval(attempt, self._rng), remaining))
             attempt += 1
+
+    def _fetch_output(
+        self,
+        client: httpx.Client,
+        job: SubmittedJob,
+        model: ProviderModel,
+        outcome: PollOutcome,
+        out_path: str,
+        *,
+        duration: float,
+        deadline: float,
+        cancel_check: CancelCheck | None,
+    ) -> tuple[PollOutcome, int, dict[str, Any]]:
+        """Download and probe the video of a succeeded job: ``(outcome used, bytes, probe info)``.
+
+        The job is finished and billed, so only this step is retried: up to
+        :data:`OUTPUT_FETCH_ATTEMPTS` tries for retryable failures while the
+        deadline allows, re-reading the output (:meth:`_refresh_output`) in
+        between. Every error raised from here carries the job's ``cost_usd``;
+        a final failure is not retryable, so the pipeline books the job instead
+        of submitting (and paying for) a new one.
+        """
+        cost = _job_cost(outcome, model, duration)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if not outcome.video_url:
+                    raise ProviderTaskError(
+                        f"{self.name}: 生成は完了しましたが動画の URL が返されませんでした",
+                        retryable=True, code="provider_bad_response", external_job_id=job.id,
+                    )  # fmt: skip
+                with httpx.Client(
+                    timeout=self.download_timeout, transport=self._transport, follow_redirects=False
+                ) as dl:
+                    size = download_file(
+                        dl, outcome.video_url, out_path, provider_name=self.name,
+                        headers=self._download_headers(outcome.video_url), max_bytes=_max_download_bytes(),
+                        cancel_check=cancel_check, external_job_id=job.id,
+                    )  # fmt: skip
+                return outcome, size, self._probe_output(out_path, job.id)
+            except ProviderCancelled as exc:
+                exc.cost_usd = cost
+                raise
+            except ProviderError as exc:
+                error = exc
+            except OSError as exc:  # the local file could not be written (disk full, permissions)
+                raise ProviderTaskError(
+                    f"{self.name}: 生成した動画を保存できませんでした（{type(exc).__name__}）。生成は完了・課金済みです",
+                    retryable=False, code="provider_bad_output", external_job_id=job.id, cost_usd=cost,
+                ) from exc  # fmt: skip
+            remaining = deadline - self._clock()
+            if not error.retryable or attempt >= OUTPUT_FETCH_ATTEMPTS or remaining <= 0:
+                raise ProviderTaskError(
+                    f"{error.message}。生成は完了・課金済みのため、新しいジョブは送信しません（取得を {attempt} 回試行）",
+                    retryable=False, code=error.code, external_job_id=job.id,
+                    failure_code=getattr(error, "failure_code", None), cost_usd=cost,
+                ) from error  # fmt: skip
+            logger.warning("%s: fetching the output of job %s failed (try %d): %s", self.id, job.id, attempt, error)
+            self._sleep(min(self.poll.interval(attempt - 1, self._rng), remaining))
+            if _cancelled(cancel_check):
+                raise ProviderCancelled(external_job_id=job.id, cost_usd=cost)
+            try:
+                refreshed = self._refresh_output(client, job, model, outcome)
+            except ProviderError as exc:  # keep the previous output and try it again
+                logger.warning("%s: re-reading finished job %s failed: %s", self.id, job.id, exc)
+            else:
+                if refreshed.state == "succeeded" and refreshed.video_url:
+                    if refreshed.cost_usd is None:
+                        refreshed = replace(refreshed, cost_usd=outcome.cost_usd)
+                    outcome = refreshed
+                    cost = _job_cost(outcome, model, duration)
 
     def _try_cancel_remote(self, client: httpx.Client, job: SubmittedJob) -> None:
         try:

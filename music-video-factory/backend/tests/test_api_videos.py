@@ -174,3 +174,102 @@ def test_video_endpoints_are_owner_scoped(make_client: Any, finished_batch: dict
     assert other.post(f"/api/videos/{video_id}/retry", headers=headers).status_code == 404
     assert other.put(f"/api/videos/{video_id}/edit", json={}, headers=headers).status_code == 404
     assert other.post("/api/videos/zip", json={"video_ids": [video_id]}, headers=headers).status_code == 404
+
+
+def test_rerender_routes_require_confirmed_rights(
+    client: TestClient, ready_project: Project, finished_batch: dict, db: Session, sync_tasks: list, fake_clips: Any
+) -> None:
+    rights = client.put(
+        f"/api/projects/{ready_project.id}/rights",
+        json={"items": {"lyrics_rights": False, "no_real_person_likeness": False}},
+    )
+    assert rights.status_code == 200 and rights.json()["rights_confirmed_at"] is None
+    first, second = (v["id"] for v in finished_batch["videos"])
+    db.get(Video, second).status = "failed"
+    db.commit()
+    calls, tasks = len(fake_clips.calls), len(sync_tasks)
+    for response in (
+        client.post(f"/api/videos/{first}/regenerate", json={"new_clips": True}),
+        client.post(f"/api/videos/{first}/regenerate", json={"new_clips": False}),
+        client.put(f"/api/videos/{first}/edit", json={"lyric_style": "karaoke"}),
+        client.post(f"/api/videos/{second}/retry"),
+    ):
+        assert response.status_code == 422 and response.json()["code"] == "rights_unconfirmed"
+    assert len(fake_clips.calls) == calls and len(sync_tasks) == tasks  # nothing generated or queued
+    db.expire_all()
+    assert db.get(Video, first).render_version == 1 and db.get(Video, second).status == "failed"
+
+
+def test_cancelling_a_rerender_keeps_the_finished_video(
+    client: TestClient, finished_batch: dict, fake_render: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import worker
+
+    video_id = finished_batch["videos"][0]["id"]
+    before = client.get(f"/api/videos/{video_id}").json()
+    monkeypatch.setattr(worker, "enqueue", lambda *args: None)  # the re-render has not started yet
+    assert client.post(f"/api/videos/{video_id}/regenerate", json={"new_clips": True}).json()["status"] in (
+        "queued",
+        "waiting_clips",
+    )
+    reopened = client.get(f"/api/batches/{finished_batch['id']}").json()
+    assert reopened["status"] == "rendering" and reopened["reopened_from"] == "completed"
+    cancelled = client.post(f"/api/batches/{finished_batch['id']}/cancel").json()
+    assert cancelled["reopened_from"] is None
+    assert cancelled["status"] == "completed"  # back to where it was: every video is finished
+    assert cancelled["clip_counts"]["generating"] == 0
+    body = client.get(f"/api/videos/{video_id}").json()
+    assert body["status"] == "done" and body["url"] and body["render_version"] == before["render_version"]
+    assert body["plan"]["shots"] == before["plan"]["shots"] and "前回の動画" in body["error"]
+    assert client.get(f"/api/videos/{video_id}/download", follow_redirects=False).status_code == 302
+
+
+def test_queue_outage_on_retry_does_not_leave_the_batch_rendering(
+    client: TestClient, finished_batch: dict, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import worker
+
+    video_id = finished_batch["videos"][1]["id"]
+    db.get(Video, video_id).status = "failed"
+    db.commit()
+
+    def down(*args: Any) -> None:
+        raise worker.QueueUnavailable("ジョブキュー（Redis）に接続できません。")
+
+    monkeypatch.setattr(worker, "enqueue", down)
+    response = client.post(f"/api/videos/{video_id}/retry")
+    assert response.status_code == 503 and response.json()["code"] == "queue_unavailable"
+    batch = client.get(f"/api/batches/{finished_batch['id']}").json()
+    assert batch["status"] == "partial" and batch["counts"]["failed"] == 1
+
+
+def test_budget_stopped_batch_resumes_after_raising_its_budget(
+    client: TestClient, ready_project: Project, sync_tasks: list, fake_clips: Any, fake_render: Any, priced_mock: Any,
+    db: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    from app import pipeline, worker
+    from app.models import Batch
+
+    priced_mock(0.10)  # $0.50 per 5 s clip
+    run_now = worker.enqueue
+    monkeypatch.setattr(worker, "enqueue", lambda *args: None)
+    settings = {"provider": "mock", "count": 1, "duration_sec": 5, "max_new_clips": 2, "budget_limit_usd": 100}
+    batch_id = client.post(f"/api/projects/{ready_project.id}/batches", json=settings).json()["id"]
+    batch = db.get(Batch, batch_id)
+    batch.estimate = {**batch.estimate, "budget_limit_usd": 0.6}  # the run no longer fits (e.g. prices changed)
+    db.commit()
+    monkeypatch.setattr(worker, "enqueue", run_now)
+    pipeline.run_batch(batch_id)
+    stopped = client.get(f"/api/batches/{batch_id}").json()
+    assert stopped["status"] == "budget_exceeded"
+    video_id = stopped["videos"][0]["id"]
+    refused = client.post(f"/api/videos/{video_id}/retry")
+    assert refused.status_code == 422 and refused.json()["code"] == "budget_exceeded"
+
+    raised = client.patch(f"/api/batches/{batch_id}", json={"budget_limit_usd": 5})
+    assert raised.status_code == 200 and raised.json()["estimate"]["budget_limit_usd"] == 5
+    assert client.patch(f"/api/batches/{batch_id}", json={"budget_limit_usd": -1}).status_code == 422
+    assert client.post(f"/api/videos/{video_id}/retry").status_code == 200
+    done = client.get(f"/api/batches/{batch_id}").json()
+    assert done["status"] == "completed" and done["videos"][0]["status"] == "done"
+    assert all(c["status"] == "ready" for c in done["clips"])

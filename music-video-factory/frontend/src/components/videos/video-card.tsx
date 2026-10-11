@@ -113,7 +113,13 @@ export function VideoCard({ video, selected, selecting, onSelectedChange, onOpen
             #{video.index + 1}
             {video.plan?.start !== undefined ? ` ・ ${formatTime(video.plan.start)}〜` : ""}
             {video.render_version > 1 ? ` ・ v${video.render_version}` : ""}
+            {video.plan?.substitutions ? ` ・ 代替素材 ${video.plan.substitutions}` : ""}
           </span>
+          {video.status === "done" && video.error ? (
+            <span className="line-clamp-2 text-2xs leading-4 text-warning-foreground" title={video.error}>
+              {video.error}
+            </span>
+          ) : null}
         </div>
         {video.status === "done" ? <QualityBadge report={video.quality} /> : null}
       </div>

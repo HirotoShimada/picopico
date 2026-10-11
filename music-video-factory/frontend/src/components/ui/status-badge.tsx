@@ -11,7 +11,7 @@ type StatusBadgeProps = (
   | { kind: "video"; status: VideoStatus }
   | { kind: "clip"; status: ClipStatus }
   | { kind: "analysis"; status: AnalysisStatus }
-) & { className?: string; showIcon?: boolean };
+) & { className?: string; showIcon?: boolean; /** Overrides the status label (e.g. "一部キャンセル"). */ label?: string };
 
 const TONE_ICONS: Record<StatusTone, React.ComponentType<{ className?: string }>> = {
   neutral: CircleDashed,
@@ -22,13 +22,13 @@ const TONE_ICONS: Record<StatusTone, React.ComponentType<{ className?: string }>
 };
 
 /** Job / video / clip / analysis status as a labelled badge (icon + Japanese label). */
-function StatusBadge({ kind, status, className, showIcon = true }: StatusBadgeProps) {
+function StatusBadge({ kind, status, className, showIcon = true, label }: StatusBadgeProps) {
   const meta = statusMeta(kind as StatusKind, status);
   const Icon = status === "cancelled" ? Ban : TONE_ICONS[meta.tone];
   return (
     <Badge tone={meta.tone} className={className} data-status={status}>
       {showIcon ? <Icon className={meta.tone === "progress" ? "animate-spin" : undefined} aria-hidden /> : null}
-      {meta.label}
+      {label ?? meta.label}
     </Badge>
   );
 }

@@ -74,3 +74,28 @@ def test_analysis_endpoints_are_owner_scoped(make_client: Any, ready_project: Pr
         assert response.status_code == 404
     response = other.put(f"/api/projects/{ready_project.id}/segment", json={"start": 0, "end": 10}, headers=headers)
     assert response.status_code == 404
+
+
+def test_world_estimate_combines_audio_lyrics_and_user_input(
+    client: TestClient, ready_project: Project, db: Session
+) -> None:
+    url = f"/api/projects/{ready_project.id}/world-estimate"
+    body = client.get(url).json()
+    assert body["analysis_used"] is True
+    assert set(body) >= {"emotions", "themes", "mood_en", "recommended_presets", "sources", "rationale_ja"}
+    assert body["recommended_presets"] and "おすすめの世界観" in body["rationale_ja"]
+
+    client.patch(f"/api/projects/{ready_project.id}", json={"mood": "切ない夜の雨", "purpose": "ライブツアーの告知"})
+    after = client.get(url).json()
+    assert "melancholic" in after["sources"]["user"] and "入力" in after["rationale_ja"]
+
+    pid = client.post("/api/projects", json={"title": "曲", "artist_name": "A"}).json()["id"]
+    empty = client.get(f"/api/projects/{pid}/world-estimate").json()
+    assert empty["analysis_used"] is False and empty["recommended_presets"] == ["cinematic"]
+
+
+def test_world_estimate_is_owner_scoped(make_client: Any, ready_project: Project) -> None:
+    other = make_client(AUTH_MODE="token", API_TOKENS="bob:bob-token-0123456789abcdef")
+    response = other.get(f"/api/projects/{ready_project.id}/world-estimate",
+                         headers={"Authorization": "Bearer bob-token-0123456789abcdef"})  # fmt: skip
+    assert response.status_code == 404

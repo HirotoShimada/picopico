@@ -5,7 +5,11 @@
 * ``GET /v1/tasks/{id}``: ``PENDING | THROTTLED | RUNNING | SUCCEEDED | FAILED |
   CANCELLED``; ``SUCCEEDED`` carries ``output[]`` URLs (expire in 24-48 h) and
   ``cost.credits`` (1 credit = $0.01), which replaces the price-table cost.
+  When downloading the output fails, the task is read again for fresh URLs
+  (``ApiVideoProvider._refresh_output``); a succeeded task is never resubmitted.
 * ``DELETE /v1/tasks/{id}`` cancels a running task (used on cancel/timeout).
+* ``FAILED`` / ``CANCELLED`` tasks carry their reported ``cost.credits`` as
+  ``ProviderTaskError.cost_usd`` (the pipeline books it as known spend).
 
 Every request sends ``Authorization: Bearer`` and ``X-Runway-Version``. Runway
 asks clients not to poll a task more often than every 5 s.
@@ -98,6 +102,7 @@ class RunwayProvider(ApiVideoProvider):
         "API 利用時は UI に「Powered by Runway」の表示が求められています。"
     )
     poll_config: ClassVar[PollConfig] = PollConfig(initial=6.0, maximum=30.0, factor=1.4, jitter=0.2, minimum=5.0)
+    supports_remote_cancel: ClassVar[bool] = True  # DELETE /v1/tasks/{id}
 
     def __init__(self, *, api_base: str | None = None, **kwargs: Any):
         super().__init__(**kwargs)
@@ -197,9 +202,10 @@ class RunwayProvider(ApiVideoProvider):
                 code="provider_content_filtered" if str(failure_code or "").upper().startswith("SAFETY") else "provider_failed",
                 external_job_id=job.id,
                 failure_code=failure_code,
+                cost_usd=cost_usd,  # what Runway reports for the task (often 0); None when absent
             )
         if status == "CANCELLED":
-            raise ProviderCancelled(f"{self.name}: タスクがキャンセルされました", external_job_id=job.id)
+            raise ProviderCancelled(f"{self.name}: タスクがキャンセルされました", external_job_id=job.id, cost_usd=cost_usd)
         raise ProviderError(f"{self.name}: 想定外のタスク状態です（{status or '空'}）", retryable=True,
                             code="provider_bad_response")  # fmt: skip
 

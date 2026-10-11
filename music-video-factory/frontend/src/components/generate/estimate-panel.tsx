@@ -8,7 +8,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { errorMessage } from "@/lib/api";
@@ -22,9 +21,21 @@ import type { EstimateState } from "./use-estimate";
 /** Variety below this is flagged by the planner (§6.4). */
 const VARIETY_WARNING_THRESHOLD = 0.35;
 
-function Row({ label, value, hint, strong = false }: { label: React.ReactNode; value: React.ReactNode; hint?: React.ReactNode; strong?: boolean }) {
+function Row({
+  label,
+  value,
+  hint,
+  strong = false,
+  className,
+}: {
+  label: React.ReactNode;
+  value: React.ReactNode;
+  hint?: React.ReactNode;
+  strong?: boolean;
+  className?: string;
+}) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-1">
+    <div className={cn("flex items-baseline justify-between gap-3 py-1", className)}>
       <dt className={cn("text-xs", strong ? "font-medium text-foreground" : "text-muted-foreground")}>
         {label}
         {hint ? <span className="ml-1 text-2xs text-subtle-foreground">{hint}</span> : null}
@@ -154,12 +165,15 @@ function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; s
           </dt>
           <dd className="text-right font-mono text-xs text-foreground tabular">{formatPricePerSecond(estimate.price_per_second_usd)}</dd>
         </div>
-        <Separator className="my-1.5" />
-        <Row label="動画生成" value={formatUsd(estimate.video_generation_usd)} />
+        {/* Separators are row borders: a <dl> may only contain dt/dd groups (axe definition-list). */}
+        <Row label="動画生成" value={formatUsd(estimate.video_generation_usd)} className="mt-1.5 border-t border-border pt-2.5" />
         <Row label="LLM（絵コンテ）" value={formatUsd(estimate.llm_usd)} />
         <Row label="合計" value={formatUsd(estimate.total_usd)} strong />
-        <Separator className="my-1.5" />
-        <Row label="全ショットを新規生成した場合" value={formatUsd(estimate.naive_total_usd)} />
+        <Row
+          label="全ショットを新規生成した場合"
+          value={formatUsd(estimate.naive_total_usd)}
+          className="mt-1.5 border-t border-border pt-2.5"
+        />
         <Row
           label="素材の使い回しによる節約"
           value={

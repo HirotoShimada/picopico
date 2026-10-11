@@ -25,7 +25,7 @@ import {
   SAFE_TOP_PX,
   type LyricStyleSpec,
 } from "./lyric-styles";
-import { activeLineIndex, effectiveEnd, karaokeSpans } from "./timing";
+import { activeLineGroup, karaokeSpans } from "./timing";
 
 const POSITION_OPTIONS: { value: "default" | TextPosition; label: string }[] = [
   { value: "default", label: "既定" },
@@ -95,9 +95,11 @@ function PreviewFrame({ lines, duration, styleId, position, showSafeArea, backgr
 
   const scale = width / 1080;
   const spec = LYRIC_STYLE_SPECS[styleId];
-  const index = activeLineIndex(lines, time, duration);
-  const line = index >= 0 ? lines[index] : null;
-  const end = index >= 0 ? effectiveEnd(lines, index, duration) : null;
+  // Lines starting together (bilingual / duet LRC) are stacked as one block, as in the rendered video.
+  const group = activeLineGroup(lines, time, duration);
+  const line = group.indexes.length > 0 ? lines[group.indexes[0]] : null;
+  const others = group.indexes.slice(1).map((i) => lines[i]);
+  const end = group.end;
   const fade = line && line.start !== null && end !== null ? lyricFade(spec, time, line.start, end) : { opacity: 1, rise: 0 };
   const box = lyricBoxStyle(spec, scale);
   const pct = (px: number) => `${(px / CANVAS_HEIGHT) * 100}%`;
@@ -107,7 +109,7 @@ function PreviewFrame({ lines, duration, styleId, position, showSafeArea, backgr
       ref={frameRef}
       className="relative aspect-[9/16] w-full overflow-hidden rounded-md border border-border bg-black"
       role="img"
-      aria-label={line ? `プレビュー: ${line.text}` : "プレビュー（この位置に歌詞はありません）"}
+      aria-label={line ? `プレビュー: ${[line, ...others].map((l) => l.text).join(" / ")}` : "プレビュー（この位置に歌詞はありません）"}
     >
       {backgroundUrl ? (
         // eslint-disable-next-line @next/next/no-img-element -- signed, short-lived backend URL
@@ -139,6 +141,13 @@ function PreviewFrame({ lines, duration, styleId, position, showSafeArea, backgr
             <span style={box}>
               {styleId === "karaoke" && end !== null ? <KaraokeText line={line} end={end} time={time} spec={spec} /> : line.text}
             </span>
+            {/* Karaoke sweeps only the first line of a group; the others stay in the not-yet-sung colour. */}
+            {others.map((other) => (
+              <React.Fragment key={other.id}>
+                <br />
+                <span style={box}>{other.text}</span>
+              </React.Fragment>
+            ))}
           </p>
         </div>
       ) : null}

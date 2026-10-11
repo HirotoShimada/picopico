@@ -181,6 +181,28 @@ export async function videoDuration(page: Page, selector: string, timeout = 60_0
   return handle.evaluate((element: HTMLVideoElement) => element.duration);
 }
 
+/**
+ * Rewrites the JSON body of the backend's `GET {apiPath}` before the page sees it. Only for
+ * state this environment cannot produce for real (no Runway API key: a configured Runway
+ * provider, a batch generated with it); the rest of the response is the real one.
+ */
+export async function patchApiJson<T>(page: Page, apiPath: string, patch: (body: T) => void): Promise<void> {
+  await page.route(
+    (url) => url.pathname === apiPath,
+    async (route: Route) => {
+      if (route.request().method() !== "GET") return route.fallback();
+      const response = await route.fetch();
+      const body = (await response.json()) as T;
+      patch(body);
+      // The body changes size and is no longer encoded: drop the original framing headers.
+      const headers = Object.fromEntries(
+        Object.entries(response.headers()).filter(([name]) => !["content-length", "content-encoding"].includes(name.toLowerCase())),
+      );
+      await route.fulfill({ status: response.status(), headers, json: body });
+    },
+  );
+}
+
 // --- direct API helpers (used to prepare the library test project) -------------------------------
 
 export async function apiJson<T>(request: APIRequestContext, method: string, url: string, data?: unknown): Promise<T> {

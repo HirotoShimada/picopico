@@ -40,6 +40,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Cinematic",
     description_ja: "映画のようなライティングと浅い被写界深度。ドラマチックで洗練された映像。",
     palette: ["#1f3b4d", "#d98c4a", "#0d0d0f"],
+    lyric_styles: ["cinematic", "simple", "fade"],
   },
   {
     id: "emotional",
@@ -47,6 +48,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Emotional",
     description_ja: "やわらかな逆光と感情に寄り添うクローズアップ。切なさや温かさを丁寧に描く。",
     palette: ["#f2c6a0", "#8c5e58", "#2b2633"],
+    lyric_styles: ["fade", "simple", "minimal"],
   },
   {
     id: "urban_night",
@@ -54,6 +56,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Urban night",
     description_ja: "ネオンと街灯が映える夜の街。濡れた路面の反射、ビルの谷間、走る車の光跡。",
     palette: ["#0b1d3a", "#e23e8a", "#29c5d6"],
+    lyric_styles: ["simple", "karaoke", "cinematic"],
   },
   {
     id: "nostalgic",
@@ -61,6 +64,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Nostalgic",
     description_ja: "色褪せたフィルム調と粒子感。夕暮れの商店街や海辺など、懐かしい情景。",
     palette: ["#c9a46c", "#7a6a53", "#e8dcc4"],
+    lyric_styles: ["minimal", "fade", "cinematic"],
   },
   {
     id: "nature",
@@ -68,6 +72,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Nature",
     description_ja: "森・海・空など雄大な自然。朝の光や風の動きを活かした清らかな映像。",
     palette: ["#2f5d3a", "#9cc5a1", "#e3d9b5"],
+    lyric_styles: ["minimal", "simple", "fade"],
   },
   {
     id: "dark",
@@ -75,6 +80,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Dark",
     description_ja: "低照度で陰影の強いコントラスト。ミステリアスで緊張感のある世界観。",
     palette: ["#0a0a0c", "#3d1f2b", "#8a8f99"],
+    lyric_styles: ["cinematic", "minimal", "fade"],
   },
   {
     id: "dreamy",
@@ -82,6 +88,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Dreamy",
     description_ja: "パステル調の色彩と柔らかなボケ。幻想的で浮遊感のある映像。",
     palette: ["#f5c6de", "#b8c7f2", "#fff1d6"],
+    lyric_styles: ["fade", "minimal", "simple"],
   },
   {
     id: "documentary",
@@ -89,6 +96,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Documentary",
     description_ja: "手持ちカメラ風の自然な質感。日常のリアルな瞬間を切り取る。",
     palette: ["#6b6f73", "#b59a7a", "#2e3236"],
+    lyric_styles: ["simple", "minimal", "cinematic"],
   },
   {
     id: "custom",
@@ -96,6 +104,7 @@ export const WORLD_PRESETS_FALLBACK: readonly WorldPresetInfo[] = [
     name_en: "Custom",
     description_ja: "世界観を自由に記述します（日本語可）。場所・時間帯・色・質感などを具体的に。",
     palette: ["#3f3f46", "#71717a", "#a1a1aa"],
+    lyric_styles: ["simple", "cinematic", "fade"],
   },
 ];
 

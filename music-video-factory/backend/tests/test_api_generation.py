@@ -228,3 +228,62 @@ def test_batch_endpoints_are_owner_scoped(make_client: Any, ready_project: Proje
         if method == "post":
             kwargs["json"] = {}
         assert getattr(other, method)(url, **kwargs).status_code == 404, url
+
+
+def test_unknown_color_grade_is_rejected_like_the_editor_does(
+    client: TestClient, ready_project: Project, enqueued: list
+) -> None:
+    for path in ("estimate", "batches"):
+        response = client.post(f"/api/projects/{ready_project.id}/{path}", json={**SETTINGS, "color_grade": "nope"})
+        assert response.status_code == 422 and response.json()["code"] == "color_grade_unknown"
+    ok = client.post(f"/api/projects/{ready_project.id}/estimate", json={**SETTINGS, "color_grade": "teal_orange"})
+    assert ok.status_code == 200
+    assert enqueued == []
+
+
+def test_polled_batch_and_list_endpoints_use_a_bounded_number_of_queries(
+    client: TestClient, ready_project: Project, db: Session
+) -> None:
+    """A 30-video batch is polled every 2 s: assets must not be loaded one query per row."""
+    from sqlalchemy import event
+
+    from app.db import get_engine
+    from app.models import Asset, Batch, Clip, Video, new_id
+
+    def asset(kind: str) -> Asset:
+        return Asset(id=new_id(), project_id=ready_project.id, owner_id=ready_project.owner_id, kind=kind,
+                     filename=f"{kind}.bin", storage_key=f"projects/{ready_project.id}/{kind}/{new_id()}.bin")  # fmt: skip
+
+    clips = []
+    for _ in range(10):
+        a, t = asset("clip"), asset("thumbnail")
+        clips.append(Clip(project_id=ready_project.id, source="mock", provider="mock", model="mock-v1",
+                          status="ready", asset=a, thumbnail_asset=t, duration=5.0))  # fmt: skip
+    batch = Batch(project_id=ready_project.id, status="completed", settings={"provider": "mock"}, plan={})
+    db.add_all([*clips, batch])
+    db.flush()
+    batch.plan = {"clip_specs": [{"key": f"c{i}", "clip_id": c.id} for i, c in enumerate(clips)]}
+    for index in range(30):
+        shots = [{"clip_id": clips[(index + k) % 10].id, "duration": 1.0} for k in range(3)]
+        db.add(Video(project_id=ready_project.id, batch_id=batch.id, index=index, status="done",
+                     asset=asset("render"), thumbnail_asset=asset("thumbnail"), plan={"shots": shots}))  # fmt: skip
+    db.commit()
+
+    statements: list[str] = []
+
+    def count(*args: Any) -> None:
+        statements.append(str(args[2]))
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        for path in (f"/api/batches/{batch.id}", f"/api/projects/{ready_project.id}/clips",
+                     f"/api/projects/{ready_project.id}/videos", "/api/dashboard"):  # fmt: skip
+            statements.clear()
+            response = client.get(path)
+            assert response.status_code == 200, response.text
+            assert len(statements) < 20, (path, len(statements))
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    body = client.get(f"/api/batches/{batch.id}").json()
+    assert len(body["videos"]) == 30 and all(v["url"] for v in body["videos"]) and len(body["clips"]) == 10

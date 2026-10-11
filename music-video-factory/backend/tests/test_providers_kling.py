@@ -17,7 +17,11 @@ import pytest
 import respx
 
 from app.services.errors import ProviderError, ProviderNotConfigured
-from app.services.providers.base import ClipRequest, ProviderCancelled, ProviderTaskError
+from app.services.providers.base import (
+    ClipRequest,
+    ProviderCancelled,
+    ProviderTaskError,
+)
 from app.services.providers.kling import KlingProvider, kling_code_retryable, make_jwt
 
 BASE = "https://api-singapore.klingai.com"
@@ -266,3 +270,75 @@ def test_models_and_durations() -> None:
     assert provider.clip_duration_for("kling-v2-5-turbo", 6) == 10
     assert {m.id: m.price_per_second_usd for m in provider.models()} == {"kling-3.0": 0.112, "kling-v2-5-turbo": 0.042}
     assert all(not m.verified for m in provider.models())
+
+
+@respx.mock
+@pytest.mark.parametrize("api", ["new", "legacy"])
+def test_resume_token_round_trip_polls_the_same_task(api: str, set_env: Callable[..., Any], clock: FakeClock,
+                                                     mp4_bytes: bytes, tmp_path: Path) -> None:  # fmt: skip
+    if api == "new":
+        set_env(KLING_API_KEY=API_KEY, KLING_ACCESS_KEY="", KLING_SECRET_KEY="", KLING_API_BASE=BASE)
+        create = respx.post(f"{BASE}/text-to-video/kling-3.0").mock(side_effect=lambda request: httpx.Response(200, json={
+            "code": 0, "data": {"id": "task-9", "status": "submitted",
+                                "external_id": json.loads(request.content)["options"]["external_task_id"]}}))  # fmt: skip
+        poll = respx.get(f"{BASE}/tasks").mock(side_effect=lambda request: _tasks(
+            "succeeded", parse_qs(urlsplit(str(request.url)).query)["external_task_ids"][0],
+            outputs=[{"type": "video", "url": OUTPUT_URL}]))  # fmt: skip
+        req = _req()
+    else:
+        set_env(KLING_API_KEY="", KLING_ACCESS_KEY=AK, KLING_SECRET_KEY=SK, KLING_API_BASE=BASE)
+        create = respx.post(f"{BASE}/v1/videos/text2video").mock(
+            return_value=httpx.Response(200, json={"code": 0, "data": {"task_id": "legacy-1"}})
+        )
+        poll = respx.get(f"{BASE}/v1/videos/text2video/legacy-1").mock(return_value=httpx.Response(200, json={
+            "code": 0, "data": {"task_status": "succeed", "task_result": {"videos": [{"url": OUTPUT_URL}]}}}))  # fmt: skip
+        req = _req(model="kling-v2-5-turbo")
+    respx.get(OUTPUT_URL).mock(return_value=httpx.Response(200, content=mp4_bytes))
+    provider = KlingProvider(sleep=clock.sleep, clock=clock)
+    reported: list[tuple[str, str]] = []
+    first = provider.generate(req, str(tmp_path / "a.mp4"), on_submitted=lambda job, token: reported.append((job, token)))
+    ((job_id, token),) = reported
+    assert job_id == first.external_job_id and token.startswith(f"{api}:")
+    polls = poll.call_count
+    resumed = provider.resume(token, req, str(tmp_path / "b.mp4"), timeout=60)
+    assert create.call_count == 1 and poll.call_count == polls + 1
+    assert resumed.external_job_id == first.external_job_id
+    with pytest.raises(ProviderError):  # a token of the other API is rejected, never guessed
+        provider.resume("new:x:y" if api == "legacy" else "legacy:x", req, str(tmp_path / "c.mp4"))
+
+
+@respx.mock
+def test_task_missing_from_lookup_fails_without_waiting_for_the_timeout(
+    new_api: KlingProvider, clock: FakeClock, tmp_path: Path
+) -> None:
+    from app.services.providers.kling import MAX_LOOKUP_MISSES
+
+    respx.post(f"{BASE}/text-to-video/kling-3.0").mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"id": "task-9", "status": "submitted"}})
+    )
+    lookup = respx.get(f"{BASE}/tasks").mock(return_value=httpx.Response(200, json={"code": 0, "data": []}))
+    with pytest.raises(ProviderTaskError) as info:
+        new_api.generate(_req(), str(tmp_path / "a.mp4"))
+    assert info.value.retryable is False and lookup.call_count == MAX_LOOKUP_MISSES
+    assert clock.now < 900
+
+    lookup.mock(return_value=httpx.Response(200, json={"code": 0, "data": {"tasks": [{"id": "task-9"}]}}))
+    with pytest.raises(ProviderTaskError) as info:  # an unexpected shape: bounded by the poll-error limit
+        new_api.generate(_req(), str(tmp_path / "b.mp4"))
+    assert info.value.code == "provider_bad_response"
+
+
+@respx.mock
+def test_task_found_after_a_few_misses_succeeds(new_api: KlingProvider, mp4_bytes: bytes, tmp_path: Path) -> None:
+    respx.post(f"{BASE}/text-to-video/kling-3.0").mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"id": "task-9", "status": "submitted"}})
+    )
+    answers = iter([httpx.Response(200, json={"code": 0, "data": []})] * 2)
+
+    def lookup(request: httpx.Request) -> httpx.Response:
+        return next(answers, None) or _tasks("succeeded", parse_qs(urlsplit(str(request.url)).query)["external_task_ids"][0],
+                                             outputs=[{"type": "video", "url": OUTPUT_URL}])  # fmt: skip
+
+    respx.get(f"{BASE}/tasks").mock(side_effect=lookup)
+    respx.get(OUTPUT_URL).mock(return_value=httpx.Response(200, content=mp4_bytes))
+    assert new_api.generate(_req(), str(tmp_path / "a.mp4")).external_job_id == "task-9"

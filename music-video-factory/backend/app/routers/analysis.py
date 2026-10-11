@@ -8,7 +8,14 @@ from app import worker
 from app.db import DbSession
 from app.models import AnalysisStatus
 from app.pipeline import song_duration
-from app.schemas import AnalysisOut, AnalysisRerunOut, Segment, SegmentOut, SegmentUpdate
+from app.schemas import (
+    AnalysisOut,
+    AnalysisRerunOut,
+    Segment,
+    SegmentOut,
+    SegmentUpdate,
+    WorldEstimateOut,
+)
 from app.security import CurrentUser, get_owned_project
 from app.services.errors import ServiceError
 
@@ -75,3 +82,14 @@ def update_segment(project_id: str, body: SegmentUpdate, db: DbSession, user: Cu
     project.segment_end = round(end, 3)
     db.commit()
     return SegmentOut(segment=Segment(start=project.segment_start, end=project.segment_end))
+
+
+@router.get("/projects/{project_id}/world-estimate", response_model=WorldEstimateOut)
+def get_world_estimate(project_id: str, db: DbSession, user: CurrentUser) -> WorldEstimateOut:
+    """感情・世界観推定: audio mood (once analysed) + lyrics + the project's mood/purpose → emotions and presets."""
+    from app.services.storyboard import estimate_world
+
+    project = get_owned_project(db, project_id, user)
+    analysis = project.analysis if project.analysis_status == AnalysisStatus.DONE else None
+    estimate = estimate_world(analysis, list(project.lyric_lines or []), project.mood, project.purpose)
+    return WorldEstimateOut(**estimate, analysis_used=analysis is not None)

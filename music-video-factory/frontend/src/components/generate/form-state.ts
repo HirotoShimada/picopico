@@ -3,7 +3,7 @@ import type {
   GenerationSettings,
   GenerationSettingsInput,
   LimitsInfo,
-  LyricStyleId,
+  LyricStyleChoice,
   PresetId,
   ProjectOut,
   ProviderId,
@@ -12,7 +12,7 @@ import type {
   TextStyle,
 } from "@/lib/types";
 
-import { compactTextStyle, toLyricStyleId } from "./text-style";
+import { compactTextStyle, toLyricStyleChoice } from "./text-style";
 
 export const CUSTOM = "custom";
 
@@ -29,7 +29,8 @@ export interface GenerateFormState {
   /** `"1" | "3" | … | "custom"` */
   countChoice: string;
   customCount: number | null;
-  lyricStyle: LyricStyleId;
+  /** `auto` = the preset's styles rotated per video. */
+  lyricStyle: LyricStyleChoice;
   textStyle: TextStyle | null;
   colorGrade: string;
   startStrategy: StartStrategy;
@@ -39,6 +40,8 @@ export interface GenerateFormState {
   maxNewClips: number | null;
   /** `null` = project budget, else the server default. */
   budget: number | null;
+  /** Ask Claude for a fresh storyboard (never carried over from the previous batch). */
+  newStoryboard: boolean;
 }
 
 export type FormErrors = Partial<Record<"customWorld" | "duration" | "count" | "startSec" | "maxNewClips" | "budget", string>>;
@@ -56,19 +59,35 @@ function choiceFor(value: number, choices: readonly number[]): { choice: string;
 }
 
 /**
+ * The preset 感情・世界観推定 suggests for a first run: only when there is no previous batch and
+ * the project is still on the default preset without a custom world (an explicit choice wins).
+ */
+export function suggestedInitialPreset(
+  project: ProjectOut,
+  previous: Partial<GenerationSettings> | null,
+  recommended: readonly string[] | null | undefined,
+): PresetId | null {
+  if (previous || project.custom_world || project.world_preset !== DEFAULT_GENERATION_SETTINGS.preset) return null;
+  const top = recommended?.find((id) => (PRESET_IDS as readonly string[]).includes(id) && id !== "custom");
+  return top && top !== project.world_preset ? (top as PresetId) : null;
+}
+
+/**
  * Initial state: the latest batch's settings when there is one (so a second run
- * starts from what worked), otherwise the project's world preset and defaults.
+ * starts from what worked), otherwise the project's world preset (or the preset the
+ * world estimate suggests, see {@link suggestedInitialPreset}) and defaults.
+ * `new_storyboard` is never carried over.
  */
 export function initialFormState(
   project: ProjectOut,
   previous: Partial<GenerationSettings> | null,
-  options: { durations?: readonly number[]; counts?: readonly number[] } = {},
+  options: { durations?: readonly number[]; counts?: readonly number[]; suggestedPreset?: PresetId | null } = {},
 ): GenerateFormState {
   const defaults = DEFAULT_GENERATION_SETTINGS;
   const durations = options.durations ?? DEFAULT_DURATIONS;
   const counts = options.counts ?? DEFAULT_COUNTS;
   const source: Partial<GenerationSettings> = previous ?? {
-    preset: pick(project.world_preset, PRESET_IDS, defaults.preset),
+    preset: options.suggestedPreset ?? pick(project.world_preset, PRESET_IDS, defaults.preset),
     custom_world: project.custom_world,
   };
   const duration = choiceFor(Number(source.duration_sec ?? defaults.duration_sec), durations);
@@ -82,7 +101,7 @@ export function initialFormState(
     customDuration: duration.custom,
     countChoice: count.choice,
     customCount: count.custom,
-    lyricStyle: toLyricStyleId(source.lyric_style ?? defaults.lyric_style),
+    lyricStyle: toLyricStyleChoice(source.lyric_style ?? defaults.lyric_style),
     textStyle: compactTextStyle(source.text_style),
     colorGrade: source.color_grade || defaults.color_grade,
     startStrategy: pick(source.start_strategy, START_STRATEGIES, defaults.start_strategy),
@@ -91,6 +110,7 @@ export function initialFormState(
     limitNewClips: source.max_new_clips !== null && source.max_new_clips !== undefined,
     maxNewClips: source.max_new_clips ?? null,
     budget: source.budget_limit_usd ?? null,
+    newStoryboard: false,
   };
 }
 
@@ -151,6 +171,7 @@ export function validateForm(state: GenerateFormState, limits: LimitsInfo): Vali
     max_new_clips: state.limitNewClips ? state.maxNewClips : null,
     budget_limit_usd: state.budget,
     seed: null,
+    new_storyboard: state.newStoryboard,
   };
   return { errors, settings };
 }

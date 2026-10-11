@@ -150,3 +150,17 @@ def test_media_signature_is_stable_within_a_window(monkeypatch) -> None:
     later = sign_media_url("projects/p/render/v.mp4", ttl=3600)
     later_exp = int(dict(part.split("=", 1) for part in later.split("?", 1)[1].split("&"))["exp"])
     assert now + 1 + 3600 <= later_exp <= now + 1 + 3600 + 300
+
+
+def test_removing_a_user_from_api_tokens_revokes_the_token(make_client: Callable[..., TestClient], db: Session) -> None:
+    both = make_client(AUTH_MODE="token", API_TOKENS=f"alice:{ALICE},bob:{BOB}")
+    project = both.post("/api/projects", json={"title": "t", "artist_name": "a"}, headers=_auth(BOB)).json()
+    assert both.get("/api/projects", headers=_auth(BOB)).status_code == 200
+
+    alice_only = make_client(AUTH_MODE="token", API_TOKENS=f"alice:{ALICE}")
+    assert alice_only.get("/api/projects", headers=_auth(BOB)).status_code == 401
+    assert alice_only.get("/api/projects", headers=_auth(ALICE)).status_code == 200
+
+    restored = make_client(AUTH_MODE="token", API_TOKENS=f"alice:{ALICE},bob:{BOB}")
+    listed = restored.get("/api/projects", headers=_auth(BOB)).json()
+    assert [p["id"] for p in listed] == [project["id"]]  # same user again: projects kept

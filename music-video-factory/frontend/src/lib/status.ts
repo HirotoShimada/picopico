@@ -71,6 +71,19 @@ export const ACTIVE_VIDEO_STATUSES: readonly VideoStatus[] = ["queued", "waiting
 export const ACTIVE_CLIP_STATUSES: readonly ClipStatus[] = ["pending", "generating"];
 export const ACTIVE_ANALYSIS_STATUSES: readonly AnalysisStatus[] = ["queued", "running"];
 
+export function batchStatusLabel(status: BatchStatus | string): string {
+  return statusMeta("batch", status).label;
+}
+
+/**
+ * Label of a finished batch that also reflects its video counts: a `partial` batch whose
+ * unfinished videos were all cancelled (none failed) is "一部キャンセル", not "一部失敗".
+ */
+export function batchOutcomeLabel(status: BatchStatus | string, counts?: { failed: number; cancelled: number } | null): string {
+  if (status === "partial" && counts && counts.failed === 0 && counts.cancelled > 0) return "一部キャンセル";
+  return batchStatusLabel(status);
+}
+
 export function isBatchActive(status: BatchStatus | string | null | undefined): boolean {
   return !!status && (ACTIVE_BATCH_STATUSES as readonly string[]).includes(status);
 }

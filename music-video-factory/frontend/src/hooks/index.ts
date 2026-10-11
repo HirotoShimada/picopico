@@ -10,4 +10,5 @@ export { useLyrics } from "./use-lyrics";
 export { useNow } from "./use-now";
 export { useProject, useProjects } from "./use-projects";
 export { useVideo, useVideos } from "./use-videos";
+export { useWorldEstimate } from "./use-world-estimate";
 export { POLL_FAST_MS, POLL_IDLE_MS, POLL_NORMAL_MS } from "./polling";

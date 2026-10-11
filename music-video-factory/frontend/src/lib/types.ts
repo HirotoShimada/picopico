@@ -39,6 +39,8 @@ export type PresetId =
 export type ProviderId = "mock" | "library" | "kling" | "runway" | "veo";
 export type ProviderKind = "mock" | "library" | "api";
 export type LyricStyleId = "simple" | "cinematic" | "minimal" | "karaoke" | "fade";
+/** Batch setting only: a style id, or `auto` = the planner rotates the preset's `lyric_styles` per video. */
+export type LyricStyleChoice = LyricStyleId | "auto";
 export type StartStrategy = "segment" | "chorus" | "varied" | "custom";
 export type ReuseMode = "max_variety" | "balanced" | "economy";
 export type Transition = "cut" | "crossfade";
@@ -212,6 +214,8 @@ export interface AutoTimeOut {
 export interface ProjectCreate {
   title: string;
   artist_name: string;
+  /** Other spellings of the artist name (romanised / English) that are kept out of prompts (likeness guard). */
+  artist_aliases?: string[];
   mood?: string | null;
   purpose?: string | null;
   notes?: string | null;
@@ -232,6 +236,7 @@ export interface ProjectOut {
   id: string;
   title: string;
   artist_name: string;
+  artist_aliases: string[];
   mood: string | null;
   purpose: string | null;
   notes: string | null;
@@ -322,7 +327,8 @@ export interface GenerationSettings {
   duration_sec: number;
   /** 1..50 videos. */
   count: number;
-  lyric_style: LyricStyleId;
+  /** `auto` varies the style per video (each video's `plan.lyric_style` is a concrete id). */
+  lyric_style: LyricStyleChoice;
   text_style: TextStyle | null;
   /** `auto` or a color grade id. */
   color_grade: string;
@@ -333,6 +339,8 @@ export interface GenerationSettings {
   max_new_clips: number | null;
   budget_limit_usd: number | null;
   seed: number | null;
+  /** Ask Claude for a new storyboard instead of reusing the project's last one for the same world (one batch only). */
+  new_storyboard?: boolean;
 }
 
 /** Request body for estimate / batch creation: omitted fields take server defaults. */
@@ -437,6 +445,8 @@ export interface ShotPlan {
   /** Additive (§6.4). */
   scene_id?: string | null;
   section?: string | null;
+  /** Set when the planned clip was unusable (failed/cancelled/deleted) and another clip of the batch was used. */
+  substituted_from?: string | null;
 }
 
 export interface VideoPlan {
@@ -450,6 +460,11 @@ export interface VideoPlan {
   color_grade: string;
   shots: ShotPlan[];
   transition: Transition;
+  /** Pipeline additions (§5.9): number of shots filled with a substitute clip. */
+  substitutions?: number;
+  regenerated?: boolean;
+  edited?: boolean;
+  lyric_offsets?: Record<string, LyricOffset> | null;
 }
 
 export interface ClipSpec {
@@ -593,6 +608,14 @@ export interface BatchOut {
   finished_at: ISODateString | null;
   counts: BatchCounts;
   clip_counts: ClipCounts;
+  /** Additive: while a finished batch is re-opened for a re-render, the status / reason it had before. */
+  reopened_from?: BatchStatus | null;
+  previous_error?: string | null;
+}
+
+/** `PATCH /api/batches/{id}`: a new budget cap (e.g. to resume a `budget_exceeded` batch). */
+export interface BatchUpdate {
+  budget_limit_usd: number;
 }
 
 /** `GET /api/batches/{id}` includes the batch's videos and clips. */
@@ -655,6 +678,24 @@ export interface WorldPresetInfo {
   name_en: string;
   description_ja: string;
   palette: string[];
+  /** Additive: recommended lyric styles, best first; `lyric_style: "auto"` rotates them per video. */
+  lyric_styles?: string[];
+  /** Colour grades `color_grade: "auto"` rotates through. */
+  color_grades?: string[];
+}
+
+/** `GET /api/projects/{id}/world-estimate` (感情・世界観推定; deterministic, no API call). */
+export interface WorldEstimate {
+  /** Emotion ids: melancholic nostalgic hopeful energetic romantic calm dark dreamy. */
+  emotions: string[];
+  /** Theme ids: night nature. */
+  themes: string[];
+  mood_en: string;
+  recommended_presets: (PresetId | string)[];
+  sources: { audio: string[]; lyrics: string[]; user: string[] };
+  rationale_ja: string;
+  /** False until the song analysis is done (then only lyrics and the project's mood/purpose count). */
+  analysis_used: boolean;
 }
 
 export interface LyricStyleInfo {

@@ -403,3 +403,17 @@ def test_plain_converts_numpy_types() -> None:
     )
     assert value == {"a": 0.5, "b": 3, "c": [1.0, 0.0], "d": True}
     assert_plain_json(value)
+
+
+@pytest.mark.parametrize("decoder", ["librosa", "ffmpeg"])
+def test_decoding_is_capped_even_without_upload_validation(
+    demo_dir: Path, monkeypatch: pytest.MonkeyPatch, decoder: str
+) -> None:
+    """A crafted file whose header under-reports its length must not decode for hours (defence in depth)."""
+    monkeypatch.setattr(audio_analysis, "MAX_DECODE_SEC", 2.0)
+    path = demo_dir / ("demo_song.wav" if decoder == "librosa" else "demo_song.mp3")
+    if decoder == "ffmpeg":
+        y = audio_analysis._decode_with_ffmpeg(path)
+    else:
+        y = audio_analysis._decode(path)
+    assert abs(len(y) / audio_analysis.SR - 2.0) < 0.1  # the 60 s demo song stops at the cap

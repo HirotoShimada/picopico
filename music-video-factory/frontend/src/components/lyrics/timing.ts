@@ -57,6 +57,32 @@ export function effectiveEnd(lines: readonly LyricLine[], index: number, songDur
   return roundTime(end);
 }
 
+/** Lines starting within this many seconds of each other are one block (bilingual / duet LRC), like the renderer. */
+export const SAME_TIME_SEC = 0.05;
+
+/**
+ * Indexes of the lines shown together at `time`: the active line plus every timed line that
+ * starts within {@link SAME_TIME_SEC} of it (the renderer stacks such a group as one block and
+ * keeps it until the group's latest end — or the next distinct start). Empty when nothing is on screen.
+ */
+export function activeLineGroup(lines: readonly LyricLine[], time: number, songDuration?: number | null): { indexes: number[]; end: number | null } {
+  const anchor = activeLineIndex(lines, time, songDuration);
+  if (anchor < 0) return { indexes: [], end: null };
+  const start = lines[anchor].start as number;
+  const indexes = lines.flatMap((line, i) => (line.start !== null && Math.abs(line.start - start) <= SAME_TIME_SEC ? [i] : []));
+  if (indexes.length <= 1) return { indexes: [anchor], end: effectiveEnd(lines, anchor, songDuration) };
+  const explicit = indexes.map((i) => lines[i].end).filter((end): end is number => end !== null && end > start);
+  let end: number;
+  if (explicit.length > 0) {
+    end = Math.max(...explicit);
+  } else {
+    const later = lines.find((line) => line.start !== null && line.start > start + SAME_TIME_SEC)?.start ?? null;
+    end = later !== null ? Math.min(later, start + MAX_DERIVED_LINE_SECONDS) : start + DEFAULT_LINE_SECONDS;
+    if (songDuration && songDuration > start) end = Math.min(end, songDuration);
+  }
+  return time < end ? { indexes, end: roundTime(end) } : { indexes: [], end: null };
+}
+
 /** Index of the line on screen at `time` (start ≤ time < end), or -1. Later lines win on overlap. */
 export function activeLineIndex(lines: readonly LyricLine[], time: number, songDuration?: number | null): number {
   for (let i = lines.length - 1; i >= 0; i -= 1) {

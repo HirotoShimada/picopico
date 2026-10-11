@@ -14,6 +14,7 @@ import type {
   AutoTimeRequest,
   BatchDetailOut,
   BatchOut,
+  BatchUpdate,
   CapabilitiesOut,
   ClipOut,
   DashboardOut,
@@ -41,6 +42,7 @@ import type {
   VideoOut,
   VideoRegenerateRequest,
   VideoUpdate,
+  WorldEstimate,
 } from "./types";
 import { navigateToDownload, saveBlob } from "./utils";
 
@@ -515,6 +517,7 @@ export const apiPaths = {
   projectRights: (projectId: string) => `/api/projects/${enc(projectId)}/rights`,
   projectAudio: (projectId: string) => `/api/projects/${enc(projectId)}/audio`,
   analysis: (projectId: string) => `/api/projects/${enc(projectId)}/analysis`,
+  worldEstimate: (projectId: string) => `/api/projects/${enc(projectId)}/world-estimate`,
   analysisRerun: (projectId: string) => `/api/projects/${enc(projectId)}/analysis/rerun`,
   segment: (projectId: string) => `/api/projects/${enc(projectId)}/segment`,
   lyrics: (projectId: string) => `/api/projects/${enc(projectId)}/lyrics`,
@@ -596,6 +599,11 @@ export function uploadAudio(projectId: string, file: File, options: UploadOption
 
 export function getAnalysis(projectId: string): Promise<AnalysisOut> {
   return apiRequest(apiPaths.analysis(projectId));
+}
+
+/** 感情・世界観推定 from the audio mood, lyrics and the project's mood/purpose. */
+export function getWorldEstimate(projectId: string): Promise<WorldEstimate> {
+  return apiRequest(apiPaths.worldEstimate(projectId));
 }
 
 export function rerunAnalysis(projectId: string): Promise<AnalysisRerunOut> {
@@ -686,6 +694,11 @@ export function getBatch(batchId: string): Promise<BatchDetailOut> {
 
 export function cancelBatch(batchId: string): Promise<BatchOut> {
   return apiRequest(apiPaths.batchCancel(batchId), { method: "POST" });
+}
+
+/** New budget cap for a batch (e.g. to resume a `budget_exceeded` one; its stopped videos can then be retried). */
+export function updateBatchBudget(batchId: string, body: BatchUpdate): Promise<BatchDetailOut> {
+  return apiRequest(apiPaths.batch(batchId), { method: "PATCH", json: body });
 }
 
 /** Absolute URL of the batch ZIP (needs no header only in `AUTH_MODE=dev`). */

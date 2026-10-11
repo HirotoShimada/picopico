@@ -75,7 +75,7 @@ def seed_users(db: Session) -> list[User]:
         user = db.scalar(select(User).where(User.token_hash == token_hash))
         if user is None:
             user = db.scalar(
-                select(User).where(User.name == name, User.token_hash.is_not(None)).order_by(User.created_at)
+                select(User).where(User.name == name, User.id != LOCAL_USER_ID).order_by(User.created_at)
             )
             if user is None:
                 user = User(name=name, token_hash=token_hash)
@@ -85,6 +85,13 @@ def seed_users(db: Session) -> list[User]:
         elif user.name != name:
             user.name = name
         users.append(user)
+    if settings.AUTH_MODE == "token":
+        # A user removed from API_TOKENS loses access (their projects stay; re-adding the name restores them).
+        kept = {user.id for user in users}
+        for stale in db.scalars(select(User).where(User.token_hash.is_not(None))).all():
+            if stale.id not in kept:
+                stale.token_hash = None
+                logger.warning("revoked the API token of user %r (no longer in API_TOKENS)", stale.name)
     db.commit()
     return users
 

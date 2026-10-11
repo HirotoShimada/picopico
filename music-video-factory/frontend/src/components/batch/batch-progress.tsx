@@ -103,7 +103,8 @@ function StageSteps({ batch }: { batch: BatchDetailOut }) {
       {STAGES.map((stage, index) => {
         const state = states[index];
         const last = index === STAGES.length - 1;
-        const label = last ? (FINAL_LABELS[batch.status] ?? stage.label) : stage.label;
+        const final = batch.status === "partial" && batch.counts.failed === 0 ? "完了（一部キャンセル）" : FINAL_LABELS[batch.status];
+        const label = last ? (final ?? stage.label) : stage.label;
         return (
           <li key={stage.key} className="flex items-center gap-2">
             <span

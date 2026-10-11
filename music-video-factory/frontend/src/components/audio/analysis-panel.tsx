@@ -22,6 +22,7 @@ import { AnalysisSummary } from "./analysis-summary";
 import { useAudioHotkeys } from "./audio-player";
 import { AudioTransport } from "./audio-transport";
 import { AudioUploadCard } from "./audio-upload-card";
+import { WorldEstimateCard } from "./world-estimate-card";
 import { SegmentEditor } from "./segment-editor";
 
 function useRerun(projectId: string) {
@@ -179,6 +180,7 @@ function AnalysisMain({ project, aside }: { project: ProjectOut; aside: React.Re
       main={
         <>
           <AnalysisSummary analysis={data.analysis} />
+          <WorldEstimateCard project={project} analysisStatus={data.status} />
           <div className="flex justify-end">
             <Button type="button" variant="ghost" size="sm" onClick={() => void rerun.run()} loading={rerun.pending}>
               {rerun.pending ? null : <RefreshCw aria-hidden />}

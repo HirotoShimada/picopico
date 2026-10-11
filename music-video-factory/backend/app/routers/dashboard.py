@@ -26,7 +26,7 @@ from app.models import (
 )
 from app.schemas import ActiveJob, DashboardOut, ProviderUsage, UsageOut
 from app.security import CurrentUser
-from app.serializers import to_video_out
+from app.serializers import to_video_outs
 
 router = APIRouter(tags=["dashboard"])
 
@@ -126,7 +126,7 @@ def get_dashboard(db: DbSession, user: CurrentUser) -> DashboardOut:
         videos_done=videos_by_status.get(VideoStatus.DONE, 0),
         videos_total=sum(videos_by_status.values()),
         active_jobs=active_jobs,
-        recent_videos=[to_video_out(v) for v in recent],
+        recent_videos=to_video_outs(db, list(recent)),
         usage=UsageOut(
             total_usd=_money(totals[0]),
             month_usd=_money(totals[1]),

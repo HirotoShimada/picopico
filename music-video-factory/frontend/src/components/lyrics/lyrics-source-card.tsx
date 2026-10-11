@@ -176,6 +176,7 @@ export function LyricsSourceCard({ projectId, lyrics, hasTiming, onParsed }: Lyr
               type="file"
               className="sr-only"
               tabIndex={-1}
+              aria-label="歌詞ファイル（.txt / .lrc / .srt）"
               accept={LYRICS_EXTENSIONS.map((ext) => `.${ext}`).join(",")}
               onChange={(event) => {
                 const file = event.currentTarget.files?.[0];

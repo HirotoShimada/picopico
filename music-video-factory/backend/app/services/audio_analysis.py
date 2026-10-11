@@ -46,12 +46,16 @@ from scipy import ndimage
 from scipy.spatial.distance import cdist
 
 from app.services.errors import AnalysisError
+from app.services.media import MAX_AUDIO_SEC
 
 logger = logging.getLogger(__name__)
 
 ANALYSIS_VERSION = 1
 
 SR = 22050
+# Never decode more than this, even if upload validation was bypassed (a crafted file whose header
+# under-reports its length could otherwise decode for hours and exhaust memory/disk).
+MAX_DECODE_SEC = MAX_AUDIO_SEC + 1.0
 N_FFT = 2048
 HOP = 512
 FRAME_SEC = HOP / SR
@@ -225,7 +229,7 @@ def _soundfile_meta(path: Path) -> dict[str, Any]:
 def _decode(path: Path) -> np.ndarray:
     """Mono float32 samples at ``SR``: libsndfile first, FFmpeg for anything else (m4a/aac, video...)."""
     try:
-        y, _ = librosa.load(path, sr=SR, mono=True)
+        y, _ = librosa.load(path, sr=SR, mono=True, duration=MAX_DECODE_SEC)
     except Exception as exc:  # any libsndfile failure: unsupported container/codec, odd headers
         logger.info("soundfile could not decode %s (%s); transcoding with ffmpeg", path.name, exc)
         y = _decode_with_ffmpeg(path)
@@ -248,7 +252,7 @@ def _decode_with_ffmpeg(path: Path) -> np.ndarray:
         cmd = [
             ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(path), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(SR),
-            "-c:a", "pcm_f32le", str(wav),
+            "-t", f"{MAX_DECODE_SEC:.3f}", "-c:a", "pcm_f32le", str(wav),
         ]  # fmt: skip
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT, check=False)

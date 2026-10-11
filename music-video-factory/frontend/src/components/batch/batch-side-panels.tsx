@@ -4,10 +4,11 @@ import { Clapperboard, Film, Layers } from "lucide-react";
 import * as React from "react";
 
 import { clipSourceLabel } from "@/components/materials/clip-labels";
-import { colorGradeName, COLOR_GRADES_FALLBACK, toLyricStyleId } from "@/components/generate/text-style";
+import { colorGradeName, COLOR_GRADES_FALLBACK, lyricStyleChoiceName } from "@/components/generate/text-style";
 import { reuseLabel, startStrategyLabel } from "@/components/generate/vocab";
 import { LYRIC_STYLES_FALLBACK } from "@/components/lyrics/lyric-styles";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Thumbnail } from "@/components/ui/thumbnail";
 import { useCapabilities, usePresets } from "@/hooks/use-capabilities";
@@ -33,7 +34,8 @@ export function BatchSettingsCard({ batch }: { batch: BatchDetailOut }) {
   const model = batch.estimate?.model ?? settings.model ?? provider?.default_model ?? null;
   // mock / library have a single built-in model; naming it only repeats the provider.
   const modelName = provider && provider.kind !== "api" ? null : (provider?.models.find((m) => m.id === model)?.name ?? model);
-  const lyricStyle = (capabilities?.lyric_styles ?? LYRIC_STYLES_FALLBACK).find((s) => s.id === toLyricStyleId(settings.lyric_style));
+  // `auto` is stored as is; each video's plan holds the style it was given.
+  const lyricStyle = lyricStyleChoiceName(settings.lyric_style, capabilities?.lyric_styles ?? LYRIC_STYLES_FALLBACK);
 
   return (
     <Card>
@@ -45,7 +47,7 @@ export function BatchSettingsCard({ batch }: { batch: BatchDetailOut }) {
           <Row label="本数 × 長さ" value={`${formatCount(settings.count)}本 × ${formatDuration(settings.duration_sec)}`} />
           <Row label="世界観" value={presets.find((p) => p.id === settings.preset)?.name_ja ?? settings.preset} />
           <Row label="生成エンジン" value={`${provider?.name ?? providerLabel(settings.provider)}${modelName ? ` / ${modelName}` : ""}`} />
-          <Row label="歌詞スタイル" value={lyricStyle?.name_ja ?? settings.lyric_style} />
+          <Row label="歌詞スタイル" value={lyricStyle} />
           <Row label="カラー" value={colorGradeName(settings.color_grade, capabilities?.color_grades ?? COLOR_GRADES_FALLBACK)} />
           <Row
             label="開始位置"
@@ -65,6 +67,7 @@ export function BatchSettingsCard({ batch }: { batch: BatchDetailOut }) {
             </>
           ) : null}
         </dl>
+        {isRunway(settings.provider) ? <PoweredByRunway className="mt-3" /> : null}
       </CardContent>
     </Card>
   );

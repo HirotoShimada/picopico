@@ -8,6 +8,7 @@ real mock provider, FFmpeg renderer and quality validator end to end.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -624,8 +625,12 @@ def test_clean_stale_work_dirs_keeps_recent_ones() -> None:
     past = time.time() - pipeline.STALE_WORK_SEC - 60
     os.utime(old, (past, past))
     os.utime(other, (past, past))
-    assert pipeline.clean_stale_work_dirs() == 1
-    assert not old.exists() and fresh.exists() and other.exists()
+    try:
+        assert pipeline.clean_stale_work_dirs() == 1
+        assert not old.exists() and fresh.exists() and other.exists()
+    finally:
+        for path in (fresh, other):  # other tests check that uploads leave nothing behind
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def test_celery_dispatch_publishes_named_tasks(set_env: Any, monkeypatch: pytest.MonkeyPatch) -> None:

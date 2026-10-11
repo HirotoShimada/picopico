@@ -10,6 +10,7 @@ import {
   downloadVideosZip,
   downloadBatchZip,
   errorMessage,
+  isApiError,
   regenerateVideo,
   retryVideo,
   updateVideo,
@@ -17,6 +18,18 @@ import {
 import type { VideoOut } from "@/lib/types";
 
 type VideoRef = Pick<VideoOut, "id" | "project_id" | "batch_id">;
+
+/**
+ * Error text for a failed re-render request, with what to do next for the coded refusals
+ * (`regenerate` / `edit` / `retry` re-check the rights checklist; `retry` and `regenerate` the budget).
+ */
+export function rerenderErrorMessage(error: unknown): string {
+  const message = errorMessage(error);
+  if (!isApiError(error)) return message;
+  if (error.code === "rights_unconfirmed") return `${message} プロジェクトの「権利確認」タブで全項目を確認すると再開できます。`;
+  if (error.code === "budget_exceeded") return `${message} 生成ジョブの画面で予算を引き上げると再試行できます。`;
+  return message;
+}
 
 /** Display title with a fallback (`動画 #3`). */
 export function videoTitle(video: Pick<VideoOut, "title" | "index">): string {
@@ -58,7 +71,7 @@ export function useVideoActions() {
         await revalidate(video);
         return result;
       } catch (error) {
-        toast.error(failure, errorMessage(error));
+        toast.error(failure, rerenderErrorMessage(error));
         return undefined;
       } finally {
         setPending((current) => {

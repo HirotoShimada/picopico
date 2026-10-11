@@ -92,8 +92,19 @@ export function BatchVideoTable({ videos, disabled }: BatchVideoTableProps) {
                         {video.render_version > 1 ? <span className="ml-2 text-2xs text-subtle-foreground">v{video.render_version}</span> : null}
                       </span>
                       {video.error ? (
-                        <span className="line-clamp-2 text-xs leading-5 text-danger-foreground" title={video.error}>
+                        <span
+                          className={cn(
+                            "line-clamp-2 text-xs leading-5",
+                            video.status === "done" ? "text-warning-foreground" : video.status === "cancelled" ? "text-muted-foreground" : "text-danger-foreground",
+                          )}
+                          title={video.error}
+                        >
                           {video.error}
+                        </span>
+                      ) : null}
+                      {video.plan?.substitutions ? (
+                        <span className="text-2xs text-subtle-foreground" title="予定していた素材を生成できなかったショットを、同じジョブの別の素材で補っています">
+                          代替素材 {video.plan.substitutions} ショット
                         </span>
                       ) : null}
                     </div>

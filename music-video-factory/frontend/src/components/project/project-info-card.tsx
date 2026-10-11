@@ -14,10 +14,12 @@ import { usePresets } from "@/hooks/use-capabilities";
 import { apiPaths, errorMessage, updateProject } from "@/lib/api";
 import { formatDateTime, formatUsd } from "@/lib/format";
 import type { ProjectOut, ProjectUpdate } from "@/lib/types";
+import { formatAliases, parseAliases } from "@/lib/utils";
 
 interface InfoValues {
   title: string;
   artist: string;
+  aliases: string;
   mood: string;
   purpose: string;
   notes: string;
@@ -29,6 +31,7 @@ function valuesOf(project: ProjectOut): InfoValues {
   return {
     title: project.title,
     artist: project.artist_name,
+    aliases: formatAliases(project.artist_aliases),
     mood: project.mood ?? "",
     purpose: project.purpose ?? "",
     notes: project.notes ?? "",
@@ -41,6 +44,9 @@ function validate(values: InfoValues): InfoErrors {
   else if (values.title.trim().length > 200) errors.title = "楽曲名は200文字以内にしてください";
   if (!values.artist.trim()) errors.artist = "アーティスト名を入力してください";
   else if (values.artist.trim().length > 200) errors.artist = "アーティスト名は200文字以内にしてください";
+  const aliases = parseAliases(values.aliases);
+  if (aliases.length > 10) errors.aliases = "別表記は10件までにしてください";
+  else if (aliases.some((alias) => alias.length > 100)) errors.aliases = "別表記は1件100文字以内にしてください";
   if (values.mood.length > 2000) errors.mood = "2000文字以内にしてください";
   if (values.purpose.length > 2000) errors.purpose = "2000文字以内にしてください";
   if (values.notes.length > 10_000) errors.notes = "10000文字以内にしてください";
@@ -52,6 +58,8 @@ function diff(project: ProjectOut, values: InfoValues): ProjectUpdate {
   const optional = (text: string) => (text.trim() ? text.trim() : null);
   if (values.title.trim() !== project.title) patch.title = values.title.trim();
   if (values.artist.trim() !== project.artist_name) patch.artist_name = values.artist.trim();
+  const aliases = parseAliases(values.aliases);
+  if (formatAliases(aliases) !== formatAliases(project.artist_aliases)) patch.artist_aliases = aliases;
   if (optional(values.mood) !== (project.mood ?? null)) patch.mood = optional(values.mood);
   if (optional(values.purpose) !== (project.purpose ?? null)) patch.purpose = optional(values.purpose);
   if (optional(values.notes) !== (project.notes ?? null)) patch.notes = optional(values.notes);
@@ -132,6 +140,15 @@ export function ProjectInfoCard({ project }: { project: ProjectOut }) {
             <Field label="アーティスト名" htmlFor="info-artist" required error={errors.artist}>
               <Input id="info-artist" value={values.artist} onChange={(e) => set("artist", e.target.value)} aria-invalid={!!errors.artist} />
             </Field>
+            <Field
+              label="アーティスト名の別表記"
+              htmlFor="info-aliases"
+              optional
+              error={errors.aliases}
+              description="ローマ字・英語表記など（カンマ区切り）。生成プロンプトから除外します。"
+            >
+              <Input id="info-aliases" value={values.aliases} onChange={(e) => set("aliases", e.target.value)} aria-invalid={!!errors.aliases} />
+            </Field>
             <Field label="雰囲気" htmlFor="info-mood" optional error={errors.mood} description="例: 切ない、疾走感、夜明け">
               <Textarea id="info-mood" rows={2} value={values.mood} onChange={(e) => set("mood", e.target.value)} />
             </Field>
@@ -163,6 +180,7 @@ export function ProjectInfoCard({ project }: { project: ProjectOut }) {
           <dl className="divide-y divide-border">
             <Row label="楽曲名">{project.title}</Row>
             <Row label="アーティスト">{project.artist_name}</Row>
+            {project.artist_aliases?.length ? <Row label="別表記">{formatAliases(project.artist_aliases)}</Row> : null}
             <Row label="雰囲気">{project.mood || <Empty />}</Row>
             <Row label="動画生成目的">{project.purpose || <Empty />}</Row>
             {project.notes ? <Row label="メモ">{project.notes}</Row> : null}

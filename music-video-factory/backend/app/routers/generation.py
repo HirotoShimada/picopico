@@ -20,9 +20,9 @@ from app import worker
 from app.config import get_settings
 from app.db import DbSession
 from app.models import Batch, BatchStatus, utcnow
-from app.pipeline import cancel_batch, create_batch, llm_cost_record, preview_batch
+from app.pipeline import cancel_batch, create_batch, llm_cost_record, preview_batch, update_batch_budget
 from app.routers.videos import zip_response
-from app.schemas import BatchOut, Estimate, GenerationSettings, Storyboard, StoryboardRequest
+from app.schemas import BatchOut, BatchUpdate, Estimate, GenerationSettings, Storyboard, StoryboardRequest
 from app.security import CurrentUser, get_owned_batch, get_owned_project
 from app.serializers import to_batch_out
 from app.services.media import sanitize_filename
@@ -49,6 +49,7 @@ def preview_storyboard(project_id: str, body: StoryboardRequest, db: DbSession, 
         n_scenes=body.scenes,
         seed=None,
         use_claude=settings.anthropic_configured,
+        artist_aliases=list(project.artist_aliases or []),
     )
     record = llm_cost_record(project.id, None, storyboard)
     if record is not None:
@@ -91,6 +92,14 @@ def list_batches(project_id: str, db: DbSession, user: CurrentUser) -> list[Batc
 @router.get("/batches/{batch_id}", response_model=BatchOut)
 def get_batch(batch_id: str, db: DbSession, user: CurrentUser) -> BatchOut:
     return to_batch_out(db, get_owned_batch(db, batch_id, user), include_children=True)
+
+
+@router.patch("/batches/{batch_id}", response_model=BatchOut)
+def update_generation_batch(batch_id: str, body: BatchUpdate, db: DbSession, user: CurrentUser) -> BatchOut:
+    """Change the batch budget (later clip generations and retries are checked against it)."""
+    batch = get_owned_batch(db, batch_id, user)
+    update_batch_budget(db, batch, body.budget_limit_usd)
+    return to_batch_out(db, batch, include_children=True)
 
 
 @router.post("/batches/{batch_id}/cancel", response_model=BatchOut)

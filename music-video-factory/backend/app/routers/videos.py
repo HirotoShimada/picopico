@@ -24,6 +24,7 @@ from app import worker
 from app.db import DbSession
 from app.models import Batch, Clip, ClipStatus, Video, VideoStatus, utcnow
 from app.pipeline import (
+    abandon_video,
     apply_video_edit,
     download_filename,
     effective_lyric_lines,
@@ -32,7 +33,7 @@ from app.pipeline import (
 )
 from app.schemas import VideoDetailOut, VideoEdit, VideoOut, VideoRegenerateRequest, VideoUpdate, VideoZipRequest
 from app.security import CurrentUser, get_owned_project, get_owned_video
-from app.serializers import to_clip_outs, to_video_out
+from app.serializers import to_clip_outs, to_video_out, to_video_outs
 from app.services.errors import ServiceError
 from app.storage import Storage, build_content_disposition, get_storage
 
@@ -137,9 +138,8 @@ def _enqueue_render(db: DbSession, video: Video) -> None:
     try:
         worker.enqueue("render_video", video.id)
     except worker.QueueUnavailable:
-        video.status = VideoStatus.FAILED
-        video.error = "ジョブキューに接続できないため、レンダリングを開始できませんでした。"
-        db.commit()
+        # The video fails (or keeps its previous render) and the re-opened batch is recomputed.
+        abandon_video(db, video.id, "ジョブキューに接続できないため、レンダリングを開始できませんでした。")
         raise
 
 
@@ -162,7 +162,7 @@ def list_videos(
         stmt = stmt.where(Video.favorite.is_(favorite))
     if batch_id:
         stmt = stmt.where(Video.batch_id == batch_id)
-    return [to_video_out(v) for v in db.scalars(stmt)]
+    return to_video_outs(db, list(db.scalars(stmt)))
 
 
 @router.post("/videos/zip")

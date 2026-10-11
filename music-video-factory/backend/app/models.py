@@ -183,6 +183,9 @@ class Project(Base):
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(200))
     artist_name: Mapped[str] = mapped_column(String(200))
+    # Other spellings of the artist's name (romanised / English, e.g. "Kenshi Yonezu" for 米津玄師) that the
+    # likeness guard also removes from prompts. Nullable so ``init_db`` can add it to existing databases.
+    artist_aliases: Mapped[list[str] | None] = mapped_column(JSONList, default=list)
     mood: Mapped[str | None] = mapped_column(Text)
     purpose: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)

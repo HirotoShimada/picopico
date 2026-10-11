@@ -94,6 +94,37 @@ def test_validate_uploads(demo_dir: Path, tmp_path: Path) -> None:
         validate_video_upload(tiny, "tiny.mp4")
 
 
+def test_audio_length_limit_uses_decoded_audio_not_the_header(tmp_path: Path) -> None:
+    """ADTS AAC has no duration field: ffprobe estimates it from the first frames' bitrate.
+
+    A short high-bitrate part followed by a long low-bitrate (and lower sample rate) part
+    reports a couple of minutes but decodes to more than the 15 min limit.
+    """
+    from app.services.media import MAX_AUDIO_SEC, decoded_audio_duration
+
+    head, tail, bomb = tmp_path / "head.aac", tmp_path / "tail.aac", tmp_path / "bomb.aac"
+    _ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=40",
+            "-ac", "2", "-c:a", "aac", "-b:a", "160k", "-f", "adts", str(head))  # fmt: skip
+    _ffmpeg("-f", "lavfi", "-i", "sine=frequency=330:sample_rate=8000:duration=880",
+            "-ac", "1", "-c:a", "aac", "-b:a", "12k", "-f", "adts", str(tail))  # fmt: skip
+    bomb.write_bytes(head.read_bytes() + tail.read_bytes())
+    assert probe(bomb)["duration"] < MAX_AUDIO_SEC  # the header-derived length lies
+    assert decoded_audio_duration(bomb, limit=MAX_AUDIO_SEC) > MAX_AUDIO_SEC
+    with pytest.raises(MediaValidationError, match="長すぎ"):
+        validate_audio_upload(bomb, "song.aac")
+    # The well-formed head alone is accepted, with its real length.
+    assert validate_audio_upload(head, "song.aac")["duration"] == pytest.approx(40.0, abs=0.5)
+
+
+def test_audio_upload_rejects_matroska_container(demo_dir: Path, tmp_path: Path) -> None:
+    """Matroska's Duration element is free-form metadata, and no song extension maps to it."""
+    mka = tmp_path / "song.ogg"
+    _ffmpeg("-i", str(demo_dir / "demo_song.mp3"), "-t", "10", "-c:a", "libopus", "-f", "matroska", str(mka))
+    assert "matroska" in probe(mka)["format_name"]
+    with pytest.raises(MediaValidationError, match="音声ストリーム"):
+        validate_audio_upload(mka, "song.ogg")
+
+
 def test_make_thumbnail(demo_dir: Path, tmp_path: Path) -> None:
     out = make_thumbnail(demo_dir / "clip_03.mp4", tmp_path / "thumbs" / "t.jpg")
     with Image.open(out) as image:

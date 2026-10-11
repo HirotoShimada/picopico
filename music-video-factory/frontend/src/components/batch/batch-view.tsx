@@ -1,6 +1,6 @@
 "use client";
 
-import { Ban, Download, Film } from "lucide-react";
+import { Ban, Download, Film, Wallet } from "lucide-react";
 import Link from "next/link";
 import * as React from "react";
 import { useSWRConfig } from "swr";
@@ -11,13 +11,15 @@ import { useZipDownload } from "@/components/videos/video-actions";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Field } from "@/components/ui/field";
+import { NumberInput } from "@/components/ui/number-input";
 import { ErrorState } from "@/components/ui/error-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { toast } from "@/components/ui/toast";
-import { apiPaths, cancelBatch, errorMessage } from "@/lib/api";
-import { formatCount, formatDateTime } from "@/lib/format";
-import { isBatchActive } from "@/lib/status";
+import { apiPaths, cancelBatch, errorMessage, updateBatchBudget } from "@/lib/api";
+import { formatCount, formatDateTime, formatUsd } from "@/lib/format";
+import { batchOutcomeLabel, batchStatusLabel, isBatchActive } from "@/lib/status";
 import type { BatchDetailOut } from "@/lib/types";
 
 import { BatchProgress } from "./batch-progress";
@@ -64,7 +66,7 @@ export function BatchSkeleton() {
   );
 }
 
-function StatusCallout({ batch }: { batch: BatchDetailOut }) {
+function StatusCallout({ batch, onRaiseBudget }: { batch: BatchDetailOut; onRaiseBudget: () => void }) {
   const galleryLink = (
     <Link href={galleryHref(batch.project_id, batch.id)} className="font-medium text-foreground underline underline-offset-2">
       動画一覧を開く
@@ -73,8 +75,18 @@ function StatusCallout({ batch }: { batch: BatchDetailOut }) {
   switch (batch.status) {
     case "budget_exceeded":
       return (
-        <Alert tone="warning" title="予算上限に達したため停止しました" className="mb-6">
-          {batch.error ?? "これ以上の素材生成は予算を超えるため中止しました。"} 完成した動画はそのまま利用できます。予算や本数を見直して再度生成してください。
+        <Alert
+          tone="warning"
+          title="予算上限に達したため停止しました"
+          className="mb-6"
+          action={
+            <Button variant="secondary" size="sm" onClick={onRaiseBudget}>
+              <Wallet aria-hidden />
+              予算を変更
+            </Button>
+          }
+        >
+          {batch.error ?? "これ以上の素材生成は予算を超えるため中止しました。"} 完成した動画はそのまま利用できます。予算を引き上げると、止まった動画を下の一覧から再試行できます（残りの素材を生成します）。
         </Alert>
       );
     case "failed":
@@ -87,9 +99,18 @@ function StatusCallout({ batch }: { batch: BatchDetailOut }) {
         </Alert>
       );
     case "partial":
-      return (
+      return batch.counts.failed === 0 ? (
+        <Alert
+          tone="neutral"
+          title={`完成 ${formatCount(batch.counts.done)} 本・キャンセル済み ${formatCount(batch.counts.cancelled)} 本`}
+          className="mb-6"
+        >
+          キャンセルした動画は下の一覧から個別に再試行できます。完成した動画はダウンロードできます。 {galleryLink}
+        </Alert>
+      ) : (
         <Alert tone="warning" title={`${formatCount(batch.counts.failed)} 本の動画が失敗しました`} className="mb-6">
-          失敗した動画は下の一覧から個別に再試行できます。完成した {formatCount(batch.counts.done)} 本はダウンロードできます。 {galleryLink}
+          失敗{batch.counts.cancelled > 0 ? "・キャンセルした" : "した"}動画は下の一覧から個別に再試行できます。完成した {formatCount(batch.counts.done)} 本はダウンロードできます。{" "}
+          {galleryLink}
         </Alert>
       );
     case "cancelled":
@@ -105,9 +126,17 @@ function StatusCallout({ batch }: { batch: BatchDetailOut }) {
         </Alert>
       );
     default:
-      return batch.error ? (
-        <Alert tone="warning" className="mb-6">
-          {batch.error}
+      if (batch.error) {
+        return (
+          <Alert tone="warning" className="mb-6">
+            {batch.error}
+          </Alert>
+        );
+      }
+      return batch.reopened_from ? (
+        <Alert tone="neutral" title="完了したジョブの動画を作り直しています" className="mb-6">
+          再レンダリングが終わると、このジョブの状態を計算し直します（作り直す前: {batchStatusLabel(batch.reopened_from)}）。
+          {batch.previous_error ? ` 前回の停止理由: ${batch.previous_error}` : ""}
         </Alert>
       ) : null;
   }
@@ -119,6 +148,8 @@ export function BatchView({ batchId }: { batchId: string }) {
   const { mutate: globalMutate } = useSWRConfig();
   const zip = useZipDownload();
   const [cancelOpen, setCancelOpen] = React.useState(false);
+  const [budgetOpen, setBudgetOpen] = React.useState(false);
+  const [budget, setBudget] = React.useState<number | null>(null);
   useRefreshProjectOnProgress(batch);
 
   if (error && !batch) {
@@ -135,6 +166,28 @@ export function BatchView({ batchId }: { batchId: string }) {
   const active = isBatchActive(batch.status);
   const finished = !active;
   const hasDone = batch.counts.done > 0;
+
+  const currentLimit = batch.estimate?.budget_limit_usd ?? null;
+
+  function openBudget() {
+    setBudget(currentLimit !== null ? Math.max(currentLimit, Math.ceil((batch?.cost_usd ?? 0) + 1)) : null);
+    setBudgetOpen(true);
+  }
+
+  async function handleBudget() {
+    if (budget === null || budget < 0) {
+      toast.error("予算を変更できませんでした", "0 以上の金額を入力してください。");
+      throw new Error("invalid budget");
+    }
+    try {
+      const updated = await updateBatchBudget(batchId, { budget_limit_usd: budget });
+      await mutate((current) => (current ? { ...current, ...updated } : current), { revalidate: true });
+      toast.success("予算を変更しました", "止まった動画を一覧から再試行すると、残りの素材を生成します。");
+    } catch (err) {
+      toast.error("予算を変更できませんでした", errorMessage(err));
+      throw err;
+    }
+  }
 
   async function handleCancel() {
     try {
@@ -185,13 +238,13 @@ export function BatchView({ batchId }: { batchId: string }) {
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <h2 className="text-base font-semibold text-foreground">生成ジョブ</h2>
-        <StatusBadge kind="batch" status={batch.status} />
+        <StatusBadge kind="batch" status={batch.status} label={batchOutcomeLabel(batch.status, batch.counts)} />
         <span className="font-mono text-2xs text-subtle-foreground">{batch.id}</span>
         <span className="text-xs text-muted-foreground">作成 {formatDateTime(batch.created_at)}</span>
         {active ? <span className="text-xs text-muted-foreground">・ 自動で更新しています</span> : null}
       </div>
 
-      <StatusCallout batch={batch} />
+      <StatusCallout batch={batch} onRaiseBudget={openBudget} />
       <BatchProgress batch={batch} />
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
@@ -208,11 +261,34 @@ export function BatchView({ batchId }: { batchId: string }) {
         onOpenChange={setCancelOpen}
         destructive
         title="生成をキャンセルしますか？"
-        description="まだ始まっていない動画と素材の生成を中止します。完成済みの動画と生成済みの素材は残ります。実行中の外部 API の生成は途中で止められない場合があり、その分の費用が発生することがあります。"
+        description="まだ始まっていない素材の生成と、順番待ち・レンダリング中の動画を中止します。生成済みの素材は残ります。作り直し中の動画は前回完成した動画に戻り、完了済みのジョブで作り直していた場合はジョブも元の状態（完了・一部失敗・予算超過など）に戻ります。実行中の外部 API の生成は途中で止められない場合があり（Veo・Kling）、その分の費用が発生することがあります。"
         confirmLabel="キャンセルする"
         cancelLabel="続行する"
         onConfirm={handleCancel}
       />
+
+      <ConfirmDialog
+        open={budgetOpen}
+        onOpenChange={setBudgetOpen}
+        title="このジョブの予算を変更しますか？"
+        description={`これまでの費用は ${formatUsd(batch.cost_usd)}、現在の上限は ${currentLimit !== null ? formatUsd(currentLimit) : "なし"} です。以降の素材生成と再試行は新しい上限で確認します。`}
+        confirmLabel="予算を変更"
+        onConfirm={handleBudget}
+      >
+        <Field label="新しい予算上限" htmlFor="batch-budget">
+          <NumberInput
+            id="batch-budget"
+            value={budget}
+            onValueChange={setBudget}
+            min={0}
+            max={100_000}
+            step={1}
+            decimals={2}
+            prefix="$"
+            className="w-40"
+          />
+        </Field>
+      </ConfirmDialog>
     </>
   );
 }

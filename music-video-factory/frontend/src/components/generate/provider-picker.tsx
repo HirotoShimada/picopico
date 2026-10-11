@@ -6,6 +6,7 @@ import * as React from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { RadioCards, type RadioCardOption } from "@/components/ui/radio-cards";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { PROVIDER_KIND_LABELS, providerLabel } from "@/lib/constants";
@@ -87,6 +88,8 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
               価格未検証
             </Badge>
           ) : null}
+          {/* The card is a radio button: text only here, the linked mark is shown below when selected. */}
+          {isRunway(p.id) ? <PoweredByRunway link={false} /> : null}
         </>
       ),
       description: (
@@ -199,6 +202,13 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
             <span className="font-medium text-foreground/90">利用条件: </span>
             {selected.commercial_use_note}
           </span>
+        </p>
+      ) : null}
+
+      {selected && isRunway(selected.id) ? (
+        <p className="flex flex-wrap items-center gap-2 text-xs leading-5 text-muted-foreground">
+          <PoweredByRunway />
+          <span>Runway で生成した映像を使う画面には、この表記が表示されます。</span>
         </p>
       ) : null}
     </div>

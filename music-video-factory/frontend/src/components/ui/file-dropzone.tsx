@@ -134,6 +134,7 @@ export function FileDropzone({
         type="file"
         className="sr-only"
         tabIndex={-1}
+        aria-label={typeof title === "string" ? title : "アップロードするファイル"}
         accept={acceptAttr}
         multiple={multiple}
         disabled={disabled}

@@ -19,7 +19,7 @@ import { useLimits, usePresets } from "@/hooks/use-capabilities";
 import { apiPaths, createProject, errorMessage, isAbortError, uploadAudio } from "@/lib/api";
 import { formatPercent } from "@/lib/format";
 import type { PresetId, ProjectOut } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, parseAliases } from "@/lib/utils";
 
 import { audioDurationProblem, AudioFileSection, readAudioDuration, type SelectedAudio } from "./audio-file-card";
 
@@ -31,6 +31,7 @@ type Phase = "idle" | "creating" | "uploading" | "processing" | "failed";
 interface FormValues {
   title: string;
   artist: string;
+  aliases: string;
   mood: string;
   purpose: string;
   notes: string;
@@ -45,6 +46,7 @@ type FieldErrors = Partial<Record<keyof FormValues, string>>;
 const FIELD_IDS: Record<keyof FormValues, string> = {
   title: "title",
   artist: "artist",
+  aliases: "aliases",
   mood: "mood",
   purpose: "purpose",
   notes: "notes",
@@ -56,6 +58,7 @@ const FIELD_IDS: Record<keyof FormValues, string> = {
 const INITIAL_VALUES: FormValues = {
   title: "",
   artist: "",
+  aliases: "",
   mood: "",
   purpose: "",
   notes: "",
@@ -70,6 +73,9 @@ function validate(values: FormValues): FieldErrors {
   else if (values.title.trim().length > 200) errors.title = "楽曲名は200文字以内にしてください";
   if (!values.artist.trim()) errors.artist = "アーティスト名を入力してください";
   else if (values.artist.trim().length > 200) errors.artist = "アーティスト名は200文字以内にしてください";
+  const aliases = parseAliases(values.aliases);
+  if (aliases.length > 10) errors.aliases = "別表記は10件までにしてください";
+  else if (aliases.some((alias) => alias.length > 100)) errors.aliases = "別表記は1件100文字以内にしてください";
   if (values.preset === "custom" && !values.customWorld.trim()) {
     errors.customWorld = "カスタムを選んだ場合は世界観を入力してください";
   }
@@ -202,6 +208,7 @@ export function NewProjectForm() {
         project = await createProject({
           title: values.title.trim(),
           artist_name: values.artist.trim(),
+          artist_aliases: parseAliases(values.aliases),
           mood: values.mood.trim() || null,
           purpose: values.purpose.trim() || null,
           notes: values.notes.trim() || null,
@@ -293,6 +300,24 @@ export function NewProjectForm() {
                 />
               </Field>
             </div>
+
+            <Field
+              label="アーティスト名の別表記"
+              htmlFor="aliases"
+              optional
+              error={fieldErrors.aliases}
+              description="ローマ字・英語表記など（カンマ区切り）。アーティスト本人に似せた映像を作らないよう、生成プロンプトから除外します。かな表記のローマ字は自動で除外します。"
+            >
+              <Input
+                id="aliases"
+                value={values.aliases}
+                onChange={(e) => setValue("aliases", e.target.value)}
+                placeholder="例：Hikari Lab, ヒカリラボ"
+                autoComplete="off"
+                disabled={locked}
+                aria-invalid={!!fieldErrors.aliases || undefined}
+              />
+            </Field>
 
             <Field
               label="雰囲気"

@@ -13,13 +13,24 @@ import pytest
 import respx
 
 from app.services.errors import ProviderError, ProviderNotConfigured
-from app.services.providers.base import ClipRequest, ProviderCancelled, ProviderTaskError
-from app.services.providers.runway import RUNWAY_API_VERSION, RunwayProvider, classify_failure_code
+from app.services.providers.base import (
+    OUTPUT_FETCH_ATTEMPTS,
+    ClipRequest,
+    PollConfig,
+    ProviderCancelled,
+    ProviderTaskError,
+)
+from app.services.providers.runway import (
+    RUNWAY_API_VERSION,
+    RunwayProvider,
+    classify_failure_code,
+)
 
 KEY = "test-runway-key"
 BASE = "https://api.dev.runwayml.com"
 TASK = "0b9b7a5e-1c0f-4c55-9d7c-5f1a2b3c4d5e"
 OUTPUT_URL = "https://dnznrvs05pmza.cloudfront.example/out/video.mp4?_jwt=x"
+FRESH_OUTPUT_URL = "https://dnznrvs05pmza.cloudfront.example/out/video-fresh.mp4?_jwt=y"
 
 
 @pytest.fixture(scope="module")
@@ -196,6 +207,76 @@ def test_cancel_check_cancels_remote_task(provider: RunwayProvider, tmp_path: Pa
 
 
 @respx.mock
+def test_failed_download_rereads_the_task_instead_of_resubmitting(
+    provider: RunwayProvider, clock: FakeClock, mp4_bytes: bytes, tmp_path: Path
+) -> None:
+    create = respx.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": TASK}))
+    poll = respx.get(f"{BASE}/v1/tasks/{TASK}").mock(side_effect=[
+        _task("SUCCEEDED", output=[OUTPUT_URL], cost={"credits": 60}),
+        _task("SUCCEEDED", output=[FRESH_OUTPUT_URL], cost={"credits": 60}),  # fresh pre-signed URL
+    ])  # fmt: skip
+    stale = respx.get(OUTPUT_URL).mock(return_value=httpx.Response(503))
+    fresh = respx.get(FRESH_OUTPUT_URL).mock(return_value=httpx.Response(200, content=mp4_bytes))
+    result = provider.generate(_req(), str(tmp_path / "c.mp4"))
+    assert create.call_count == 1 and poll.call_count == 2
+    assert stale.call_count == 1 and fresh.call_count == 1
+    assert result.cost_usd == pytest.approx(0.6) and result.external_job_id == TASK
+    assert all(s >= 5.0 for s in clock.sleeps)  # the re-read respects Runway's 5 s polling floor
+
+
+def test_succeeded_task_whose_output_cannot_be_downloaded_is_billed_not_resubmitted(
+    provider: RunwayProvider, tmp_path: Path
+) -> None:
+    with respx.mock(assert_all_called=False) as router:
+        create = router.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": TASK}))
+        router.get(f"{BASE}/v1/tasks/{TASK}").mock(
+            return_value=_task("SUCCEEDED", output=[OUTPUT_URL], cost={"credits": 60})
+        )
+        cdn = router.get(OUTPUT_URL).mock(return_value=httpx.Response(503))
+        delete = router.delete(f"{BASE}/v1/tasks/{TASK}").mock(return_value=httpx.Response(204))
+        with pytest.raises(ProviderTaskError) as info:
+            provider.generate(_req(), str(tmp_path / "c.mp4"))
+    assert info.value.retryable is False and info.value.cost_usd == pytest.approx(0.6)
+    assert info.value.external_job_id == TASK
+    assert create.call_count == 1 and cdn.call_count == OUTPUT_FETCH_ATTEMPTS
+    assert delete.call_count == 0  # a succeeded task is neither cancelled nor deleted
+
+
+def test_pipeline_books_a_succeeded_task_whose_output_cannot_be_downloaded(
+    db: Any, ready_project: Any, sync_tasks: list, fake_render: Any, set_env: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: the paid task is submitted once, its cost lands in a CostRecord and ``batch.cost_usd``."""
+    from sqlalchemy import select
+
+    from app import pipeline
+    from app.models import Batch, Clip, CostRecord
+    from app.schemas import GenerationSettings
+
+    set_env(RUNWAY_API_KEY=KEY, RUNWAY_API_BASE=BASE)
+    monkeypatch.setattr(RunwayProvider, "poll_config", PollConfig(initial=0.0, maximum=0.0, factor=1.0, jitter=0.0,
+                                                                  minimum=0.0))  # fmt: skip
+    with respx.mock(assert_all_called=False) as router:
+        create = router.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": TASK}))
+        router.get(f"{BASE}/v1/tasks/{TASK}").mock(
+            return_value=_task("SUCCEEDED", output=[OUTPUT_URL], cost={"credits": 60})
+        )
+        cdn = router.get(OUTPUT_URL).mock(return_value=httpx.Response(503))
+        settings = GenerationSettings(provider="runway", model="gen4.5", count=1, duration_sec=5, seed=7,
+                                      max_new_clips=1)  # fmt: skip
+        batch_id = pipeline.create_batch(db, ready_project, settings).id
+        pipeline.run_batch(batch_id)
+    assert create.call_count == 1 and cdn.call_count == OUTPUT_FETCH_ATTEMPTS
+    db.expire_all()
+    (clip,) = db.scalars(select(Clip).where(Clip.project_id == ready_project.id, Clip.provider == "runway")).all()
+    assert clip.status == "failed" and clip.attempts == 1 and clip.cost_usd == pytest.approx(0.6)
+    assert clip.external_job_id == TASK and "課金済み" in (clip.error or "")
+    assert db.get(Batch, batch_id).cost_usd == pytest.approx(0.6)
+    paid = db.scalars(select(CostRecord).where(CostRecord.batch_id == batch_id, CostRecord.cached.is_(False))).all()
+    assert [round(r.amount_usd, 4) for r in paid] == [0.6]
+
+
+@respx.mock
 def test_remotely_cancelled_task(provider: RunwayProvider, tmp_path: Path) -> None:
     respx.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": TASK}))
     respx.get(f"{BASE}/v1/tasks/{TASK}").mock(return_value=_task("CANCELLED", cost={"credits": 0}))
@@ -221,3 +302,44 @@ def test_models_and_durations() -> None:
     prices = {m.id: m.price_per_second_usd for m in provider.models()}
     assert prices == {"gen4.5": 0.12, "gen4_turbo": 0.05, "veo3.1_fast": 0.1}
     assert all(m.verified is False for m in provider.models())
+
+
+@respx.mock
+def test_resume_reads_the_stored_task_instead_of_creating_one(provider: RunwayProvider, mp4_bytes: bytes,
+                                                              tmp_path: Path) -> None:  # fmt: skip
+    create = respx.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": "other"}))
+    poll = respx.get(f"{BASE}/v1/tasks/{TASK}").mock(
+        side_effect=[_task("RUNNING", progress=0.5), _task("SUCCEEDED", output=[OUTPUT_URL], cost={"credits": 60})]
+    )
+    respx.get(OUTPUT_URL).mock(return_value=httpx.Response(200, content=mp4_bytes))
+    result = provider.resume(TASK, _req(), str(tmp_path / "c.mp4"), timeout=300)
+    assert create.call_count == 0 and poll.call_count == 2
+    assert result.external_job_id == TASK and result.cost_usd == pytest.approx(0.6)
+
+
+@respx.mock
+def test_on_submitted_gets_the_task_id(provider: RunwayProvider, mp4_bytes: bytes, tmp_path: Path) -> None:
+    respx.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": TASK}))
+    respx.get(f"{BASE}/v1/tasks/{TASK}").mock(return_value=_task("SUCCEEDED", output=[OUTPUT_URL]))
+    respx.get(OUTPUT_URL).mock(return_value=httpx.Response(200, content=mp4_bytes))
+    reported: list[tuple[str, str]] = []
+    provider.generate(_req(), str(tmp_path / "c.mp4"), on_submitted=lambda job, token: reported.append((job, token)))
+    assert reported == [(TASK, TASK)]
+
+
+@respx.mock
+@pytest.mark.parametrize(("status", "error"), [("FAILED", ProviderTaskError), ("CANCELLED", ProviderCancelled)])
+def test_failed_or_cancelled_task_reports_its_charged_credits(
+    provider: RunwayProvider, tmp_path: Path, status: str, error: type[Exception]
+) -> None:
+    respx.post(f"{BASE}/v1/text_to_video").mock(return_value=httpx.Response(200, json={"id": TASK}))
+    respx.get(f"{BASE}/v1/tasks/{TASK}").mock(
+        return_value=_task(status, failureCode="INTERNAL.BAD_OUTPUT.CODE01", cost={"credits": 0})
+    )
+    with pytest.raises(error) as info:
+        provider.generate(_req(), str(tmp_path / "c.mp4"))
+    assert info.value.cost_usd == 0.0  # reported (0 credits) — known, not presumed
+    respx.get(f"{BASE}/v1/tasks/{TASK}").mock(return_value=_task(status, failureCode="INTERNAL"))
+    with pytest.raises(error) as info:
+        provider.generate(_req(), str(tmp_path / "c.mp4"))
+    assert info.value.cost_usd is None  # not reported

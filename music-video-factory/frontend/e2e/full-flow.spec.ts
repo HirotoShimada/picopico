@@ -9,6 +9,7 @@ import {
   browserPlaysH264,
   demoFile,
   ffprobe,
+  patchApiJson,
   requireDemoAssets,
   RIGHTS_KEYS,
   screenshot,
@@ -43,6 +44,9 @@ interface ClipDto {
 }
 
 const RENDER_TIMEOUT = 8 * 60_000;
+/** Label of `lyric_style: "auto"` (the preset's styles rotated per video). */
+const AUTO_LYRIC_STYLE = "自動（動画ごとに変える）";
+const POWERED_BY_RUNWAY = "Powered by Runway";
 
 test.beforeAll(() => requireDemoAssets());
 
@@ -61,6 +65,14 @@ function formatClock(seconds: number): string {
 
 function toast(page: Page, text: string | RegExp): Locator {
   return page.getByText(text).first();
+}
+
+/**
+ * The value cell of a visible `<dt>label</dt><dd>value</dd>` settings / summary row (the
+ * previous route stays mounted but hidden after a client-side navigation).
+ */
+function settingValue(page: Page, label: string): Locator {
+  return page.locator(`xpath=//dt[normalize-space()="${label}"]/following-sibling::dd[1]`).filter({ visible: true });
 }
 
 /** The project id from a `/projects/{id}` URL. */
@@ -86,6 +98,8 @@ test("full journey: mock provider, 3 × 15 s, preview, download, edit and re-ren
   await test.step("create project and upload the song", async () => {
     await page.locator("#title").fill(title);
     await page.locator("#artist").fill("デモアーティスト");
+    // Other spellings of the artist name are kept out of every generation prompt (likeness guard).
+    await page.locator("#aliases").fill("Demo Artist, でもあーてぃすと");
     await page.locator("#mood").fill("切ない、夜明け前の静けさ");
     await page.getByRole("radio", { name: /都会の夜/ }).click();
     await expect(page.getByRole("radio", { name: /都会の夜/ })).toHaveAttribute("aria-checked", "true");
@@ -130,6 +144,21 @@ test("full journey: mock provider, 3 × 15 s, preview, download, edit and re-ren
     expect(suggested15).toBeTruthy();
     expect(analysis.segment?.start).toBeCloseTo(suggested15!.start, 1);
     expect(analysis.segment!.end - analysis.segment!.start).toBeCloseTo(15, 0);
+
+    // 感情・世界観推定 from the audio mood, the lyrics and the project's mood ("切ない").
+    const estimateCard = page.getByText("感情・世界観の推定", { exact: true });
+    await expect(estimateCard).toBeVisible();
+    await expect(page.getByText("推定される感情")).toBeVisible();
+    const estimate = await apiJson<{ emotions: string[]; recommended_presets: string[]; sources: { user: string[] }; analysis_used: boolean }>(
+      request,
+      "GET",
+      `/api/projects/${projectId}/world-estimate`,
+    );
+    expect(estimate.analysis_used).toBe(true);
+    expect(estimate.sources.user).toContain("melancholic");
+    expect(estimate.recommended_presets.length).toBeGreaterThan(0);
+    const created = await apiJson<{ artist_aliases: string[] }>(request, "GET", `/api/projects/${projectId}`);
+    expect(created.artist_aliases).toEqual(["Demo Artist", "でもあーてぃすと"]);
     await screenshot(page, "03-workspace-analysis");
   });
 
@@ -190,6 +219,9 @@ test("full journey: mock provider, 3 × 15 s, preview, download, edit and re-ren
   await test.step("generate: mock provider, 15 s, 3 videos", async () => {
     await page.getByRole("link", { name: /生成設定へ/ }).click();
     await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/generate$`));
+    // The world estimate is offered next to the presets; the explicit project preset (都会の夜) stays selected.
+    await expect(page.getByText("感情・世界観の推定", { exact: false }).first()).toBeVisible();
+    await expect(page.getByRole("radio", { name: /都会の夜/ })).toHaveAttribute("aria-checked", "true");
     await page.getByRole("radio", { name: /モック/ }).click();
     await page.getByRole("radiogroup", { name: "1 本の長さ" }).getByRole("radio", { name: "15秒" }).click();
     await page.getByRole("radiogroup", { name: "本数" }).getByRole("radio", { name: "3本" }).click();
@@ -276,7 +308,7 @@ test("full journey: mock provider, 3 × 15 s, preview, download, edit and re-ren
 
     // 3) swap shot 1 for an uploaded clip that is not used there
     await page.getByRole("tab", { name: "ショット" }).click();
-    await page.getByRole("button", { name: "差し替え", exact: true }).first().click();
+    await page.getByRole("button", { name: "ショット 1 の素材を差し替え", exact: true }).click();
     const picker = page.getByRole("dialog");
     await expect(picker).toBeVisible();
     const uploads = before.available_clips.filter((clip) => clip.source === "upload" && clip.id !== before.plan.shots[0].clip_id);
@@ -323,7 +355,7 @@ test("full journey: mock provider, 3 × 15 s, preview, download, edit and re-ren
   pageLog.assertClean();
 });
 
-test("library provider: 3 videos from uploaded clips only", async ({ page, request }, testInfo) => {
+test("library provider: 3 videos from uploaded clips only, lyric style 自動 varies per video; Runway attribution", async ({ page, request }, testInfo) => {
   const pageLog = watchConsole(page, testInfo);
 
   // Prepare a ready project directly through the API (the UI path is covered by the journey above).
@@ -356,6 +388,12 @@ test("library provider: 3 videos from uploaded clips only", async ({ page, reque
   await page.getByRole("radio", { name: /アップロード素材/ }).click();
   await page.getByRole("radiogroup", { name: "1 本の長さ" }).getByRole("radio", { name: "15秒" }).click();
   await page.getByRole("radiogroup", { name: "本数" }).getByRole("radio", { name: "3本" }).click();
+  // 自動 = `lyric_style: "auto"`: the planner rotates the preset's recommended styles per video.
+  const autoStyle = page.getByRole("radiogroup", { name: "歌詞スタイル" }).getByRole("radio", { name: /^自動/ });
+  await expect(page.getByRole("radiogroup", { name: "歌詞スタイル" }).getByRole("radio", { name: /^シンプル/ })).toHaveAttribute("aria-checked", "true");
+  await autoStyle.click();
+  await expect(autoStyle).toHaveAttribute("aria-checked", "true");
+  await expect(settingValue(page, "歌詞スタイル")).toHaveText(AUTO_LYRIC_STYLE);
   await expect(page.getByText("合計（概算）")).toBeVisible({ timeout: 60_000 });
   await expect(page.getByText("見積もりは予算内です")).toBeVisible({ timeout: 60_000 });
   await expect(page.getByRole("button", { name: "生成開始" })).toBeEnabled();
@@ -367,6 +405,15 @@ test("library provider: 3 videos from uploaded clips only", async ({ page, reque
 
   await expect(page.getByText("3 本の動画が完成しました")).toBeVisible({ timeout: RENDER_TIMEOUT });
   await screenshot(page, "17-batch-library-complete");
+
+  await test.step("lyric style 自動: shown as such, and the videos got different styles", async () => {
+    await expect(settingValue(page, "歌詞スタイル")).toHaveText(AUTO_LYRIC_STYLE);
+    const batch = await apiJson<{ settings: { lyric_style: string; preset: string }; videos: VideoDto[] }>(request, "GET", `/api/batches/${batchId}`);
+    expect(batch.settings.lyric_style).toBe("auto");
+    const styles = batch.videos.map((video) => video.plan.lyric_style);
+    expect(styles).toHaveLength(3);
+    expect(new Set(styles).size, `per-video styles ${styles.join(", ")}`).toBeGreaterThan(1);
+  });
 
   await page.getByRole("link", { name: "動画一覧へ" }).first().click();
   await expect(page.getByRole("button", { name: /をプレビュー$/ })).toHaveCount(3);
@@ -380,6 +427,67 @@ test("library provider: 3 videos from uploaded clips only", async ({ page, reque
   }
   const clips = await apiJson<ClipDto[]>(request, "GET", `/api/projects/${project.id}/clips`);
   expect(clips.every((clip) => clip.source === "upload")).toBeTruthy();
+
+  await test.step("reopening the generate page starts from 自動 again", async () => {
+    await page.goto(`/projects/${project.id}/generate`);
+    const styles = page.getByRole("radiogroup", { name: "歌詞スタイル" });
+    await expect(styles.getByRole("radio", { name: /^自動/ })).toHaveAttribute("aria-checked", "true");
+    await expect(styles.getByRole("radio", { checked: true })).toHaveCount(1);
+    await expect(settingValue(page, "歌詞スタイル")).toHaveText(AUTO_LYRIC_STYLE);
+  });
+
+  await test.step("Runway attribution: settings, provider picker, batch, gallery and preview", async () => {
+    const attribution = page.getByRole("link", { name: POWERED_BY_RUNWAY });
+    // The settings page lists Runway (configured or not) with its attribution.
+    await page.goto("/settings");
+    await expect(page.getByRole("heading", { name: "設定", level: 1 })).toBeVisible();
+    await expect(attribution).toHaveCount(1);
+    await expect(attribution).toHaveAttribute("href", /^https:\/\/runwayml\.com\/?$/);
+    await expect(attribution).toHaveAttribute("target", "_blank");
+
+    // No RUNWAY_API_KEY here: report the provider as configured so its card can be selected.
+    await patchApiJson<{ providers: { id: string; configured: boolean; available: boolean; reason: string | null }[] }>(
+      page,
+      "/api/system/capabilities",
+      (capabilities) => {
+        for (const provider of capabilities.providers) {
+          if (provider.id === "runway") Object.assign(provider, { configured: true, available: true, reason: null });
+        }
+      },
+    );
+    await page.goto(`/projects/${project.id}/generate`);
+    const runwayCard = page.getByRole("radio", { name: /^Runway/ });
+    // The card itself is a radio button: the mark is plain text there, the link appears once selected.
+    await expect(runwayCard).toContainText(POWERED_BY_RUNWAY);
+    await expect(attribution).toHaveCount(0);
+    await runwayCard.click();
+    await expect(runwayCard).toHaveAttribute("aria-checked", "true");
+    await expect(attribution).toBeVisible();
+    await expect(attribution).toHaveAttribute("href", /^https:\/\/runwayml\.com\/?$/);
+    await expect(page.getByText("見積もりは予算内です")).toBeVisible({ timeout: 60_000 });
+
+    // A batch generated with Runway (provider patched on this batch) carries the attribution.
+    type BatchSettingsDto = { id: string; settings: { provider: string } };
+    await patchApiJson<BatchSettingsDto>(page, `/api/batches/${batchId}`, (batch) => {
+      batch.settings.provider = "runway";
+    });
+    await patchApiJson<BatchSettingsDto[]>(page, `/api/projects/${project.id}/batches`, (batches) => {
+      for (const batch of batches) if (batch.id === batchId) batch.settings.provider = "runway";
+    });
+    await page.goto(`/batches/${batchId}`);
+    await expect(settingValue(page, "生成エンジン")).toContainText("Runway");
+    await expect(attribution).toBeVisible();
+
+    await page.goto(`/projects/${project.id}/videos`);
+    await expect(page.getByRole("button", { name: /をプレビュー$/ })).toHaveCount(3);
+    await expect(attribution).toHaveCount(1);
+    if (!(await browserPlaysH264(page))) await transcodeRendersForBrowser(page, testInfo);
+    await page.getByRole("button", { name: /をプレビュー$/ }).first().click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByRole("link", { name: POWERED_BY_RUNWAY })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.unrouteAll({ behavior: "ignoreErrors" });
+  });
 
   pageLog.assertClean();
   testInfo.annotations.push({ type: "project", description: path.basename(page.url()) });

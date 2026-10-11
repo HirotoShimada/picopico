@@ -6,13 +6,20 @@
 映像に焼き込みます。
 
 - 楽曲解析: BPM・拍・小節頭・セクション（イントロ／A メロ／サビ…）・サビ候補・おすすめ区間（15/30/60 秒）
+- 感情・世界観推定: 音源のムード・歌詞・入力したムードと目的から感情とおすすめの世界観を推定（外部 API なし）。
+  初回の生成画面ではおすすめの世界観を初期値にする（プロジェクトで世界観を明示した場合はそちらを優先）
 - 歌詞: TXT / LRC / SRT 入力（Shift_JIS 等も自動判定）、ヒューリスティック自動タイミング、
-  Whisper による整列（ローカルにモデルがある場合のみ）、手動修正、LRC / SRT 書き出し
+  Whisper による整列（ローカルにモデルがある場合のみ）、手動修正、LRC / SRT 書き出し。
+  同じ時刻の行（対訳・デュエットの LRC）は上下に並べて表示
 - 生成: 世界観プリセット → 絵コンテ（Claude またはテンプレート）→ 素材プール → 動画ごとに
-  カット割り・開始位置・反転・ズーム／パン・カラーグレード・歌詞スタイルを変えたバリエーション
-- コスト: 事前見積もり（プロバイダ／モデル比較つき）、予算上限、生成済み素材のキャッシュ再利用
+  カット割り・開始位置・反転・ズーム／パン・カラーグレード・歌詞スタイル（「自動」で動画ごとに変える）を変えたバリエーション
+- 肖像の保護: アーティスト名・別表記（ローマ字など）・「〜似」「lookalike」などの表現と、自由入力に書かれた
+  人名らしき語をプロンプトから除去し、全プロンプトに「架空の人物のみ」の指定を付ける
+- コスト: 事前見積もり（プロバイダ／モデル比較つき）、予算上限（試行ごとに DB で予約し、上限を超えない）、
+  生成済み・生成中の素材の再利用、課金済みの失敗も記録、停止したジョブの予算引き上げと再開
 - 仕上げ: 5 種類の歌詞スタイル（simple / cinematic / minimal / karaoke / fade）、ストーリーズのセーフエリア、
   FFmpeg による H.264 / AAC 出力、品質チェック、個別・ZIP ダウンロード、動画ごとの手動編集と再レンダリング
+  （作り直しが失敗・キャンセルされたら前回の動画に戻る）
 
 設計の詳細（モジュール境界・データ構造・API 仕様）は [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、
 動画生成 API の調査は [`docs/VIDEO_PROVIDERS.md`](docs/VIDEO_PROVIDERS.md)、
@@ -29,14 +36,15 @@
    │  pipeline.py: 見積もり・バッチ作成のガード、編集／再生成、状態遷移
    │
    │ worker.enqueue("analyze" | "run_batch" | "render_video", id)
-   ├── TASK_MODE=inline : API プロセス内のスレッドプール（2 並列）
-   └── TASK_MODE=celery : Redis ──► Celery ワーカー（mvf.analyze / mvf.run_batch / mvf.render_video）
+   ├── TASK_MODE=inline : API プロセス内のスレッドプール（タスク種別ごと: run_batch 2・render_video 2・analyze 1）
+   └── TASK_MODE=celery : Redis ──► Celery ワーカー（キュー mvf: mvf.analyze / mvf.render_video、
+                                    キュー mvf_batch: mvf.run_batch）
                                           │（同じタスク本体: app/pipeline.py）
                                           ▼
    analyze      : services/audio_analysis.py（librosa）
    run_batch    : storyboard.py（Claude / テンプレート）→ variation.py（素材プール・動画プラン）
                   → providers/（mock / library / veo / runway / kling）で素材生成
-                    （予算チェック・リトライ・キャンセル・キャッシュ再利用）
+                    （試行ごとの予算予約・リトライ・キャンセル・キャッシュ再利用・ジョブ ID の保存と再開）
    render_video : subtitles.py（ASS）→ render.py（FFmpeg）→ quality.py（ffprobe 検証）
    │
    ▼
@@ -75,7 +83,9 @@ npm install
 cp .env.example .env.local    # NEXT_PUBLIC_API_BASE_URL（既定 http://localhost:8000）
 ```
 
-テーブルは API の起動時に自動作成されます（MVP のためマイグレーションはまだありません）。
+テーブルは API の起動時に自動作成されます。マイグレーション（Alembic）はまだありません。既存のデータベースに
+後から追加された **NULL 可の列**（例: `projects.artist_aliases`）は、起動時に `ALTER TABLE … ADD COLUMN` で自動的に
+追加します（`db.add_missing_columns`）。それ以外のスキーマ変更は手動での対応が必要です。
 
 ## 環境変数（`backend/.env`）
 
@@ -109,19 +119,26 @@ API キーはサーバー側でのみ読み込み、どの API レスポンス�
 # API（inline モード: ワーカー不要）
 cd backend && .venv/bin/uvicorn app.main:app --port 8000
 
-# Celery モード（API とワーカーに同じ設定を渡す）
+# Celery モード（API とワーカーに同じ設定を渡す。SECRET_KEY は必ず同じ固定値にする）
 cd backend && TASK_MODE=celery .venv/bin/uvicorn app.main:app --port 8000
 cd backend && TASK_MODE=celery .venv/bin/celery -A app.worker.celery_app worker -l info -c 2
+# （任意）素材生成専用のワーカー。-Q なしのワーカーは mvf と mvf_batch の両方を処理します
+cd backend && TASK_MODE=celery .venv/bin/celery -A app.worker.celery_app worker -l info -Q mvf_batch -c 2 -n batch@%h
 
 # フロントエンド
 cd frontend && npm run dev    # http://localhost:3000
 ```
 
 - inline モードは単一プロセス前提です（`uvicorn --workers` を増やさないでください）。API が途中で落ちた場合、
-  再起動時に未完了の解析・バッチ・レンダリングを自動で再開します。
-- Celery モードではタスクを `acks_late` で受け取るため、ワーカーが落ちても Redis から再配信されます。
+  再起動時に未完了の解析・バッチ・レンダリングを自動で再開します。素材生成中だった API ジョブは、保存済みの
+  ジョブ ID でポーリングを再開し、新しく送信し直しません（二重課金の防止）。
+- Celery モードで落ちたワーカーの処理は、Redis の再配信（visibility timeout 6 時間）を待たず、
+  **ワーカーの起動時（`worker_ready`）の回収処理**が拾います。10 分（`STALE_TASK_SEC`）以上動きのないバッチ・
+  レンダリング・生成中の素材が対象です。つまり、落ちたワーカーを再起動する（または別のワーカーを起動する）と再開します。
+  後から重複して届いたタスクは、素材・レンダリングの「確保」（条件付き UPDATE）により何もしません。
   Redis に接続できないときは API が 503（`queue_unavailable`）を返し、バッチは `failed` になります。
-- レンダリングは 1 本（15 秒）あたり CPU 2 コアで約 20〜30 秒です。並列数は inline / Celery とも 2 です。
+- レンダリングは 1 本（15 秒）あたり CPU 2 コアで約 20〜30 秒です。inline のレンダリング並列数は 2、
+  Celery では `-c` で指定したワーカー数です。
 
 ## テスト
 
@@ -159,21 +176,23 @@ cd backend && .venv/bin/python scripts/e2e_demo.py --api http://localhost:8000
 
 失敗が 1 つでもあると終了コード 1 になります。
 
-2026-10-11 にこの開発コンテナで実行した結果を示します。inline モードと Celery モード（`celery -A app.worker.celery_app worker -c 2`）の両方で成功しました。以下は Celery モードの出力です。
+2026-10-11 にこの開発コンテナで、レビュー指摘の修正後に実行した結果を示します。inline モードと Celery モード
+（`celery -A app.worker.celery_app worker -c 2`、API とワーカーに同じ `SECRET_KEY`）の両方で成功しました（inline: 合計 173.6 秒）。
+以下は Celery モードの出力です。
 
 ```
 +----------+-----------+-------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
 | video    | style     | grade       | start | shots | MB   | resolution | vcodec | fps  | acodec | dur(s) | lag(ms) | corr  | quality | result |
 +----------+-----------+-------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
-| A#1      | cinematic | natural     | 24.03 | 5     | 7.9  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| A#2      | simple    | teal_orange | 24.03 | 7     | 7.2  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| A#3      | fade      | warm_film   | 24.03 | 6     | 9.2  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| B#1      | karaoke   | warm_film   | 24.03 | 7     | 12.9 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| B#2      | karaoke   | cool_night  | 44.02 | 6     | 9.7  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| B#3      | karaoke   | natural     | 0.03  | 5     | 13.5 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.999 | pass    | OK     |
-| A-edit#1 | karaoke   | natural     | 24.03 | 5     | 12.6 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| A#1      | cinematic | cool_night  | 24.03 | 7     | 7.2  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| A#2      | simple    | natural     | 24.03 | 7     | 8.1  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| A#3      | fade      | teal_orange | 24.03 | 6     | 7.2  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| B#1      | karaoke   | teal_orange | 24.03 | 7     | 10.5 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| B#2      | karaoke   | warm_film   | 22.04 | 5     | 12.2 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| B#3      | karaoke   | cool_night  | 8.03  | 6     | 12.2 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.999 | pass    | OK     |
+| A-edit#1 | karaoke   | cool_night  | 24.03 | 7     | 9.4  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
 +----------+-----------+-------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
-timings: analysis 4.1s, batch_a 66.9s, batch_b 57.6s, edit_rerender 20.4s, total 153.5s
+timings: analysis 6.5s, batch_a 69.9s, batch_b 63.6s, edit_rerender 26.4s, total 171.5s
 E2E PASSED: 7/7 videos verified
 ```
 
@@ -204,23 +223,74 @@ npx playwright test          # 起動済みのサーバーを使い、なけれ�
 | Kling | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
 
 API モデルの料金は公式料金表の調査値（`verified: false`）です。実キーでの検証が済むまでは概算として扱ってください。
-Runway を使う場合は、利用規約に従い UI に「Powered by Runway」の表記が必要です。
+Runway の利用規約に従い、UI には runwayml.com へのリンク付きで「Powered by Runway」を表示します（Runway の
+プロバイダーカード、Runway 選択時の詳細、Runway を使ったジョブの設定欄・動画一覧・プレビュー、Runway の素材、
+設定画面のプロバイダー一覧）。表示が必須かどうかの最終確認は `docs/VIDEO_PROVIDERS.md` §6 の未確定事項です。
 
-## 制限事項・未検証事項
+## 検証済み / 未検証
 
-- 実際の AI 動画生成（Veo / Runway / Kling）と Claude による絵コンテ生成は、API キーがないため未検証です
-  （HTTP モック・SDK モックでのみテスト）。
-- Whisper による歌詞整列は、この環境ではモデルを取得できない（huggingface.co に接続不可）ため 503 になります。
-  整列ロジックは偽の文字起こしでのみテスト済みです。
+この開発コンテナ（4 CPU、API キーなし、huggingface.co・api.klingai.com・api.dev.runwayml.com へ接続不可）で
+2026-10-11 に確認した範囲です。
+
+**検証済み（実際に動かして確認）**
+
+- バックエンドの全テスト（PostgreSQL 16 の `mvf_test`）。外部 API は HTTP モック（respx）と SDK モックのみ。
+- `scripts/e2e_demo.py`: inline モードと Celery モード（実ワーカー、API とワーカーで同じ `SECRET_KEY`）の両方で、
+  解析 → 歌詞 → 生成ガード → mock / library のバッチ → 編集・再レンダリング → MP4・ZIP のダウンロード → ffprobe と
+  元曲との相互相関による検証まで（下の「E2E デモ」）。
+- Playwright のブラウザ E2E（本番ビルド `next start` と inline モードの API）: 画面操作による一連の流れ、
+  library での生成、歌詞スタイル「自動」、Runway 表記（Runway は設定済みと見せかけた応答で確認）。
+- フロントエンドの `npm run typecheck` / `npm run lint` / `npm run build`。
+- FFmpeg による 1080×1920 / H.264 / AAC / 30fps の出力、歌詞の焼き込み、品質チェック、Range 対応の署名付き URL。
+- Celery ワーカーの強制終了（kill -9）からの回収（ワーカー再起動時の回収処理で完了まで進むこと）は、修正時に一度確認。
+
+**未検証（キー・接続先がないため）**
+
+- Veo / Runway / Kling への実際の生成リクエスト、料金、課金の挙動（失敗したジョブが課金されるか、出力 URL の有効期限など）。
+  ジョブ ID の保存と再開（`on_submitted` / `resume`）も HTTP モックでのみ確認しています。
+- Claude による絵コンテ生成・翻訳（Anthropic SDK を偽の HTTP 応答で呼ぶテストのみ）。
+- Whisper による歌詞整列（モデルを取得できないため 503。整列ロジックは偽の文字起こしでのみテスト）。
+- 実 S3 / MinIO / R2（moto のみ）。H.264 を再生できる Chrome での動画再生（同梱の Chromium は H.264 非対応のため、
+  E2E では VP9 に変換したコピーで再生を確認）。
+
+## 外部 API に送るデータ
+
+- 動画生成 API（Veo / Runway / Kling）には、英語のプロンプト（世界観・シーンの説明）と、画像→動画のときは入力画像を送ります。
+  楽曲・歌詞の本文は送りません。
+- `ANTHROPIC_API_KEY` を設定すると、絵コンテの生成に **楽曲名・ムード・目的・カスタム世界観・歌詞の本文・楽曲解析の要約**
+  を Anthropic（Claude）に送ります。アーティスト名と別表記は「描写してはいけない名前」としてのみ送り、
+  他の項目からは取り除きます。送信したくない場合はキーを設定しないでください（テンプレートで絵コンテを作ります）。
+  詳しくは `docs/RIGHTS_AND_SECURITY.md` §5 を参照してください。
+
+## 制限事項・既知の問題
+
+- 実際の AI 動画生成（Veo / Runway / Kling）と Claude による絵コンテ生成は、上記のとおり未検証です。
+- Whisper による歌詞整列は、この環境ではモデルを取得できないため 503 になります。
 - 楽曲解析・自動タイミングの精度は、合成したデモ曲でのみ確認しています。実際の楽曲（特に 4/4 拍子以外）では精度が下がります。
-- 実 S3 / MinIO / R2 は未検証です（moto のみ）。
-- 見積もり（`POST /estimate`）は乱数シードを固定せずに計画するため、実際のバッチの新規生成数と多少ずれることがあります。
-  バッチ作成時の見積もりは、実際に使うシードで計算します。Claude を使う場合は絵コンテが変わるため、さらに差が出ます。
+  拍の位置は約 30 ms 遅れて検出される傾向があります。
+- 見積もり: 生成画面は 1 つのシードで見積もりとバッチ作成を行うため、確認ダイアログの金額は実際の計画と一致します。
+  API を直接呼んでシードを省略した場合、`POST /estimate` はシード 0 で計画し、バッチはランダムなシードで実行するため、
+  新規生成数が多少ずれることがあります。プロバイダー比較の他モデルの金額は、キャッシュ済み素材があると過大・過小になる
+  ことがあります（選択中のモデルの金額は正確です）。
+- Claude を使う場合、同じ世界観・楽曲・歌詞の 2 回目以降のバッチは前回の Claude の絵コンテを再利用します
+  （「絵コンテを Claude で新しく作り直す」で作り直し）。初回は見積もりの絵コンテ（テンプレート）と実際の絵コンテが異なります。
+- 肖像の保護は語句ベースです。1 語だけの人名（look-alike 表現を伴わないもの）や、漢字のアーティスト名のローマ字表記は、
+  別表記に登録するか Claude を使わないと除去されません。逆に、辞書にない 2 語の地名（例: Times Square）が人名として除去される
+  ことがあります（警告が出ます）。生成された映像に実在の人物が写っていないかは、公開前に人が確認してください。
+- 映像・音声の細部: TXT の見出し行（`[サビ]` など）にも歌唱時間が割り当てられ次の行が約 1 秒遅れる、終了タグのない LRC の行は
+  間奏中も表示され続ける（空の時刻タグで終了できます）、音圧の非常に高い音源では AAC 出力でわずかにクリップする、
+  一部のカラーグレードは暗部がつぶれやすい、Ken Burns のパンは 1 ピクセル単位で動く、Claude なしの英訳（簡易辞書）では
+  一部の名詞が落ちる（警告あり）、左右反転で素材内の文字が鏡文字になる、素材の再利用率の警告は原因に関係なく同じ助言を出す。
+- 歌詞を保存し直すと行 ID が振り直されるため、行を追加・削除すると、動画ごとに調整した歌詞タイミングが別の行に付くことがあります。
+- 音源や歌詞を差し替えても権利確認はリセットされません（チェックリストは自己申告です）。
+- プロジェクトを削除すると、その費用記録も削除されます（ダッシュボードの利用額の合計が減ります）。
+- キャンセルした動画・素材も一覧に表示され、素材の「使用本数」に数えられます。
+- 選択した動画の ZIP（およびトークン認証時のジョブ ZIP）は、ブラウザのメモリに読み込んでから保存します（進捗表示・中断なし）。
 - 素材キャッシュはプロジェクト内でのみ共有します。
 - ZIP は無圧縮のストリーミング（データディスクリプタ付き）です。`unzip` と Python の `zipfile` では確認済みですが、
   一部の古い解凍ツールは非対応の可能性があります。
 - HDR / 10bit 素材のトーンマッピングには対応していません。
-- マイグレーション（Alembic）、レート制限、監査ログ、マルチテナント課金はありません。
+- Alembic マイグレーション、レート制限、監査ログ、マルチテナント課金はありません。
 
 ## ロードマップ
 

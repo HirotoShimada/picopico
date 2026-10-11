@@ -5,11 +5,12 @@ import Link from "next/link";
 import * as React from "react";
 
 import { editorHref } from "@/components/generate/links";
-import { colorGradeName, COLOR_GRADES_FALLBACK, toLyricStyleId } from "@/components/generate/text-style";
+import { colorGradeName, COLOR_GRADES_FALLBACK, lyricStyleChoiceName } from "@/components/generate/text-style";
 import { LYRIC_STYLES_FALLBACK } from "@/components/lyrics/lyric-styles";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useCapabilities } from "@/hooks/use-capabilities";
@@ -37,10 +38,12 @@ export interface VideoPreviewDialogProps {
   onVideoIdChange: (videoId: string | null) => void;
   /** Refresh signed URLs after an expiry. */
   onReload: () => void;
+  /** Batches generated with Runway: their videos show the 「Powered by Runway」 attribution. */
+  runwayBatchIds?: ReadonlySet<string>;
 }
 
 /** Large 9:16 preview with quality report, download, favourite, regenerate and edit. */
-export function VideoPreviewDialog({ videos, videoId, onVideoIdChange, onReload }: VideoPreviewDialogProps) {
+export function VideoPreviewDialog({ videos, videoId, onVideoIdChange, onReload, runwayBatchIds }: VideoPreviewDialogProps) {
   const { data: capabilities } = useCapabilities();
   const actions = useVideoActions();
   const [regenerateOpen, setRegenerateOpen] = React.useState(false);
@@ -64,9 +67,7 @@ export function VideoPreviewDialog({ videos, videoId, onVideoIdChange, onReload 
 
   const plan = video?.plan;
   const busy = video ? actions.pending[video.id] : undefined;
-  const lyricStyle = plan
-    ? (capabilities?.lyric_styles ?? LYRIC_STYLES_FALLBACK).find((style) => style.id === toLyricStyleId(plan.lyric_style))?.name_ja ?? plan.lyric_style
-    : null;
+  const lyricStyle = plan ? lyricStyleChoiceName(plan.lyric_style, capabilities?.lyric_styles ?? LYRIC_STYLES_FALLBACK) : null;
 
   return (
     <>
@@ -157,9 +158,15 @@ export function VideoPreviewDialog({ videos, videoId, onVideoIdChange, onReload 
                   </div>
 
                   {video.error ? (
-                    <Alert tone="danger" title="エラー">
-                      {video.error}
-                    </Alert>
+                    video.status === "done" ? (
+                      <Alert tone="warning" title="前回の動画を表示しています">
+                        {video.error}
+                      </Alert>
+                    ) : (
+                      <Alert tone={video.status === "cancelled" ? "neutral" : "danger"} title={video.status === "cancelled" ? "キャンセル" : "エラー"}>
+                        {video.error}
+                      </Alert>
+                    )
                   ) : null}
 
                   {plan && plan.shots ? (
@@ -168,8 +175,12 @@ export function VideoPreviewDialog({ videos, videoId, onVideoIdChange, onReload 
                       <Row label="歌詞スタイル" value={lyricStyle} />
                       <Row label="カラー" value={colorGradeName(plan.color_grade, capabilities?.color_grades ?? COLOR_GRADES_FALLBACK)} />
                       <Row label="ショット" value={`${plan.shots.length} カット${plan.transition === "crossfade" ? "（クロスフェード）" : ""}`} />
+                      {plan.substitutions ? (
+                        <Row label="代替素材" value={`${plan.substitutions} ショット（予定の素材を生成できなかったため同じジョブの素材で補完）`} />
+                      ) : null}
                     </dl>
                   ) : null}
+                  {runwayBatchIds?.has(video.batch_id) ? <PoweredByRunway /> : null}
 
                   <Separator />
                   <div className="flex flex-col gap-2">

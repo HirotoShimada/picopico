@@ -12,13 +12,14 @@ import { LyricStyleSample } from "@/components/generate/lyric-style-sample";
 import { TextStyleControls } from "@/components/generate/text-style-controls";
 import { ProjectHeader } from "@/components/layout/project-header";
 import { QualitySummary } from "@/components/videos/quality-summary";
-import { useVideoActions, videoTitle } from "@/components/videos/video-actions";
+import { rerenderErrorMessage, useVideoActions, videoTitle } from "@/components/videos/video-actions";
 import { VideoPlayer } from "@/components/videos/video-player";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ErrorState } from "@/components/ui/error-state";
 import { Field } from "@/components/ui/field";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/ui/status-badge";
@@ -27,7 +28,7 @@ import { toast } from "@/components/ui/toast";
 import { usePresets } from "@/hooks/use-capabilities";
 import { useProject } from "@/hooks/use-projects";
 import { useVideo } from "@/hooks/use-videos";
-import { apiPaths, editVideo, errorMessage } from "@/lib/api";
+import { apiPaths, editVideo } from "@/lib/api";
 import { formatDateTime, formatDuration, formatPercent } from "@/lib/format";
 import { isVideoActive } from "@/lib/status";
 import type { LyricOffset, VideoDetailOut } from "@/lib/types";
@@ -107,7 +108,10 @@ function VideoEditor({ video }: { video: VideoDetailOut }) {
   const rendering = isVideoActive(video.status);
   const songDuration = project?.analysis?.duration ?? project?.audio?.duration ?? null;
   const clipsById = React.useMemo(() => new Map(video.available_clips.map((clip) => [clip.id, clip])), [video.available_clips]);
+  // The current render (or the pending edit) contains Runway footage → attribution.
+  const usesRunway = [...base.shots, ...effective.shots].some((shot) => isRunway(clipsById.get(shot.clip_id ?? "")?.source));
   const sampleLine = linesInWindow(effective.lines, effective.start, effective.duration)[0]?.text;
+  const substituted = base.shots.filter((shot) => shot.substituted_from).length;
   const palette = presets.find((preset) => preset.id === project?.world_preset)?.palette;
 
   const updateDraft = React.useCallback((patch: (current: EditDraft) => EditDraft) => setRawDraft((current) => patch(current)), []);
@@ -226,6 +230,17 @@ function VideoEditor({ video }: { video: VideoDetailOut }) {
               {video.error}
             </Alert>
           ) : null}
+          {video.status === "done" && video.error ? (
+            <Alert tone="warning" title="前回の動画を表示しています">
+              {video.error}
+            </Alert>
+          ) : null}
+          {substituted > 0 && !rendering ? (
+            <Alert tone="neutral" title={`代替素材 ${substituted} ショット`}>
+              予定していた素材を生成できなかったショットは、同じ生成ジョブの別の素材で補っています。「ショット」タブで差し替えできます。
+            </Alert>
+          ) : null}
+          {usesRunway ? <PoweredByRunway /> : null}
           <details className="rounded-md border border-border bg-surface px-3.5 py-2.5">
             <summary className="cursor-pointer text-xs font-medium text-foreground select-none">品質チェック</summary>
             <QualitySummary report={video.quality} className="mt-3" />
@@ -260,7 +275,7 @@ function VideoEditor({ video }: { video: VideoDetailOut }) {
               ) : null}
               {saveError ? (
                 <Alert tone="danger" title="再レンダリングを開始できませんでした" className="w-full">
-                  {errorMessage(saveError)}
+                  {rerenderErrorMessage(saveError)}
                 </Alert>
               ) : null}
             </CardContent>

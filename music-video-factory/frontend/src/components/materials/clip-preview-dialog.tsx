@@ -5,6 +5,7 @@ import * as React from "react";
 
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { formatDateTime, formatDuration, formatResolution, formatUsd } from "@/lib/format";
 import { isClipActive } from "@/lib/status";
@@ -76,6 +77,7 @@ export function ClipPreviewDialog({ clip, onOpenChange, onDelete }: ClipPreviewD
                 <Row label="提供元">
                   {clipSourceLabel(clip)}
                   {clip.model ? <span className="ml-1 text-muted-foreground">（{clip.model}）</span> : null}
+                  {isRunway(clip.source) ? <PoweredByRunway className="ml-2 align-middle" /> : null}
                 </Row>
                 {clip.source !== "upload" ? <Row label="費用">{formatUsd(clip.cost_usd)}</Row> : null}
                 <Row label="使用動画">{clip.used_in_videos > 0 ? `${clip.used_in_videos}本` : "未使用"}</Row>

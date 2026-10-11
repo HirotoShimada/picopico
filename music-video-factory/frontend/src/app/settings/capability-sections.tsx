@@ -4,6 +4,7 @@ import { Bot, Captions, CircleCheck, CircleMinus, TriangleAlert } from "lucide-r
 import * as React from "react";
 
 import { Badge } from "@/components/ui/badge";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { PROVIDER_KIND_LABELS, RIGHTS_ITEMS, providerLabel } from "@/lib/constants";
 import { formatPricePerSecond, formatUsd } from "@/lib/format";
@@ -109,6 +110,7 @@ export function ProvidersSection({ capabilities }: { capabilities: CapabilitiesO
                     未検証 {unverified === provider.models.length ? "" : `${unverified}モデル`}
                   </Badge>
                 ) : null}
+                {isRunway(provider.id) ? <PoweredByRunway /> : null}
               </div>
               {provider.reason ? (
                 <p className="flex items-start gap-1.5 text-xs leading-5 text-muted-foreground">

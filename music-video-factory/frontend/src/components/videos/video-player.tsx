@@ -22,12 +22,21 @@ export interface VideoPlayerProps {
   className?: string;
 }
 
+/** Whether this browser can decode the renders (H.264 High + AAC). Chromium builds without proprietary codecs cannot. */
+function canPlayH264(): boolean {
+  if (typeof document === "undefined") return true;
+  return document.createElement("video").canPlayType('video/mp4; codecs="avc1.640028, mp4a.40.2"') !== "";
+}
+
 /**
  * 9:16 player for a rendered video (signed URL). While a (re-)render is in
- * flight it shows the status and progress over the thumbnail.
+ * flight it shows the status and progress over the thumbnail. A load error is
+ * explained: a browser without H.264 support (download instead) or a signed URL
+ * that has expired (reload).
  */
 export function VideoPlayer({ video, onReload, onTimeUpdate, videoRef, className }: VideoPlayerProps) {
   const [failedSrc, setFailedSrc] = React.useState<string | null>(null);
+  const [codecMissing, setCodecMissing] = React.useState(false);
   const rendering = isVideoActive(video.status);
   const playable = !!video.url && !rendering;
   const loadFailed = playable && failedSrc === video.url;
@@ -44,7 +53,10 @@ export function VideoPlayer({ video, onReload, onTimeUpdate, videoRef, className
           playsInline
           preload="metadata"
           className="size-full object-contain"
-          onError={() => setFailedSrc(video.url)}
+          onError={() => {
+            setCodecMissing(!canPlayH264());
+            setFailedSrc(video.url);
+          }}
           onTimeUpdate={onTimeUpdate ? (event) => onTimeUpdate(event.currentTarget.currentTime) : undefined}
           aria-label={`${videoTitle(video)} の再生`}
         />
@@ -59,8 +71,12 @@ export function VideoPlayer({ video, onReload, onTimeUpdate, videoRef, className
               <>
                 <TriangleAlert className="size-6 text-warning" aria-hidden />
                 <p className="text-sm text-foreground">動画を読み込めませんでした</p>
-                <p className="text-xs leading-5 text-muted-foreground">再生用 URL の有効期限が切れた可能性があります。</p>
-                {onReload ? (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  {codecMissing
+                    ? "このブラウザは H.264 の動画を再生できません。ダウンロードして再生するか、Chrome・Safari・Edge などで開いてください。"
+                    : "再生用 URL の有効期限が切れた可能性があります。"}
+                </p>
+                {onReload && !codecMissing ? (
                   <Button
                     size="sm"
                     variant="secondary"

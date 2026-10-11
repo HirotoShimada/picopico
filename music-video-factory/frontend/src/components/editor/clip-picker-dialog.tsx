@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Thumbnail } from "@/components/ui/thumbnail";
 import { formatDuration } from "@/lib/format";
 import type { ClipOut, ShotPlan } from "@/lib/types";
@@ -141,6 +142,7 @@ export function ClipPickerDialog({ open, onOpenChange, shotIndex, shot, clips, o
                       {candidate.prompt}
                     </span>
                   ) : null}
+                  {isRunway(candidate.source) ? <PoweredByRunway className="mt-1" /> : null}
                 </div>
               ) : null}
             </div>

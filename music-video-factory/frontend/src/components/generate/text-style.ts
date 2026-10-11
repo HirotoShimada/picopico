@@ -1,5 +1,14 @@
-import { isLyricStyleId, LYRIC_STYLE_SPECS, type LyricStyleSpec } from "@/components/lyrics/lyric-styles";
-import type { ColorGradeInfo, FontWeight, LyricStyleId, TextPosition, TextStyle } from "@/lib/types";
+import { isLyricStyleId, LYRIC_STYLE_SPECS, LYRIC_STYLES_FALLBACK, type LyricStyleSpec } from "@/components/lyrics/lyric-styles";
+import type {
+  ColorGradeInfo,
+  FontWeight,
+  LyricStyleChoice,
+  LyricStyleId,
+  LyricStyleInfo,
+  TextPosition,
+  TextStyle,
+  WorldPresetInfo,
+} from "@/lib/types";
 
 /** Text-style fields the generate page and the editor let the user override. */
 export type EditableTextStyleKey =
@@ -19,6 +28,33 @@ const FONT_WEIGHT_CSS: Record<FontWeight, number> = { bold: 700, regular: 400, l
 
 export function toLyricStyleId(value: string | null | undefined): LyricStyleId {
   return value && isLyricStyleId(value) ? value : "simple";
+}
+
+/** Batch setting value: keeps `auto` (per-video rotation), otherwise a known style id. */
+export function toLyricStyleChoice(value: string | null | undefined): LyricStyleChoice {
+  return value === "auto" ? "auto" : toLyricStyleId(value);
+}
+
+export const AUTO_LYRIC_STYLE_LABEL = "自動（動画ごとに変える）";
+
+/**
+ * Styles `lyric_style: "auto"` rotates through, video by video: the preset's
+ * recommended styles (same filter and fallback as `variation.plan_batch`).
+ */
+export function autoLyricStyles(preset: Pick<WorldPresetInfo, "lyric_styles"> | null | undefined): LyricStyleId[] {
+  const styles = (preset?.lyric_styles ?? []).filter(isLyricStyleId);
+  return styles.length > 0 ? styles : ["simple"];
+}
+
+/** Concrete style to preview a choice with: `auto` shows the first video's style. */
+export function previewStyleId(choice: LyricStyleChoice, autoStyles: readonly LyricStyleId[]): LyricStyleId {
+  return choice === "auto" ? (autoStyles[0] ?? "simple") : choice;
+}
+
+/** Display name of a lyric style setting (`auto` included; unknown ids are shown as is). */
+export function lyricStyleChoiceName(value: string, styles: readonly LyricStyleInfo[]): string {
+  if (value === "auto") return AUTO_LYRIC_STYLE_LABEL;
+  return styles.find((style) => style.id === value)?.name_ja ?? LYRIC_STYLES_FALLBACK.find((style) => style.id === value)?.name_ja ?? value;
 }
 
 /** The style defaults merged with the user's overrides (approximation of `subtitles.resolve_text_style`). */

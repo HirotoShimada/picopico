@@ -7,12 +7,20 @@ and are registered by name (``app.pipeline`` registers ``analyze``,
     register_task("analyze", analyze_project_audio)
     worker.enqueue("analyze", project_id)
 
-``TASK_MODE=inline`` runs them on a process-wide ``ThreadPoolExecutor(max_workers=2)``.
-``TASK_MODE=celery`` publishes them to Redis as Celery tasks ``mvf.<name>``
-(:data:`celery_app`, ``acks_late`` + prefetch 1); a worker runs the very same
-registered functions::
+``TASK_MODE=inline`` runs them on process-wide thread pools, one per task kind
+(:data:`INLINE_POOLS`: ``run_batch`` mostly waits on provider APIs and must not
+starve analyses and renders), other names share a pool of
+:data:`INLINE_MAX_WORKERS`. ``TASK_MODE=celery`` publishes them to Redis as
+Celery tasks ``mvf.<name>`` (:data:`celery_app`, ``acks_late`` + prefetch 1;
+``mvf.run_batch`` goes to its own queue :data:`BATCH_QUEUE`); a worker runs the
+very same registered functions::
 
-    cd backend && .venv/bin/celery -A app.worker.celery_app worker -l info -c 2
+    cd backend && .venv/bin/celery -A app.worker.celery_app worker -l info -c 2            # all queues
+    cd backend && .venv/bin/celery -A app.worker.celery_app worker -Q mvf_batch -c 2 -n batch@%h  # optional
+
+When a worker starts (``worker_ready``) it sweeps for work a crashed worker left
+behind (:func:`app.pipeline.recover_interrupted_jobs` with ``stale_after``),
+because Redis only re-delivers unacknowledged tasks after the visibility timeout.
 
 Names without a Celery task fall back to inline execution with a warning.
 """
@@ -26,7 +34,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import worker_process_init, worker_ready
+from kombu import Exchange, Queue
 
 from app.config import get_settings
 from app.services.errors import ServiceError
@@ -36,7 +45,12 @@ logger = logging.getLogger(__name__)
 TaskFn = Callable[..., Any]
 Dispatcher = Callable[[str, TaskFn, tuple[Any, ...]], Any]
 
-INLINE_MAX_WORKERS = 2
+INLINE_MAX_WORKERS = 2  # pool size for task names without their own pool
+# Inline pools per task kind: clip generation (inside run_batch) waits on remote APIs for
+# minutes, so it gets its own threads; renders use ~2 cores each; analysis is short.
+INLINE_POOLS: dict[str, int] = {"run_batch": 2, "render_video": 2, "analyze": 1}
+DEFAULT_QUEUE = "mvf"
+BATCH_QUEUE = "mvf_batch"
 
 # Registered task name -> Celery task name.
 CELERY_TASK_NAMES: dict[str, str] = {
@@ -46,7 +60,7 @@ CELERY_TASK_NAMES: dict[str, str] = {
 }
 
 _registry: dict[str, TaskFn] = {}
-_executor: ThreadPoolExecutor | None = None
+_executors: dict[str, ThreadPoolExecutor] = {}
 _executor_lock = threading.Lock()
 
 
@@ -74,12 +88,17 @@ def registered_tasks() -> dict[str, TaskFn]:
 # --- inline -------------------------------------------------------------------------------------------------------
 
 
-def _get_executor() -> ThreadPoolExecutor:
-    global _executor
+def _get_executor(name: str = "") -> ThreadPoolExecutor:
+    """The inline pool for task ``name`` (its own pool when listed in :data:`INLINE_POOLS`)."""
+    pool = name if name in INLINE_POOLS else "default"
     with _executor_lock:
-        if _executor is None:
-            _executor = ThreadPoolExecutor(max_workers=INLINE_MAX_WORKERS, thread_name_prefix="mvf-task")
-        return _executor
+        executor = _executors.get(pool)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=INLINE_POOLS.get(pool, INLINE_MAX_WORKERS), thread_name_prefix=f"mvf-task-{pool}"
+            )
+            _executors[pool] = executor
+        return executor
 
 
 def _run_logged(name: str, fn: TaskFn, args: tuple[Any, ...]) -> Any:
@@ -91,7 +110,7 @@ def _run_logged(name: str, fn: TaskFn, args: tuple[Any, ...]) -> Any:
 
 
 def _dispatch_inline(name: str, fn: TaskFn, args: tuple[Any, ...]) -> Future[Any]:
-    return _get_executor().submit(_run_logged, name, fn, args)
+    return _get_executor(name).submit(_run_logged, name, fn, args)
 
 
 def _dispatch_celery_fallback(name: str, fn: TaskFn, args: tuple[Any, ...]) -> Future[Any]:
@@ -112,9 +131,17 @@ def _make_celery_app() -> Celery:
         task_ignore_result=True,
         task_serializer="json",
         accept_content=["json"],
-        task_default_queue="mvf",
+        task_default_queue=DEFAULT_QUEUE,
+        # A worker started without -Q consumes every queue listed here; run_batch (long waits on
+        # provider APIs) has its own queue so a dedicated worker can keep renders/analyses flowing.
+        task_queues=(
+            Queue(DEFAULT_QUEUE, Exchange(DEFAULT_QUEUE, type="direct"), routing_key=DEFAULT_QUEUE),
+            Queue(BATCH_QUEUE, Exchange(DEFAULT_QUEUE, type="direct"), routing_key=BATCH_QUEUE),
+        ),
+        task_routes={CELERY_TASK_NAMES["run_batch"]: {"queue": BATCH_QUEUE}},
         broker_connection_retry_on_startup=True,
-        # Renders and paid generations can take a while; don't let Redis re-deliver early.
+        # Renders and paid generations can take a while; don't let Redis re-deliver early. Work of a
+        # crashed worker is picked up by the worker_ready sweep instead (see module docstring).
         broker_transport_options={"visibility_timeout": 6 * 3600},
         task_publish_retry_policy={"max_retries": 3, "interval_start": 0, "interval_step": 0.5, "interval_max": 2},
         worker_hijack_root_logger=False,
@@ -161,6 +188,18 @@ def _reset_db_pool_after_fork(**_kwargs: Any) -> None:
     get_engine().dispose(close=False)
 
 
+@worker_ready.connect
+def _recover_after_worker_start(**_kwargs: Any) -> None:
+    """Re-enqueue work that a crashed worker left stuck (stale rendering videos, upstream batches…)."""
+    try:
+        from app import pipeline
+
+        counts = pipeline.recover_interrupted_jobs(stale_after=pipeline.STALE_TASK_SEC)
+        logger.info("worker ready; recovery sweep: %s", counts)
+    except Exception:
+        logger.exception("worker ready: recovery sweep failed")
+
+
 def _dispatch_celery(name: str, fn: TaskFn, args: tuple[Any, ...]) -> Any:
     task_name = CELERY_TASK_NAMES.get(name)
     if task_name is None:
@@ -197,9 +236,9 @@ def enqueue(name: str, *args: Any) -> Any:
 
 
 def shutdown(wait: bool = False) -> None:
-    """Stop the inline executor (called on app shutdown)."""
-    global _executor
+    """Stop the inline executors (called on app shutdown)."""
     with _executor_lock:
-        executor, _executor = _executor, None
-    if executor is not None:
+        executors = list(_executors.values())
+        _executors.clear()
+    for executor in executors:
         executor.shutdown(wait=wait, cancel_futures=not wait)

@@ -59,8 +59,9 @@ src/
 ### API クライアント（`src/lib/api.ts`）
 
 - エンドポイントごとの関数: `listProjects`, `createProject`, `uploadAudio(id, file, { onProgress, signal })`,
-  `getAnalysis`, `updateSegment`, `updateLyrics`, `autoTimeLyrics`, `uploadClips`, `estimateBatch`,
-  `createBatch`, `getBatch`, `cancelBatch`, `downloadBatchZip`, `listVideos`, `editVideo`, `downloadVideo` など。
+  `getAnalysis`, `getWorldEstimate`, `updateSegment`, `updateLyrics`, `autoTimeLyrics`, `uploadClips`, `estimateBatch`,
+  `createBatch`, `getBatch`, `cancelBatch`, `updateBatchBudget`（`PATCH /api/batches/{id}`）, `downloadBatchZip`,
+  `listVideos`, `editVideo`, `downloadVideo` など。
 - `apiPaths` は SWR のキーを兼ねます（例: `mutate(apiPaths.project(id))`）。
 - エラーはすべて `ApiError`（`status`, `code`, `detail`, 日本語の `message`）。バックエンドに到達できない場合は
   `status === 0`（`isBackendUnreachable(error)`）。422 の検証エラーは項目名つきの日本語に変換されます。
@@ -69,8 +70,28 @@ src/
 ### SWR フック（`src/hooks`）
 
 `useProject`, `useProjects`, `useAnalysis`, `useLyrics`, `useClips`, `useBatch`, `useProjectBatches`,
-`useVideos`, `useVideo`, `useDashboard`, `useCapabilities`, `usePresets`, `useLimits`, `useHealth`,
+`useVideos`, `useVideo`, `useWorldEstimate`, `useDashboard`, `useCapabilities`, `usePresets`, `useLimits`, `useHealth`,
 `useApiToken`, `useNow`, `useHydrated`。処理中（解析中・生成中・レンダリング中）のみ自動ポーリングします。
+API トークンを変更すると、SWR のキャッシュをすべて破棄してから取得し直します（前のユーザーのデータを残さない）。
+
+### 画面ごとの補足（実装済み）
+
+- プロジェクト作成・プロジェクト情報: アーティスト名の別表記（`artist_aliases`、カンマ区切り）。生成プロンプトから除外されます。
+- 楽曲解析タブ: 「感情・世界観の推定」カード（`GET /api/projects/{id}/world-estimate`）。
+- 歌詞タブ: プレビューは同じ時刻（0.05 秒以内）に始まる行を上下に並べて表示し（カラオケのスイープは 1 行目のみ）、
+  背景ボックスのスタイルでは影を描かず縁取りを残します（レンダリング結果に合わせた近似表示）。
+  自動タイミングで何も変わらなかった場合は保存も「元に戻す」履歴の追加もしません。
+- 生成設定: 推定のおすすめ世界観（初回でプロジェクトの世界観が既定のままなら初期値に使用）、歌詞スタイル「自動」、
+  Claude 設定時の「絵コンテを Claude で新しく作り直す」（`new_storyboard`、次回には引き継がない）。見積もりとバッチ作成には
+  フォームごとに 1 つのランダムなシードを送るため、確認ダイアログの金額は実際の計画と一致します。
+- 生成ジョブ: 予算超過で止まったジョブの「予算を変更」（`PATCH /api/batches/{id}`）→ 止まった動画を再試行、
+  作り直し中（`reopened_from`）の表示と前回の停止理由（`previous_error`）、キャンセルした動画だけが残った `partial` は
+  「一部キャンセル」と表示。代替素材を使ったショット数（`plan.substitutions`）。
+- 動画一覧・プレビュー・エディター: 作り直しが失敗・キャンセルされて前回の動画に戻った場合の説明（完成済み動画の `error`）、
+  代替素材のショット（`shots[].substituted_from`）、Runway 素材の「Powered by Runway」表示。
+  再生成・編集・再試行の 422（`rights_unconfirmed` / `budget_exceeded`）には次にすべきことを添えて表示します。
+- 動画プレーヤー: 読み込みに失敗したとき、ブラウザが H.264 を再生できない場合はその旨を、そうでなければ署名付き URL の
+  期限切れとして再読み込みを案内します。サムネイルは期限切れで読み込めないと API データを取り直します（30 秒に 1 回まで）。
 
 ### プロジェクト配下のページ
 

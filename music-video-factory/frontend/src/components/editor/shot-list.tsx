@@ -78,6 +78,11 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
                 </span>
                 <span className="text-2xs text-subtle-foreground">{formatDuration(shot.duration)}</span>
                 {changed ? <Badge tone="outline">変更あり</Badge> : null}
+                {!changed && shot.substituted_from ? (
+                  <Badge tone="neutral" title="予定していた素材を生成できなかったため、別の素材で補っています">
+                    代替素材
+                  </Badge>
+                ) : null}
                 {short ? <Badge tone="warning">素材が短い</Badge> : null}
               </div>
               <span className="truncate text-2xs text-muted-foreground">
@@ -92,7 +97,7 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
                   <RotateCcw aria-hidden />
                 </Button>
               ) : null}
-              <Button variant="secondary" size="xs" onClick={() => onSwap(index)}>
+              <Button variant="secondary" size="xs" onClick={() => onSwap(index)} aria-label={`ショット ${index + 1} の素材を差し替え`}>
                 <Replace aria-hidden />
                 差し替え
               </Button>

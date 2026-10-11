@@ -25,7 +25,7 @@ export function RegenerateDialog({ open, onOpenChange, title, onConfirm }: Regen
         if (!next) setNewClips(false);
       }}
       title={`「${title}」を再生成しますか？`}
-      description="同じ設定のまま、ショットの順番・切り出し位置・開始位置・色味を変えた別バリエーションを作り、この動画を置き換えます。"
+      description="開始位置・歌詞スタイル・手動で調整した歌詞タイミングと文字設定はそのままに、ショットの組み合わせ・順番・切り出し位置を変えた別バリエーションを作り、この動画を置き換えます（色味は自動設定の場合のみ変わります）。新しい動画が完成するまでは今の動画を表示します。"
       confirmLabel="再生成する"
       onConfirm={() => onConfirm(newClips)}
     >
@@ -33,7 +33,7 @@ export function RegenerateDialog({ open, onOpenChange, title, onConfirm }: Regen
         <div className="flex flex-col gap-0.5">
           <Label htmlFor="regenerate-new-clips">新しい素材も生成する</Label>
           <p className="text-xs leading-5 text-muted-foreground">
-            オフの場合は生成済みの素材だけで組み直します。オンにすると新規生成を行うため、外部 API のプロバイダーでは費用が発生します。
+            オフの場合は生成済みの素材だけで組み直します（費用なし）。オンにすると新しい素材を生成するため、外部 API のプロバイダーでは費用が発生し、生成ジョブの予算上限を超える場合は開始できません。
           </p>
         </div>
         <Switch id="regenerate-new-clips" checked={newClips} onCheckedChange={setNewClips} />

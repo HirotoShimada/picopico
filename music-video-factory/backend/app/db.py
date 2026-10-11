@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from typing import Annotated, Any
 
 from fastapi import Depends
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -91,7 +91,41 @@ DbSession = Annotated[Session, Depends(get_db)]
 
 
 def init_db(bind: Engine | None = None) -> None:
-    """Create all tables (MVP: no migrations yet)."""
+    """Create all tables, then add columns newer versions introduced (MVP: no Alembic yet)."""
     import app.models  # noqa: F401  (registers the mappers on Base.metadata)
 
-    Base.metadata.create_all(bind=bind or engine)
+    target = bind or engine
+    Base.metadata.create_all(bind=target)
+    add_missing_columns(target)
+
+
+def add_missing_columns(bind: Engine) -> list[str]:
+    """Additive schema upgrade: ``ALTER TABLE … ADD COLUMN`` for nullable model columns an existing table lacks.
+
+    ``create_all`` never alters existing tables, so a database created by an
+    older version would miss columns added since (e.g. ``projects.artist_aliases``).
+    Only nullable columns without server-side constraints are added; anything
+    else is logged and needs a manual migration. Returns ``table.column`` names added.
+    """
+    inspector = inspect(bind)
+    existing_tables = set(inspector.get_table_names())
+    added: list[str] = []
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        present = {column["name"] for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+            if not column.nullable or column.primary_key or column.foreign_keys:
+                logger.error("column %s.%s is missing and cannot be added automatically", table.name, column.name)
+                continue
+            ddl = column.type.compile(dialect=bind.dialect)
+            preparer = bind.dialect.identifier_preparer
+            with bind.begin() as connection:
+                connection.execute(
+                    text(f"ALTER TABLE {preparer.quote(table.name)} ADD COLUMN {preparer.quote(column.name)} {ddl}")
+                )
+            added.append(f"{table.name}.{column.name}")
+            logger.warning("added missing column %s.%s (%s)", table.name, column.name, ddl)
+    return added

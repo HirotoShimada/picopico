@@ -11,6 +11,7 @@ import { ProjectHeader } from "@/components/layout/project-header";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/ui/status-badge";
@@ -19,7 +20,7 @@ import { useProjectBatches } from "@/hooks/use-batches";
 import { useVideos } from "@/hooks/use-videos";
 import { apiPaths } from "@/lib/api";
 import { formatCount, formatDateTime } from "@/lib/format";
-import { statusMeta } from "@/lib/status";
+import { batchOutcomeLabel, statusMeta } from "@/lib/status";
 import type { BatchOut, VideoOut } from "@/lib/types";
 
 import { useVideoActions, useZipDownload } from "./video-actions";
@@ -111,6 +112,10 @@ export function GalleryView({ projectId }: { projectId: string }) {
   );
   const filterBatch = sortedBatches.find((batch) => batch.id === batchFilter);
   const groups = React.useMemo(() => groupByBatch(sorted, sortedBatches), [sorted, sortedBatches]);
+  const runwayBatchIds = React.useMemo(
+    () => new Set((batches ?? []).filter((batch) => isRunway(batch.settings.provider)).map((batch) => batch.id)),
+    [batches],
+  );
 
   function setFilters(next: { batch?: string | null; fav?: boolean }) {
     const params = new URLSearchParams(searchParams.toString());
@@ -272,8 +277,11 @@ export function GalleryView({ projectId }: { projectId: string }) {
                   <h2 className="text-sm font-medium text-foreground">
                     {group.batch ? `${formatDateTime(group.batch.created_at)} の生成` : "生成ジョブ"}
                   </h2>
-                  {group.batch ? <StatusBadge kind="batch" status={group.batch.status} /> : null}
+                  {group.batch ? (
+                    <StatusBadge kind="batch" status={group.batch.status} label={batchOutcomeLabel(group.batch.status, group.batch.counts)} />
+                  ) : null}
                   <span className="text-xs text-muted-foreground tabular">{formatCount(group.videos.length)} 本</span>
+                  {runwayBatchIds.has(group.batchId) ? <PoweredByRunway /> : null}
                   <div className="ml-auto flex items-center gap-1">
                     <Button variant="ghost" size="xs" onClick={() => setFilters({ batch: group.batchId })}>
                       このジョブだけ表示
@@ -283,6 +291,8 @@ export function GalleryView({ projectId }: { projectId: string }) {
                     </Button>
                   </div>
                 </div>
+              ) : runwayBatchIds.has(group.batchId) ? (
+                <PoweredByRunway />
               ) : null}
               <ul className={GRID_CLASSES}>
                 {group.videos.map((video) => (
@@ -303,7 +313,7 @@ export function GalleryView({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      <VideoPreviewDialog videos={sorted} videoId={previewId} onVideoIdChange={setPreviewId} onReload={reloadUrls} />
+      <VideoPreviewDialog videos={sorted} videoId={previewId} onVideoIdChange={setPreviewId} onReload={reloadUrls} runwayBatchIds={runwayBatchIds} />
     </>
   );
 }

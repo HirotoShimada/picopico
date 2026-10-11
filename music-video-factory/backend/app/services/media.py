@@ -43,7 +43,9 @@ VIDEO_CONTENT_TYPES: dict[str, str] = {
 }
 
 # ffprobe demuxer names (``format.format_name`` is a comma list) accepted per upload kind.
-_AUDIO_FORMATS = frozenset({"mp3", "wav", "w64", "mov", "mp4", "m4a", "aac", "flac", "ogg", "matroska", "webm"})
+# Matroska/WebM are not accepted for songs: no allowed audio extension maps to them, and their
+# header ``Duration`` is an arbitrary number a crafted file can fake.
+_AUDIO_FORMATS = frozenset({"mp3", "wav", "w64", "mov", "mp4", "m4a", "aac", "flac", "ogg"})
 _VIDEO_FORMATS = frozenset({"mov", "mp4", "m4a", "3gp", "3g2", "mj2", "matroska", "webm"})
 
 MIN_AUDIO_SEC = 5.0
@@ -54,6 +56,7 @@ MAX_VIDEO_DIMENSION = 7680
 
 _PROBE_TIMEOUT = 60
 _FFMPEG_TIMEOUT = 120
+_DECODE_TIMEOUT = 120  # decoding MAX_AUDIO_SEC of audio takes a few seconds
 _CHUNK = 1024 * 1024
 
 
@@ -234,7 +237,11 @@ def _fmt_seconds(sec: float) -> str:
 
 
 def validate_audio_upload(path: str | os.PathLike[str], filename: str) -> dict[str, Any]:
-    """Validate an uploaded song; returns :func:`probe` output."""
+    """Validate an uploaded song; returns :func:`probe` output.
+
+    The length limits apply to the *decoded* audio (see :func:`decoded_audio_duration`);
+    ``duration`` is replaced by the decoded length when the container header is off.
+    """
     check_extension(filename, AUDIO_EXTENSIONS, "音声")
     try:
         info = probe(path)
@@ -244,7 +251,17 @@ def validate_audio_upload(path: str | os.PathLike[str], filename: str) -> dict[s
         ) from exc
     if not _format_allowed(info["format_name"], _AUDIO_FORMATS) or not info["has_audio"]:
         raise MediaValidationError("音声ストリームが見つかりません。ファイルの中身が音声データか確認してください。")
+    # The container's duration is header metadata (Matroska) or a bitrate estimate (ADTS AAC, VBR MP3):
+    # a crafted file can claim 30 s and decode for hours. The decoded length is what counts.
+    decoded = decoded_audio_duration(path, limit=MAX_AUDIO_SEC)
+    if decoded is not None and decoded > MAX_AUDIO_SEC + 0.05:
+        raise MediaValidationError(
+            f"音声が長すぎます（デコードすると{_fmt_seconds(MAX_AUDIO_SEC)}を超えます）。"
+            f"{_fmt_seconds(MAX_AUDIO_SEC)}以内の音源をアップロードしてください。"
+        )
     duration = info["duration"]
+    if decoded is not None and (duration is None or abs(decoded - duration) > max(1.0, 0.02 * decoded)):
+        duration = info["duration"] = round(decoded, 3)
     if duration is None:
         raise MediaValidationError("音声の長さを判定できませんでした。別の形式で書き出して再度お試しください。")
     if duration < MIN_AUDIO_SEC:
@@ -256,6 +273,48 @@ def validate_audio_upload(path: str | os.PathLike[str], filename: str) -> dict[s
             f"音声が長すぎます（{_fmt_seconds(duration)}）。{_fmt_seconds(MAX_AUDIO_SEC)}以内の音源をアップロードしてください。"
         )
     return info
+
+
+_COUNT_RATE = 8000  # Hz; decoded audio is resampled to mono s16 at this rate and the samples are counted
+
+
+def decoded_audio_duration(path: str | os.PathLike[str], *, limit: float) -> float | None:
+    """Seconds of audio the first audio stream really decodes to, counting at most ``limit`` seconds.
+
+    The stream is decoded and resampled (like the analysis does) and the
+    samples are counted, so neither header metadata nor timestamps (ADTS
+    frames that switch sample rate mid-stream undercount them) can hide
+    extra audio. Decoding stops as soon as ``limit`` is exceeded; a value
+    above ``limit`` means "longer than that". Returns ``None`` when nothing
+    could be decoded. Raises :class:`MediaValidationError` on a timeout.
+    """
+    import time
+
+    cmd = [
+        FFMPEG, "-nostdin", "-v", "error", "-i", os.fspath(path), "-map", "0:a:0", "-vn",
+        "-ac", "1", "-ar", str(_COUNT_RATE), "-f", "s16le", "-",
+    ]  # fmt: skip
+    max_bytes = int((limit + 0.5) * _COUNT_RATE * 2)
+    deadline = time.monotonic() + _DECODE_TIMEOUT
+    total = 0
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError as exc:
+        raise ServiceError("ffmpeg が見つかりません。サーバーに FFmpeg をインストールしてください。") from exc
+    try:
+        assert proc.stdout is not None
+        while chunk := proc.stdout.read(_CHUNK):
+            total += len(chunk)
+            if total > max_bytes:
+                break
+            if time.monotonic() > deadline:
+                raise MediaValidationError(
+                    "音声のデコードがタイムアウトしました。ファイルが破損している可能性があります。"
+                )
+    finally:
+        proc.kill()
+        proc.wait()
+    return total / (_COUNT_RATE * 2) if total else None
 
 
 def validate_video_upload(path: str | os.PathLike[str], filename: str) -> dict[str, Any]:

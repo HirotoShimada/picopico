@@ -39,6 +39,7 @@ from app.services.providers.base import (
     ProgressCallback,
     ProviderCancelled,
     ProviderModel,
+    SubmitCallback,
     VideoProvider,
     notify_progress,
 )
@@ -371,6 +372,7 @@ class MockProvider(VideoProvider):
         timeout: float = 900,
         on_progress: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        on_submitted: SubmitCallback | None = None,  # no remote job: never called
     ) -> ClipResult:
         model = self.get_model(req.model)
         available, reason = self.is_available()

@@ -151,3 +151,37 @@ def test_delete_project_removes_rows_and_files(
     db.expire_all()
     for model in (Project, Asset, Clip):
         assert db.scalar(select(func.count()).select_from(model)) == 0
+
+
+def test_artist_aliases_are_stored_and_reach_the_likeness_guard(client: TestClient) -> None:
+    created = _create(client, artist_name="米津玄師", artist_aliases=["  Kenshi   Yonezu ", "kenshi yonezu", "", "Hachi"])
+    assert created["artist_aliases"] == ["Kenshi Yonezu", "Hachi"]  # cleaned and de-duplicated
+    project_id = created["id"]
+    assert client.patch(f"/api/projects/{project_id}", json={"artist_aliases": None}).status_code == 422
+    too_many = client.patch(f"/api/projects/{project_id}", json={"artist_aliases": [f"n{i}" for i in range(11)]})
+    assert too_many.status_code == 422
+    assert client.patch(f"/api/projects/{project_id}", json={"artist_aliases": ["Kenshi Yonezu"]}).status_code == 200
+
+    storyboard = client.post(
+        f"/api/projects/{project_id}/storyboard",
+        json={"preset": "custom", "custom_world": "Kenshi Yonezu singing on a Tokyo rooftop at night", "scenes": 3},
+    ).json()
+    prompts = " ".join(scene["prompt_en"] for scene in storyboard["scenes"])
+    assert "Yonezu" not in prompts and "Kenshi" not in prompts
+    assert storyboard["warnings"]
+
+
+def test_init_db_adds_columns_missing_from_an_older_database(tmp_path: Path) -> None:
+    from sqlalchemy import inspect, text
+
+    from app.db import add_missing_columns, init_db, make_engine
+
+    engine = make_engine(f"sqlite:///{tmp_path / 'old.sqlite3'}")
+    init_db(engine)
+    with engine.begin() as connection:  # a database created before artist_aliases existed
+        connection.execute(text("ALTER TABLE projects DROP COLUMN artist_aliases"))
+    assert "artist_aliases" not in {c["name"] for c in inspect(engine).get_columns("projects")}
+    init_db(engine)
+    assert "artist_aliases" in {c["name"] for c in inspect(engine).get_columns("projects")}
+    assert add_missing_columns(engine) == []
+    engine.dispose()

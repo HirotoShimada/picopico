@@ -5,6 +5,7 @@ import * as React from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { SimpleTooltip } from "@/components/ui/tooltip";
 import { formatDuration, formatResolution } from "@/lib/format";
@@ -83,6 +84,7 @@ export function ClipCard({ clip, onOpen, onDelete }: ClipCardProps) {
           <span className="truncate text-2xs text-subtle-foreground tabular">
             {[clip.width && clip.height ? formatResolution(clip.width, clip.height) : null, clip.model].filter(Boolean).join(" ・ ") || " "}
           </span>
+          {isRunway(clip.source) ? <PoweredByRunway className="mt-0.5" /> : null}
           {clip.status === "failed" && clip.error ? (
             <span className="line-clamp-2 text-2xs text-danger-foreground" title={clip.error}>
               {clip.error}

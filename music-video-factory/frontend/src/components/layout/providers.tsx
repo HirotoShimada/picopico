@@ -22,10 +22,13 @@ const swrConfig: SWRConfiguration = {
   },
 };
 
-/** Revalidates every SWR key when the API token changes (e.g. after saving it on /settings). */
+/**
+ * Drops every cached response and refetches when the API token changes (e.g. after saving it on
+ * /settings): data of the previous user must not stay on screen if the new one may not see it.
+ */
 function RevalidateOnTokenChange() {
   const { mutate } = useSWRConfig();
-  React.useEffect(() => subscribeApiToken(() => void mutate(() => true)), [mutate]);
+  React.useEffect(() => subscribeApiToken(() => void mutate(() => true, undefined, { revalidate: true })), [mutate]);
   return null;
 }
 
