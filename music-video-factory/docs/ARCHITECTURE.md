@@ -94,8 +94,8 @@ music-video-factory/
 | `MAX_AUDIO_MB` / `MAX_VIDEO_MB` | `100` / `500` | upload limits |
 | `ANTHROPIC_API_KEY` | – | enables Claude storyboard/translation |
 | `ANTHROPIC_MODEL` | `claude-opus-5-5` | |
-| `KLING_ACCESS_KEY`, `KLING_SECRET_KEY`, `KLING_API_BASE` | – | Kling official API |
-| `RUNWAY_API_KEY`, `RUNWAY_API_BASE` | – | Runway official API |
+| `KLING_API_KEY`, `KLING_ACCESS_KEY`, `KLING_SECRET_KEY`, `KLING_API_BASE` | –, –, –, `https://api-singapore.klingai.com` | Kling official API. `KLING_API_KEY` (Bearer) is the current auth; the AK/SK pair is legacy-API only (VIDEO_PROVIDERS.md §2.4) |
+| `RUNWAY_API_KEY`, `RUNWAY_API_BASE` | –, `https://api.dev.runwayml.com` | Runway official API |
 | `GOOGLE_API_KEY` (Gemini API) | – | Veo via Gemini API |
 | `DEFAULT_BUDGET_USD` | `50` | per-batch default budget cap |
 | `WHISPER_MODEL` | `small` | faster-whisper model size/path |
@@ -130,7 +130,7 @@ Errors: FastAPI default `{"detail": "..."}` with proper status codes (400 valida
 Timestamps ISO-8601. Media URLs in responses are **signed absolute URLs** (`{PUBLIC_API_BASE_URL}/media/{key}?exp=..&sig=..`) — never raw storage keys.
 
 ### 5.1 System & dashboard
-- `GET /api/health` → `{status:"ok", db:bool, redis:bool, ffmpeg:bool, task_mode, storage_backend}`
+- `GET /api/health` → `{status:"ok"|"degraded", db:bool, redis:bool, ffmpeg:bool, task_mode, storage_backend}` (no auth; never raises; `degraded` when db or ffmpeg — or redis in `celery` mode — is down)
 - `GET /api/system/capabilities` → `{providers:[ProviderInfo], claude_configured:bool, whisper:{available:bool, reason?:string}, presets:[WorldPresetInfo], lyric_styles:[{id,name_ja,description}], color_grades:[{id,name}], fonts:[{id,family,label}], durations:[15,30,60], counts:[1,3,5,10,30], limits:{max_audio_mb,max_video_mb,max_count:50,min_duration:5,max_duration:90}}`
   - `ProviderInfo = {id, name, configured:bool, available:bool, reason?:string, kind:"mock"|"library"|"api", commercial_use_note, models:[{id,name,clip_durations:[number], max_clip_duration, resolution, supports_vertical:bool, price_per_second_usd:number, price_note, verified:bool}]}`
 - `GET /api/dashboard` → `{projects:int, videos_done:int, videos_total:int, active_jobs:[{batch_id, project_id, project_title, status, done, total, failed}], recent_videos:[VideoOut], usage:{total_usd, month_usd, by_provider:[{provider, amount_usd, clips}], clips_generated:int, clips_reused:int, saved_usd:number}, pending_estimate_usd:number}`
@@ -202,11 +202,51 @@ Timestamps ISO-8601. Media URLs in responses are **signed absolute URLs** (`{PUB
 - `POST /api/videos/{id}/regenerate` `{new_clips?:bool}` → new plan variant (new seed), re-render → `VideoOut`
 - `PUT /api/videos/{id}/edit` `VideoEdit` → saves overrides, increments `render_version`, re-renders → `VideoOut`
   - `VideoEdit = {start?, lyric_style?, text_style?, color_grade?, lyric_offsets?:{line_id:{start,end}}, shots?:[{index, clip_id, src_in?}]}`
+  - Field semantics (the `/videos/[id]/edit` page relies on them; absent/`null` = keep the current value):
+    - `start`: absolute song seconds of the video start (same as `VideoPlan.start`); the duration is unchanged.
+    - `text_style`: replaces the video's text overrides (`VideoPlan.text_style`); `{}` clears them back to the lyric-style defaults.
+    - `lyric_offsets`: per-line timing for this video only, in **absolute song seconds** (same unit as `LyricLine.start/end`, hence `start ≥ 0`, `end > start`). Merged into the video's saved overrides by line id; the editor sends only the lines it changed. `GET /api/videos/{id}` returns `lyric_lines` with the overrides applied.
+    - `shots`: replaces `clip_id` of the listed shot indexes (merged; other shots keep theirs). Without `src_in` the server keeps the shot's in-point when the new clip is long enough, else clamps it.
+    - The response is the updated `VideoOut` (status `queued`/`rendering`, incremented `render_version`, `plan` already reflecting the edit).
 - `GET /api/videos/{id}/download` → 302 to signed URL with `download=1` (Content-Disposition attachment, filename `{artist}_{title}_{index:02d}.mp4` ASCII-safe + RFC5987 utf-8 name)
 - `VideoOut = {id, project_id, batch_id, index, title, status, progress, error, favorite, url?, thumbnail_url?, duration?, quality?, plan, render_version, created_at, rendered_at}`
 
+### 5.9 As implemented (integration step)
+
+All coded errors are `{"detail": <ja>, "code": <code>}`.
+
+- **System**: `GET /api/system/capabilities` requires the normal auth (`CurrentUser`; only `/api/health` is public). `providers` = `registry.provider_info()` (adds `default_model`), `presets/lyric_styles/color_grades` from `presets.*_infos()`, `fonts` = the two Noto CJK JP families, filtered by `fc-list` when available. `whisper` = `lyrics_align.whisper_available()`.
+- **Analysis (§5.3)**: rerun → 409 `audio_missing` without a song; returns the current status unchanged while `running`. `PUT /segment` → 409 `audio_missing`, 422 `segment_out_of_range` when `end` > song length (+0.05 s tolerance; a hair over is clamped). The analysis task stores the result only if `project.audio_asset_id` is still the analysed asset, and sets the default segment to the `suggested_segments` entry closest to 15 s (else `0..min(15, duration)`).
+- **Lyrics (§5.4)**: upload accepts `.txt/.lrc/.srt` (`.txt` → auto-detect), ≤ 1 MB (413), decoded with `decode_bytes_with_info` (its warnings are returned). `PUT /lyrics/lines`: word timings follow an edited line (rescaled from the words' span) and are dropped when the line text no longer matches them. `POST /auto-time`: 422 `lyrics_missing` without lines; `heuristic` uses the analysis only when `analysis_status == done`; `whisper` → 503 `whisper_unavailable` (detail = the availability reason), otherwise `auto_time` first, then `align_lines` (sync route → FastAPI threadpool). Export file name `{artist}_{title}.{lrc|srt}` (`Content-Disposition` attachment, UTF-8 `filename*`).
+- **Generation (§5.6)**:
+  - `GenerationSettings.lyric_style` also accepts `"auto"` (extension): the planner rotates the preset's recommended styles, so the videos of one batch get different styles.
+  - When the request omits `preset` / `custom_world`, the project's `world_preset` / `custom_world` are used.
+  - `POST /estimate` plans with the deterministic template storyboard (no paid Claude call) and seed 0. It adds the expected Claude cost when a key is set (6k input tokens + 1.5k + 700 per scene output). The plan warnings are prepended to `notes`.
+  - The budget is resolved as settings → project → `DEFAULT_BUDGET_USD`.
+  - `POST /batches` guard codes (all 422): `audio_missing`, `analysis_missing`, `rights_unconfirmed`, `provider_not_configured` (from `check_model`), `library_empty`, `budget_exceeded`, plus `provider_unknown_model`.
+  - Batch creation fixes a random `seed` when none is given (stored in `settings`, together with the resolved `model`), so the stored estimate describes exactly the plan the batch runs.
+  - If the queue is down: 503 `queue_unavailable` and the batch is stored as `failed`.
+  - `POST /batches/{id}/cancel`: idempotent on a cancelled batch; 409 `batch_finished` on other terminal states.
+  - `GET /batches/{id}/zip` and `POST /videos/zip`: streamed, uncompressed (`ZIP_STORED`, data descriptors, UTF-8 names = download names, de-duplicated with `_2`…). 409 `no_videos` when nothing is done.
+  - `POST /storyboard` uses Claude when configured and books an LLM `CostRecord` (batch_id null) when it costs anything.
+- **Videos (§5.7)**:
+  - `GET /videos/{id}`: `lyric_lines` = all project lines with this video's overrides applied. `available_clips` = the project's ready clips.
+  - List order: newest batch first, then `index`.
+  - `retry`: only `failed`/`cancelled` (409 `video_not_retryable`). It keeps the plan and `render_version`.
+  - `edit` / `regenerate`: 409 `video_busy` while queued/waiting/rendering. Both increment `render_version`. Re-rendering a video re-opens a finished batch (`rendering`); its status is then recomputed.
+  - `VideoEdit` semantics:
+    - `lyric_offsets` = absolute song seconds per line id, merged into `plan.lyric_offsets` (422 `lyric_line_unknown`).
+    - `text_style` replaces the plan's overrides (`{}` clears them).
+    - `color_grade` must be a `presets.COLOR_GRADES` id (422 `color_grade_unknown`).
+    - `start` must lie within `0..song − duration` (422 `start_out_of_range`).
+    - `shots[]` takes a ready clip of the same project (422 `shot_unknown`/`clip_unknown`/`clip_not_ready`). `src_in` is clamped into the clip, and `clip_key` becomes null.
+  - `regenerate {new_clips:false}` plans with `max_new_clips=0`, so it uses cached/ready footage only and spends nothing. `{new_clips:true}` sets `fresh_clips`, creates `pending` Clip rows (generated by the render task) and is refused with 422 `budget_exceeded` when the new clips would exceed the batch budget.
+  - `download` → 302 to the signed URL with `download=1&filename={artist}_{title}_{NN}.mp4`. **NN = `index + 1`** (1-based, 2 digits; deviation from the literal `{index:02d}`, so the first video is `_01`). 409 `video_not_ready`.
+  - Plan keys added by the pipeline: `lyric_offsets`, `edited`, `regenerated`, `substitutions`, shot `substituted_from`; BatchPlan `seed`.
+
 ### 5.8 Media
 - `GET /media/{key:path}?exp=&sig=[&download=1&filename=]` (NOT under /api; no auth header needed — the HMAC signature is the capability). Local storage only; supports HTTP Range (video seeking). S3 backend returns presigned URLs instead.
+- `exp` is rounded up to a window of `ttl/10` (≤ 5 min), so repeated responses carry identical URLs and the browser cache works while the UI polls (a URL stays valid for `ttl` … `ttl + window` seconds).
 
 ## 6. Service contracts (pure functions, no DB access)
 
@@ -244,6 +284,12 @@ Times are **absolute seconds in the song**. Text is preserved exactly (strip onl
 - `lyrics_parse.to_lrc(lines) -> str`, `to_srt(lines) -> str`
 - `lyrics_timing.auto_time(lines, analysis, start=None, end=None, overwrite_timed=False) -> tuple[list[LyricLine], list[str]]` — heuristic: find vocal-active regions from `analysis.vocal_activity` (+ energy) within [start,end] (default whole song), distribute untimed lines proportionally to text length (characters, spaces ignored), snap line starts to the nearest beat (≤0.25 s), min line duration 1.0 s, no overlaps, `source="heuristic"`, `confidence≈0.3`. Also fill `words` with per-character (JA) / per-word (Latin) times by even split (karaoke style needs them).
 - `lyrics_align.whisper_available() -> tuple[bool, str|None]`; `lyrics_align.align_lines(audio_path, lines, language="ja", model_size=settings.WHISPER_MODEL, start=None, end=None) -> tuple[list[LyricLine], list[str]]` — faster-whisper with word timestamps; align recognized chars to user lines with sequence matching on normalized text (NFKC, kana-folded, punctuation/space removed); **never replace user text**; lines without a confident match keep heuristic timing and get a warning. Raises `WhisperUnavailable` when the model can't be loaded.
+- As implemented (compatible additions; ids are `l001`, `l002`, … in time order for LRC/SRT, text order for TXT; parsed lines have `confidence: null`):
+  - `decode_bytes` order: UTF-8-BOM → UTF-16-BOM → UTF-8 → CP932 (⊇ Shift_JIS) or EUC-JP, whichever reads as more plausible Japanese → UTF-8 with U+FFFD; data containing NUL raises `LyricsParseError`. `decode_bytes_with_info(data) -> DecodedText(text, encoding, warnings)` returns the warning for the replacement fallback (use it in the upload route).
+  - LRC: `[mm:ss]`, `[mm:ss.x|xx|xxx]`, `[mm:ss:xx]`; only known metadata keys (`ti ar al au by length offset re ve la …`) are dropped, so TXT headings like `[Chorus: …]` are not; a positive `[offset:+ms]` makes lyrics earlier; empty timed lines end the previous line; the last line ends at start+4 s (or its last word end, capped by `[length:]`); lines without a time tag are kept untimed (warning); a warning lists lines held > 15 s. SRT: `<i>/<b>/<font>`/`{\…}` formatting tags are removed (warning); text after a blank line inside a cue stays with that cue (warning); cues are sorted by time; optional hours/millis and `WEBVTT` headers accepted. TXT: bracket-only heading lines (`[サビ]`, `【…】`) are kept but warned about.
+  - `to_lrc(lines, *, include_words=False, metadata=None)`: writes an empty `[mm:ss.xx]` end tag when a line ends before the next one starts (and after the last line) so ends survive a round trip; untimed lines are written without a tag; `include_words` writes enhanced `<mm:ss.xx>` word tags. `to_srt` skips untimed lines (a missing end becomes the next start, else start+4 s).
+  - `auto_time`: vocal activity (fallback: `loudness.rms_db`) is smoothed and hysteresis-thresholded relative to the whole song; runs are cut at pauses ≥ 0.2 s into phrase units (gaps < 0.6 s count as breaths inside a region); a small DP assigns each run of untimed lines (between kept lines, inside `[start, end]`) to units — one line may span several units, several lines may share one (split at the weakest activity), spurious units may be skipped — comparing voiced duration with the expected duration from text length (spaces/punctuation ignored, kanji ≈ 1.5 morae, Latin words by syllables). Gaps < 0.5 s between consecutive lines are closed. Lines spread evenly for lack of vocal activity get `confidence 0.15` and a warning. With a window, `overwrite_timed` re-times only lines whose start lies inside it. Helpers: `text_units(text)`, `line_weight(text)`, `fill_words(text, start, end)` (word texts are exact substrings of the line, in order). Demo song: mean start error 0.036 s.
+  - `align_lines(..., transcriber=None)`: `transcriber(audio_path, *, language, start, end, initial_prompt) -> [(word, start, end)]` in song seconds replaces faster-whisper (tests/other engines). Matching is a semi-global Needleman–Wunsch alignment (not greedy `difflib`, which mis-maps repeated choruses); substituted characters take the time of the recognized character they align with; missing ones are inter/extrapolated at the line's pace; a line needs ≥ 40 % exactly matched characters (`confidence` = that ratio). Unmatched lines keep their timing unless it collides with aligned neighbours or is missing, in which case they are re-spread in the gap (`source="heuristic"`, `confidence 0.1`). With a window only untimed lines and lines starting inside it are aligned. Call `auto_time` first so unmatched lines have heuristic timing. `whisper_available(model_size=None)` uses `local_files_only` (≈0.4 s, no network; failures cached 5 min; `reset_whisper_cache()`); `WHISPER_MODEL` may be a size/repo id in the local HF cache or a CTranslate2 model directory. Audio is decoded with FFmpeg (16 kHz mono) because `faster_whisper.decode_audio` is incompatible with the installed PyAV 19.
 
 ### 6.3 Creative: presets, prompting, storyboard
 - `presets.WORLD_PRESETS: dict[str, WorldPreset]` with ids `cinematic, emotional, urban_night, nostalgic, nature, dark, dreamy, documentary, custom`. `WorldPreset = {id, name_ja, name_en, description_ja, look_en (style/lighting/lens/film stock words), palette:[hex×3], scene_types:[ids], camera_moves:[ids], color_grades:[grade ids], negative_en}`.
@@ -262,6 +308,11 @@ Times are **absolute seconds in the song**. Text is preserved exactly (strip onl
 }
 ```
   Claude call: Python SDK 1.x, `client.beta.messages.create(model=settings.ANTHROPIC_MODEL, max_tokens=16000, betas=["server-side-fallback-2026-07-01"], fallbacks="default", output_config={"format":{"type":"json_schema","schema":...}, "effort":"low"}, system=..., messages=[...])`; parse the first text block as JSON; handle `stop_reason == "refusal"` / API errors (typed exceptions: `anthropic.RateLimitError`, `APIStatusError`, `APIConnectionError`…) by falling back to the template generator with a warning. Template generator is deterministic for a given seed and produces varied scenes from preset vocab. Every `prompt_en` passes through `sanitize_prompt` with the artist name forbidden. Record LLM cost from `usage` (Opus 5.5: $4/MTok in, $20/MTok out).
+
+  As implemented (additions; the shapes above are unchanged):
+  - **presets**: `WorldPreset` also has `lighting_en, lens_en, film_en, atmosphere_en` (`look_en` = their join), `palette_en, palette_ja, camera_angles, lyric_styles` (recommended, best first), `protagonists` / `locations` (`[{en, ja}]`, fictional adults only). `SCENE_TYPES[id]` adds `desc_ja`, `has_subject`, `energy` (`low|mid|high`); `prompt_en`/`desc_ja` are templates with `{subject}`/`{place}`. `CAMERA_MOVES[id].energy`. `COLOR_GRADES[id]` adds `name_en`, `description_ja`; grades are **colour-only point filters** (`eq`, `colorbalance`, `colortemperature`, `curves`, `hue`, `vibrance`) because `render.py` adds vignette/grain per grade and bakes point-filter runs into a LUT; 12 ids = the 8 above + `golden_hour, neon_night, forest_moody, lavender_haze`. Note: FFmpeg 6.1 `colorbalance=…:pl=1` collapses bright saturated colours to grey — not used (regression-tested). `LYRIC_STYLES[id].default_position`. Helpers: `get_preset(id)` (unknown → cinematic), `preset_infos()`, `color_grade_infos()`, `lyric_style_infos()` (ready-made lists for `GET /api/system/capabilities`), `SECTION_LABELS_JA`.
+  - **prompting**: `sanitize_prompt(text, *, forbidden_names, max_chars=1000)` — result ends with `"<body>. fictional characters only, no real or identifiable people, no celebrities, no text, no captions, no watermark."`, is idempotent and never longer than `max_chars` (Runway's `promptText` limit is 1000; the body is shortened at a sentence/clause boundary with a warning). Names match case/width/spacing-insensitively (`米津 玄師` = `米津玄師`, `Taylor-Swift`), Latin names on word boundaries; JA terms include 本人 (not 日本人), 芸能人, 有名人, そっくり, 激似, 実在の人物, モノマネ…. `translate_to_english(text, *, use_claude=True, client=None)`; sources `passthrough|claude|glossary`. Helpers: `strip_forbidden_names`, `glossary_translate`, `glossary_keywords`, `make_claude_client()`, `first_text_block(response)`, `prompt_body_budget(max_chars)`.
+  - **storyboard**: extra keyword `client=None` (inject an Anthropic client; tests use the real SDK over `httpx2.MockTransport`). `n_scenes=None|0` → 8, clamped to 1..30. Extra keys: storyboard `preset`, `seed`; scenes `start`/`end` (song seconds of the slot, null when unknown); template `world_bible.protagonist_ja/location_ja`. Prompts are ≤ 950 chars (room for the planner's "Alternate take …" suffix) and always contain `consistency_tokens_en` verbatim. When a Claude call was made but failed (refusal / unparsable JSON), the result is `source: "template"` **with** that call's `model`, `usage` and `cost_usd` (tokens are billed) — the pipeline should book an LLM CostRecord whenever `cost_usd > 0`. The artist name reaches Claude only in `forbidden_likeness.names` (stripped from title/mood/purpose/custom world/lyrics). anthropic 1.13 accepts `betas`, `fallbacks` and `output_config` as native kwargs of `client.beta.messages.create` (no `extra_body`). Cost: `claude_cost_usd(model, usage)` (cache writes 1.25× input, cache reads $0.20/MTok on Opus 5.5).
 
 ### 6.4 `variation.plan_batch(...)`
 ```python
@@ -291,17 +342,33 @@ Rules: shot boundaries land on beats (shot length = 1 or 2 bars from analysis BP
 Pool size K by `reuse`: `max_variety` → one clip per shot (capped 60), `balanced` → ≈ shots_total/3, `economy` → ≈ shots_total/6, at least min(shots_per_video, #scenes), at most `max_new_clips` new ones. Reuse ready clips whose `cache_key` matches (and, for `library`, all uploaded clips are the pool). Videos differ by start, shot order, in-points, flips, zoom/pan, color grade and (if `auto`) lyric style variant. `variety_score` = unique (clip, src_in bucket, flip) combos / shots_total; warn in Japanese when < 0.35 (e.g. 「素材の再利用率が高いため、動画間の映像バリエーションが限定的です」).
 `cache_key = sha256(provider|model|prompt|negative|duration|aspect|seed)`.
 
+As implemented (additions):
+- `make_cache_key(provider, model, prompt, negative, duration, aspect, seed)` formats `duration` as `%.3f` and `seed=None` as an empty string; `aspect` is `"9:16"`. The **model must be the resolved model id**: pass `settings["model"]` filled in (the planner otherwise asks `providers.registry` for the default, falling back to `"default"`).
+- Clip seeds derive from (prompt, negative, take) — not from the batch seed — so a later batch with the same storyboard hits the cache. `settings["fresh_clips"]: true` (optional extension) mixes the batch seed in to force new footage (e.g. `regenerate {new_clips:true}`).
+- Pool: K = `pool_target_size(reuse, shots_total, shots_per_video, n_scenes)` (all policies capped at 60). Takes are allocated to scenes in proportion to how much of the planned videos falls into the scene's section (plus its lyric line being on screen), with a floor so other scenes still appear; take ≥ 1 adds an "Alternate take …" hint. Cache hits inside K are free; further cache hits beyond K are added for variety at no cost (so `unique_clips` can exceed K). Every new (paid) clip is used by at least one shot; unused specs are dropped and keys renumbered `c01…`.
+- `clip_specs[]` extra keys: `variant` (take index), `section`, `hints: {preset, palette, scene_type, camera_move, section}` (for the mock provider's `ClipRequest.scene`). Shots extra keys: `scene_id`, `section`. For cache hits the shot already carries `clip_id` (= `existing_clip_id`).
+- BatchPlan extra top-level `warnings: [ja]` (song shorter than duration, start clamped, no chorus found, `max_new_clips` limiting the pool…); `stats` extra `pool_target`, `clip_duration`, `shots_per_video: [int]`. Library mode: `clip_specs = []`, `stats.reused_clips = unique uploads used`, `new_clips = 0`.
+- Shot lengths: "short"/"long" = 1/2 bars; when a bar is < 1.5 s the whole-bar counts that fit are used (e.g. 2/4 bars), when only one whole-bar length fits (slow songs) the other is a half-bar multiple. Whole-bar shots cut on downbeats whenever one is in range, else on the nearest beat; without beats the BPM grid is used. Shots never repeat the same clip back-to-back (pool ≥ 2); clips needing slow motion below 0.6× are avoided; generated clips keep a 0.1 s margin at both ends.
+- `lyric_style: "auto"` (not in GenerationSettings) is tolerated and rotates the preset's `lyric_styles`. Errors: `ServiceError` 422 with codes `analysis_missing`, `library_empty`, `storyboard_empty`, `no_clips` (`max_new_clips=0` and no cache hit).
+
 ### 6.5 `cost.py`
 `PRICING: dict[provider_id, dict[model_id, ModelPricing]]` with `price_per_second_usd`, `clip_durations`, `default_duration`, `source_url`, `as_of`, `verified` (filled from docs/VIDEO_PROVIDERS.md research; mock/library = 0).
 `estimate(settings: dict, plan_stats: dict, provider: str, model: str, *, cached_clips: int, llm_estimate_usd: float, budget_limit_usd: float|None) -> dict` **Estimate**:
 ```json
 {"provider":"mock","model":"mock-v1","clip_duration":5,"videos":3,"shots_total":24,"unique_clips":8,"new_clips":8,"cached_clips":0,
  "price_per_second_usd":0.0,"video_generation_usd":0.0,"llm_usd":0.01,"total_usd":0.01,
- "naive_total_usd":0.0,"savings_usd":0.0,              // naive = every shot generated fresh
+ "naive_total_usd":0.01,"savings_usd":0.0,             // naive = every shot generated fresh (+ llm, like total_usd)
  "budget_limit_usd":50,"within_budget":true,"variety_score":0.8,"variety_warning":null,
  "comparison":[{"provider","model","total_usd","configured"}],   // same plan priced on every provider/model
  "notes":["ja strings"]}
 ```
+As implemented:
+- `PRICING` is built from the providers' `ProviderModel`s (the single source of truth for prices): `ModelPricing{provider, model, name, price_per_second_usd, clip_durations, default_duration, max_clip_duration, source_url, as_of, verified, text_to_video, price_note}`. Helpers: `get_pricing(provider, model=None)` (default model when empty; unknown ids → `ServiceError` 422 `provider_unknown`/`provider_unknown_model`), `clip_cost_usd(provider, model, seconds)`, `TARGET_CLIP_SEC = 5.0`: the clip length the pipeline should request, i.e. `provider_clip_duration = provider.clip_duration_for(model, TARGET_CLIP_SEC)`, which equals `ProviderModel.default_duration`.
+- Math: `video_generation_usd = new_clips × clip_duration × $/s`. `clip_duration` is `plan_stats.clip_duration`, else the model default; `library` → 0. Then `total_usd = video_generation_usd + llm_usd`, `naive_total_usd = shots_total × clip_duration × $/s + llm_usd` (one fresh clip per shot, no cache), and `savings_usd = naive_total_usd − total_usd`. Money is rounded to 4 decimals.
+- Budget: `budget_limit_usd=None` falls back to `settings["budget_limit_usd"]`; if that is also `None` there is no cap and `within_budget` is true. The caller resolves settings → project → `DEFAULT_BUDGET_USD`.
+- `comparison`: the selected model (its cache-aware total) plus every model that can generate from text (`text_to_video`), in registry order. Image-only `gen4_turbo` and `library` appear only when selected. Other models are priced as generating all `unique_clips` at their own `default_duration`, because cached clips are model-specific. `configured` = `provider.check_model(model)[0]`. Rows also carry `name, selected, clip_duration, price_per_second_usd, video_generation_usd, verified`.
+- Additive Estimate fields: `configured` (the selected model is usable now), `as_of`, `pricing_verified`, `pricing_source_url`.
+- `notes` (ja): cost breakdown, cache reuse, savings vs. naive (amount and %), LLM share, variety warning, budget overrun, why the selected provider/model cannot start, and for API providers the "price as of … (unverified)" disclaimer.
 
 ### 6.6 Rendering (`subtitles.py`, `render.py`, `quality.py`)
 **TextStyle** (all optional overrides; defaults depend on lyric_style):
@@ -309,8 +376,10 @@ Pool size K by `reuse`: `max_variety` → one clip per shot (capped 60), `balanc
 {"font_family":"Noto Sans CJK JP","font_weight":"bold|regular|light","font_size":64,"primary_color":"#FFFFFF","highlight_color":"#4DA3FF",
  "outline_color":"#000000","outline_width":3,"shadow":1,"position":"bottom|center|top","bg_opacity":0.0,"letter_spacing":0,"max_chars_per_line":14}
 ```
+Units (as implemented): `font_size` is the ASS `Fontsize` on the 1080×1920 canvas (Noto CJK glyphs are ≈0.69×font_size wide; scaled proportionally for other sizes); `letter_spacing`/`outline_width`/`shadow` are px on that canvas; `max_chars_per_line` counts full-width characters (half-width Latin ≈ 0.6) and is a soft limit — text never leaves the safe width (the line shrinks to ≥60 % instead); `font_weight` also accepts `thin|medium|semibold|black` (mapped to the fontconfig families `Noto Sans CJK JP Light/Medium/Black`, `Noto Serif CJK JP …`); colours `#RGB|#RRGGBB|#RRGGBBAA`. Invalid values fall back to the style default. In `karaoke`, `primary_color` is the not-yet-sung colour and `highlight_color` the sweep colour.
 - `subtitles.build_ass(lines, *, style_id, text_style, segment_start, duration, width=1080, height=1920, beats=None) -> str` — times relative to the segment; lines clipped to [0,duration]; horizontal text only (no rotation tags); Japanese-aware line wrapping (prefer breaking at spaces/punctuation, never inside a word for Latin, max 2 lines); **Instagram Stories safe area**: no text above y=270 px or below y=1920−380 px (top 14%, bottom ~20%); `position` maps to top/center/bottom inside that area.
   Styles: `simple` (white bold sans, thin outline, soft shadow), `cinematic` (serif `Noto Serif CJK JP`, smaller, semi-transparent black box via BorderStyle=3, low position), `minimal` (light weight, small, letter-spacing, no outline, subtle shadow), `karaoke` (`\kf` per word/char from `words`, else even split; highlight_color sweep), `fade` (`\fad(in,out)` with in/out aligned to nearby beats when given, ~250–400 ms).
+  Implementation notes: every visual line is its own `Dialogue` (`\an8\pos`), so line pitch and the block's extents (outline, shadow, box padding, fade rise) are computed exactly and kept inside the safe area; soft shadows are a blurred copy on layer 0; user text is escaped (`{`/`}` → `\{`/`\}`, a WORD JOINER after `\` so `\N`/`\h` stay literal, newlines → spaces). Default positions: `simple`/`cinematic`/`karaoke` bottom, `minimal`/`fade` center. Helpers: `safe_area(width, height)`, `wrap_text(...)`, `layout_text(...)`, `resolve_text_style(style_id, text_style)`, `escape_ass_text(text)`.
 - `render.render_video(spec: RenderSpec, progress_cb=None) -> RenderResult`
 ```python
 @dataclass
@@ -321,13 +390,16 @@ class RenderSpec:
     lyric_lines: list[dict]; lyric_style: str; text_style: dict; color_grade: str
     output_path: str; work_dir: str; beats: list[float] | None = None
     width: int = 1080; height: int = 1920; fps: int = 30
-    crf: int = 18; preset: str = "medium"; audio_bitrate: str = "256k"
+    crf: int = 18; preset: str = "veryfast"; audio_bitrate: str = "256k"   # preset: see measurements below
     audio_fade_in: float = 0.15; audio_fade_out: float = 0.8; transition: str = "cut"
 @dataclass
 class RenderResult: output_path: str; thumbnail_path: str; duration: float; size_bytes: int; log_tail: str
+                    timings: dict[str, float] = {}   # prepare/encode/finalize/total seconds (added)
 ```
   Each shot: trim → speed → scale-to-cover → animated crop (Ken Burns zoom/pan, cheap `crop` expressions; avoid `zoompan`) → optional hflip → fps 30, setsar 1; concat (cut) or `xfade` (crossfade 0.3 s, durations compensated so total = duration); color grade; subtle film grain/vignette per grade; burn ASS with `subtitles=...:fontsdir=` (libass; escape paths). Audio: single encode from the **original file** (`-ss audio_start -t duration`), `afade` in/out, AAC-LC, keep source sample rate if 44.1/48 kHz else 48 kHz, stereo. Output: H.264 High, yuv420p, 1080×1920, 30 fps CFR, `-movflags +faststart`, GOP 60. Thumbnail: JPEG 540×960 from ~1 s. `progress_cb(fraction, stage)` best-effort (parse `-progress pipe:1`).
+  As implemented: thumbnail is written next to the output as `<output stem>_thumb.jpg`; the MP4 is written to a hidden `.<stem>.part.mp4` and renamed on success. Progress stages: `prepare` (0.0) → `encode` (0.03–0.95) → `thumbnail` → `done` (1.0); an exception raised by `progress_cb` kills FFmpeg and propagates (use it for cancellation). Shot chains work in planar RGB (`gbrp`; per-frame `scale=eval=frame` for the zoom + `crop` x/y expressions for the pan, so no double resampling), the source matrix is honoured (`in_color_matrix`, untagged HD → BT.709) and the output is tagged BT.709. Clips shorter than needed are slowed down to ≥60 % speed, else looped (`-stream_loop`); rotation (autorotate) and non-square SAR are honoured. Colour grades: `presets.COLOR_GRADES[id].ffmpeg_filter` when importable and valid (checked once with a tiny FFmpeg run), else `render.FALLBACK_COLOR_GRADES` (same ids, cheap `colorchannelmixer`+`curves`). Runs of expensive point filters (`colorbalance`, `colortemperature`, …) are baked into a 36³ `.cube` (Hald CLUT sampled through the same chain) and applied with `lut3d` (≈4× faster, mean error <1/255); vignettes become a cached mask frame + `blend=multiply`; grain is a soft half-resolution luma noise layer (`blend=grainmerge`), only for film-look grades. Measured in the dev container (2 cores via `taskset`, 15 s 1080×1920, CRF 18): veryfast ≈21–31 s per video (31 s with grain), faster ≈28 s, medium ≈34 s; SSIM vs. lossless is identical across presets (0.969), hence the `veryfast` default. The render writes `filtergraph.txt`, `lyrics.ass`, `ffmpeg.log` (and `grade_*.cube`) into `work_dir`. `scripts/render_sample.py` renders one 15 s sample per lyric style into `backend/var/samples/`.
 - `quality.validate_output(path, *, expected_duration, width=1080, height=1920, fps=30) -> dict` **QualityReport** `{"passed": bool, "checks":[{"name","passed","value","expected"}], "loudness_lufs": float|null, "black_ratio": float}` — checks: container mp4, video h264 yuv420p, size, fps 30, duration ±0.1 s, audio aac present, audio duration matches, faststart (moov before mdat), black frames ratio < 0.5 (`blackdetect`), integrated loudness (`ebur128`, informational only).
+  Check names: `container, video_codec, pix_fmt, resolution, fps, duration, audio_codec, audio_duration, faststart, black_frames, loudness` (`readable` alone when ffprobe cannot read the file); `passed` = all checks passed (`loudness` always passes). Never raises for bad media.
 
 ### 6.7 Video providers (`services/providers/`)
 ```python
@@ -351,6 +423,67 @@ class VideoProvider(ABC):
 - `library`: no generation; the planner maps scenes onto uploaded clips. `generate` raises `ProviderError` (not used). Always configured.
 - `kling`, `runway`, `veo`: official REST APIs per docs/VIDEO_PROVIDERS.md (submit → poll with backoff → download). Configured only with keys. Retryable vs non-retryable errors distinguished (429/5xx/timeouts retryable). Unit-tested with `respx` mocks only (marked `verified: false` until a real key test passes).
 
+As implemented:
+
+**Dataclass additions.** Each has a default, so constructing with only the contract fields still works.
+- `ProviderModel.default_duration`: the clip length for a 5 s request.
+- `ProviderModel.text_to_video` / `image_to_video`: `text_to_video=False` marks image-only models such as Runway `gen4_turbo`. They are never used for text-only requests.
+- `ProviderModel.source_url`, `as_of`, and `params` (adapter request settings).
+- `ProviderInfo` adds `default_model`. Its model entries add `default_duration`, `text_to_video`, `image_to_video`, `as_of` and `source_url`.
+
+**`VideoProvider` extras.**
+- `get_model(id|None)` returns the default model when the id is empty. An unknown id raises `ProviderError(code="provider_unknown_model")`.
+- `is_available()`: for `mock`, whether FFmpeg is present.
+- `check_model(model, *, has_image=False) -> (ok, reason_ja)` checks keys (including Kling's per-model keys) and image requirements. Batch creation should answer 422 when it returns false.
+- `require_model(...)` is the raising form of `check_model`. Missing credentials, including Kling's per-model key via `model_credentials_problem(model)`, raise `ProviderNotConfigured`. An unsuitable request raises `ProviderError(code="provider_bad_input")`.
+- `info()` builds the `ProviderInfo` dict.
+- Constructor kwargs `sleep`, `clock`, `poll: PollConfig` and `transport` exist for tests.
+
+**`generate(...)` behaviour.**
+- `on_progress(fraction, stage)` reports stages `submitted|queued|running|downloading|done`. It is best effort and its exceptions are swallowed.
+- `cancel_check()` is checked before submit, between polls and during download.
+- Errors:
+  - Missing keys → `ProviderNotConfigured`.
+  - Rejected before any job exists → `ProviderError(retryable)`. Retryable: 429, 5xx, 408, timeouts and connection errors. Not retryable: other 4xx.
+  - Failures after submission → `ProviderTaskError(ProviderError)` with `external_job_id` and `failure_code`.
+  - Cancel → `ProviderCancelled(ProviderTaskError)` with `code="provider_cancelled"`, not retryable.
+  - Timeout → `ProviderTaskError(code="provider_timeout", retryable=True)`.
+  - Runway tasks are DELETEd on cancel or timeout. Veo and Kling have no cancel API, so an abandoned job may still be billed.
+- Up to 5 consecutive transient poll errors are tolerated.
+- Downloads:
+  - Written atomically and capped at `MAX_VIDEO_MB`.
+  - Credentials go only to the API origin, never to redirect targets.
+  - The file is probed with ffprobe.
+- `ClipResult` contents:
+  - `width/height/duration` are the probed values.
+  - `cost_usd` is Runway's `cost.credits × $0.01` when reported, otherwise price × requested (snapped) duration.
+  - `raw` holds `requested_duration` and the submit/final status, never secrets.
+
+**Mock.**
+- `ClipRequest.scene` is the planner's `clip_specs[].hints` (`preset, palette, scene_type, …`).
+- Output: 24 fps, 1080×1920 for 9:16 (16:9 and 1:1 also work). Any duration up to 20 s, rounded to whole frames.
+- Encoding: H.264 Constrained Baseline (`ultrafast`), no audio, bit-exact for the same (prompt, negative, seed, scene).
+- Speed: about 2 s per 5 s clip (1.6–2 MB) on the 4-core dev box.
+- With `image_path`, the still image becomes the background.
+
+**Models.** All API prices are `verified: false`, as of 2026-10-11.
+
+| provider | model | notes |
+|---|---|---|
+| veo | `veo-3.1-lite-generate-preview` | default; 720p; 4/6/8 s; $0.05/s |
+| veo | `…@1080p` | 8 s; $0.08/s |
+| veo | `veo-3.1-fast-generate-preview` | $0.10/s |
+| veo | `veo-3.1-generate-preview` | $0.40/s |
+| runway | `gen4.5` | default; 2–10 s; $0.12/s |
+| runway | `gen4_turbo` | image-only; $0.05/s |
+| runway | `veo3.1_fast` | 4/6/8 s; silent; $0.10/s |
+| kling | `kling-3.0` | new API with `KLING_API_KEY`; 3–15 s; $0.112/s |
+| kling | `kling-v2-5-turbo` | legacy API (AK/SK HS256 JWT); 5/10 s; $0.042/s; the default when only AK/SK are set |
+
+**Registry.**
+- Order: mock, library, veo, runway, kling.
+- `get_provider(unknown)` → `ProviderNotConfigured(code="provider_unknown")` (422).
+
 ## 7. Pipeline & jobs (`pipeline.py`, `worker.py`)
 
 Task functions (idempotent, take IDs, open their own DB session):
@@ -360,6 +493,38 @@ Task functions (idempotent, take IDs, open their own DB session):
 - `TASK_MODE=inline`: `worker.enqueue(name, *args)` submits to a process-wide `ThreadPoolExecutor(max_workers=2)`; `celery`: `.delay()`. Same task bodies either way. Celery app name `mvf`, tasks `mvf.analyze`, `mvf.run_batch`, `mvf.render_video`. Run worker: `celery -A app.worker.celery_app worker -l info -c 2`.
 - Cancellation: batch `cancelled` → pending/waiting videos → `cancelled`; running tasks check between steps.
 
+As implemented (`app/pipeline.py`, `app/worker.py`):
+- **Shared helpers** (used by the routers): `preview_batch(db, project, settings) -> BatchPreview{settings, storyboard, plan, estimate, budget_limit_usd}`, `create_batch(db, project, settings) -> Batch` (guards above), `cancel_batch`, `reopen_batch`, `prepare_retry`, `apply_video_edit(db, video, VideoEdit)`, `regenerate_video_plan(db, video, new_clips=)`, `recompute_batch_status(db, batch_id)`, `effective_lyric_lines(lines, overrides)`, `retime_line`, `download_filename`, `generate_clip(clip_id, cancel_check=)`, `resolve_plan_clips(db, plan, project_id, preferred=)`, `llm_cost_record`, `recover_interrupted_jobs()`.
+- **Planning** (`run_batch`, status `planning`):
+  - The storyboard comes from Claude when `ANTHROPIC_API_KEY` is set, else the template. Library mode has no storyboard.
+  - An LLM `CostRecord` is booked whenever `cost_usd > 0`, and that amount goes into `batch.cost_usd`.
+  - `plan_batch` uses the settings seed and the project's ready clips. The clip cache is **per project**.
+  - Clip rows are created **at planning time**: `pending`, `source = provider id`, `params = {batch_id, key, seed, duration, variant, section, hints, aspect_ratio}`. Shot `clip_id`s are resolved immediately and stored in `plan.clip_specs[].clip_id`.
+  - Cache hits get a `CostRecord(cached=true, amount 0, units = clip seconds, unit_price = model price)`.
+  - Videos are created as `waiting_clips`. All of this is one transaction.
+- **Generation** (`generating_clips`):
+  - Before generating, the whole plan is priced. If `spent + new clips` would exceed `estimate.budget_limit_usd`, the batch goes to `budget_exceeded` and nothing is generated.
+  - Clips are then generated by `CLIP_CONCURRENCY = 2` threads.
+  - Before each clip starts, `BudgetGuard.reserve(price × duration)` checks committed spend plus in-flight reservations against the limit. A refusal cancels that clip, and after the in-flight clips finish the batch becomes `budget_exceeded`: pending clips and waiting videos are `cancelled`.
+  - Retries: up to `MAX_CLIP_ATTEMPTS = 3` for retryable `ProviderError`s, with backoff `RETRY_BACKOFF_SEC = (5, 20)` (cancellable). `ProviderCancelled` → clip `cancelled`. `ProviderNotConfigured`, non-retryable errors and unexpected errors → `failed`, with a Japanese `error`. `ProviderTaskError` keeps `external_job_id` / `failure_code`.
+  - A successful clip is stored as `Asset(kind=clip)` + `Asset(kind=thumbnail)`. It gets a `CostRecord(video_generation, units = raw.requested_duration)`, and its cost is added to `batch.cost_usd` with an atomic `UPDATE`.
+  - `cancel_check` = `CancelWatcher` (throttled DB read of the batch/video status, every ≤ 1 s).
+- **Start rendering**: shots whose clip is not ready (failed, cancelled or deleted) are **substituted** with ready clips. The batch's own pool is tried first, then the project's clips; candidates are ranked by same scene, then least used, avoiding the neighbouring shot's clip. `src_in` is clamped. A video with no usable clip at all → `failed`. Waiting videos → `queued`. The batch → `rendering`, then one `render_video` is enqueued per video.
+- **Render**:
+  - Pending clips of the plan are generated first; this is how regenerate creates new clips. Missing clips are substituted.
+  - The video moves to `rendering` (`attempts + 1`). Inputs are read via `storage.local_path` (local backend) or `fetch_to` into `WORK_DIR/renders/<id>-*`.
+  - `render.render_video` gets the effective lyric lines, `analysis.beats` and the plan's style, grade and transition. Its `progress_cb` writes `progress` (0.02–0.95, ≤ 1/s) and raises when the batch or video was cancelled; FFmpeg is then killed and the video becomes `cancelled`.
+  - Then `quality.validate_output`. A failed report → video `failed` with the failed checks listed in `error`, and the report kept in `video.quality`.
+  - Otherwise the MP4 and thumbnail are uploaded as `Asset(kind=render)` (filename = download name) + `Asset(kind=thumbnail)`, and the video → `done`. Assets of the previous render are deleted.
+  - The work directory is always removed, and the batch status is recomputed.
+- **Concurrency safety**: status changes use conditional `UPDATE … WHERE status IN (…)`, so a cancel is never overwritten. `recompute_batch_status` locks the batch row (`SELECT … FOR UPDATE`). It acts only on `rendering|completed|partial|failed` batches; `cancelled` and `budget_exceeded` are final until a video is re-rendered.
+- **Recovery**: in `TASK_MODE=inline` the API lifespan calls `recover_interrupted_jobs()`. It re-enqueues `queued`/`running` analyses, upstream batches (`run_batch` resumes: a stored plan skips planning, and `pending`/`generating` clips are regenerated) and queued/waiting/rendering videos of `rendering` batches. It also deletes task scratch directories (`WORK_DIR/{analysis,clips,renders,whisper}/*`) older than `STALE_WORK_SEC` (2 h) left by a killed process. Inline mode is therefore single-process.
+- **Celery** (`worker.py`):
+  - `celery_app = Celery("mvf", broker=REDIS_URL)` with `task_acks_late`, `task_reject_on_worker_lost`, `worker_prefetch_multiplier=1`, JSON only, `task_ignore_result`, queue `mvf`, Redis `visibility_timeout` 6 h, a short publish retry policy and `imports=("app.pipeline",)`.
+  - Tasks `mvf.analyze` / `mvf.run_batch` / `mvf.render_video` call the registered bodies (`worker.CELERY_TASK_NAMES`).
+  - `worker_process_init` disposes the inherited DB pool.
+  - `DISPATCHERS["celery"]` publishes with `apply_async`. Names without a Celery task fall back to inline with a warning. A broker error raises `worker.QueueUnavailable` (`ServiceError`, 503 `queue_unavailable`). Routes turn it into a failed analysis, batch or video plus a 503; the audio upload still returns 201, with `analysis_status = failed`.
+
 ## 8. Frontend (Next.js 16, `frontend/`)
 
 - Talks to the backend directly from the browser: `NEXT_PUBLIC_API_BASE_URL` (default `http://localhost:8000`). Optional `NEXT_PUBLIC_API_TOKEN` is NOT used; in `token` auth mode the user pastes a token on `/settings` (stored in localStorage) and the client sends `Authorization: Bearer`.
@@ -367,9 +532,36 @@ Task functions (idempotent, take IDs, open their own DB session):
 - UI kit: shadcn/ui-style components hand-written in `src/components/ui/` (shadcn registry is unreachable here) on `radix-ui`, `class-variance-authority`, `clsx`, `tailwind-merge`, `lucide-react`; data fetching with `swr` (polling while jobs run).
 - Design: dark only. Background `#0a0a0a`, surfaces `#111113`/`#18181b`, borders `#27272a`, text `#e4e4e7`/muted `#a1a1aa`, **blue `#3b82f6` only for primary actions/progress**, red for errors, no decorative animation. Desktop-first; large 9:16 previews. Japanese UI copy.
 - Routes: `/` dashboard · `/projects/new` · `/projects/[id]` (tabs: 楽曲解析 / 歌詞 / 素材 / 権利確認) · `/projects/[id]/generate` · `/batches/[id]` progress · `/projects/[id]/videos` gallery · `/videos/[id]/edit` editor · `/settings` providers & usage.
+- Foundation modules (implemented; pages build on these — details in `frontend/README.md`):
+  - `src/lib/api.ts`: one function per §5 endpoint (e.g. `getProject`, `uploadAudio(id, file, {onProgress, signal})`, `estimateBatch`, `createBatch`, `getBatch`, `editVideo`, `downloadVideo`, `downloadBatchZip`), `apiPaths` (= SWR keys), `ApiError {status (0 = backend unreachable), code, detail, message (ja)}`, `isBackendUnreachable`, `errorMessage`, token helpers. `GET /api/batches/{id}` is typed `BatchDetailOut` (= `BatchOut` + `videos`, `clips`).
+  - `src/lib/types.ts` (§5/§6 shapes), `status.ts` (ja labels + `isBatchActive` …), `format.ts`, `constants.ts` (`RIGHTS_ITEMS`, `WORLD_PRESETS_FALLBACK`, `DEFAULT_GENERATION_SETTINGS`, `DEFAULT_LIMITS`).
+  - `src/hooks`: `useProject(s)`, `useAnalysis`, `useLyrics`, `useClips`, `useBatch`, `useProjectBatches`, `useVideos`, `useVideo`, `useDashboard`, `useCapabilities`/`usePresets`/`useLimits`, `useHealth`, `useApiToken`, `useNow`, `useHydrated` — each polls only while work is in flight.
+  - Layout: `AppShell` (sidebar + top bar, wraps pages in `<Suspense>`), `PageHeader`, `ProjectHeader({projectId, active, batchId?, actions?})`, `ProjectNav({projectId, active: "assets"|"generate"|"jobs"|"videos", batchId?})`. The 生成ジョブ item links to `/batches/{batchId ?? latest batch of the project}` (disabled while the project has no batch).
+  - UI kit in `src/components/ui/` incl. `StatusBadge({kind: "batch"|"video"|"clip"|"analysis", status})`, `ErrorState({error, onRetry})`, `EmptyState`, `StatCard`, `Thumbnail` (9:16), `FileDropzone`, `WorldPresetPicker`, `ConfirmDialog`, `toast()`, `RadioCards`, `NumberInput`, `ColorInput`.
+- Generation, progress, gallery and editor pages (implemented):
+  - `/projects/[id]/generate` (`src/components/generate/`): the form starts from the latest batch's settings (else the project's preset); live estimate = debounced (500 ms) `POST …/estimate`, requested only once the analysis is done; `POST …/storyboard` preview; readiness checks link to `/projects/[id]?tab=analysis|lyrics|materials|rights`; 生成開始 → `POST …/batches` (confirmation dialog when `total_usd > 0`) → `/batches/[id]`.
+  - `/batches/[id]` (`src/components/batch/`): polls `GET /api/batches/{id}` every 2 s while the batch **or any of its videos/clips** is active (a retried video in a finished batch keeps polling); cancel, per-video retry, batch ZIP.
+  - `/projects/[id]/videos` (`src/components/videos/`): filters in the URL (`?batch=<id>&fav=1`), grouped by job, preview dialog (`<video>` on the signed URL, quality report), favourite, regenerate, single download, selection ZIP (`POST /api/videos/zip`).
+  - `/videos/[id]/edit` (`src/components/editor/`): diff-only draft → `PUT …/edit` (semantics in §5.7), then polls `GET /api/videos/{id}` until the new `render_version` is done. Song duration/sections for the start slider come from `GET /api/projects/{project_id}`.
+- Browser E2E: `frontend/playwright.config.ts` + `frontend/e2e/` (Playwright against the production build on :3000 and the inline-mode API on :8000; full journey with the mock provider and a library-provider run; screenshots in `frontend/e2e/screenshots/`). See `frontend/e2e/README.md`.
 
 ## 9. Rights & safety
 
 Rights checklist keys (all required before batch creation):
 `audio_rights` 音源の権利を保有、または利用許諾を得ている · `lyrics_rights` 歌詞の権利を保有、または利用許諾を得ている · `no_real_person_likeness` 実在の人物（アーティスト本人を含む）の肖像を生成しない · `model_terms_checked` 使用する動画生成モデルの利用規約・商用利用条件を確認した · `platform_terms` 投稿先（Instagram 等）の規約を確認した.
 Uploaded media is private (signed URLs only), file types are validated by content (ffprobe) not only by extension, filenames are sanitized, paths never come from user input.
+Details and the list of what is not covered yet: `docs/RIGHTS_AND_SECURITY.md`.
+
+## 10. Foundation module APIs (implemented; other modules call these)
+
+- **config**: `get_settings()` (cached; tests call `get_settings.cache_clear()`). Field names = env var names (`settings.WHISPER_MODEL`). Helpers: `settings.cors_origins`, `max_audio_bytes`, `max_video_bytes`, `is_sqlite`, `anthropic_configured`. Secret fields are excluded from `repr`. Relative dirs resolve against `backend/`; `STORAGE_DIR`/`WORK_DIR` are created on load.
+- **db**: `Base`, `SessionLocal` (`autoflush=False, expire_on_commit=False`), `get_db`, `DbSession` (Annotated dependency), `init_db(bind=None)`, `make_engine(url)`, `get_engine()`, `set_engine(engine)` (rebinds `SessionLocal`; prefer `get_engine()` over importing `engine`). SQLite enables `PRAGMA foreign_keys`.
+- **models**: exactly §4, plus `new_id()`, `utcnow()` and `StrEnum`s `AnalysisStatus`, `LyricsFormat`, `AssetKind`, `ClipSource`, `ClipStatus`, `BatchStatus`, `VideoStatus`, `CostKind`, `CostUnit`; `ACTIVE_BATCH_STATUSES`, `ACTIVE_VIDEO_STATUSES`. JSON columns are `JSONB` on PostgreSQL (`JSON` elsewhere) wrapped in `MutableDict`/`MutableList`: top-level mutations are tracked, nested ones need reassignment or `flag_modified`. Set the song via `project.audio_asset = asset` (the projects↔assets FK cycle uses `post_update`). Uploaded clips: `Clip(source="upload", provider="upload", status="ready")` with `Asset(kind="clip")` + `Asset(kind="thumbnail")`; `Video.render_version` starts at 1.
+- **storage**: `get_storage() -> Storage` (cached). `Storage.put_file(key, src_path, *, content_type=None, move=False) -> int`, `put_bytes(key, data, *, content_type=None) -> int`, `fetch_to(key, dest_path) -> Path`, `exists`, `delete` (missing ok), `delete_prefix(prefix) -> int`, `size`, `url(key, *, download=False, filename=None, ttl=None)`, `iter_bytes(key, chunk_size)`, `local_path(key) -> Path|None` (local backend only; use it to avoid copies). `make_key(project_id, kind, asset_id, ext)`, `project_prefix(project_id)`, `build_content_disposition(filename)`. Errors: `StorageKeyError`, `StorageNotFound` (→ 404 via app handler).
+- **security**: `current_user` / `CurrentUser`, `get_owned_project|clip|batch|video(db, id, user)` (404 when not owned), `sign_media_url(key, *, download=False, filename=None, ttl=None)`, `verify_media_signature(...)`, `seed_users(db)`, `hash_token`. Signature covers key, exp, download flag and filename.
+- **serializers**: `to_asset_out(asset)`, `to_clip_out(clip, *, used_in_videos=0)`, `to_clip_outs(db, clips)`, `to_video_out(video)`, `to_batch_out(db, batch, *, include_children=False)` (clips of a batch = ids found in `batch.plan.clip_specs[].clip_id|existing_clip_id` and in its videos' `plan.shots[].clip_id` — the pipeline should store those ids), `to_project_out(db, project)`, `to_project_summary(db, project)`, `to_project_summaries(db, projects)`, `rights_with_defaults`, `all_rights_confirmed`, `video_clip_ids(plan)`.
+- **schemas**: request/response models for all of §5 (`GenerationSettings`, `TextStyle`, `VideoEdit`, `LyricLine`, `LyricsUpdate`, `LyricLinesUpdate`, `AutoTimeRequest`, `SegmentUpdate`, `StoryboardRequest`, `RightsUpdate`, `VideoUpdate`, `VideoRegenerateRequest`, `VideoZipRequest`, `ProjectOut`/`ProjectSummary`, `AssetOut`, `ClipOut`, `BatchOut`, `VideoOut`/`VideoDetailOut`, `AnalysisOut`, `LyricsParseOut`, `LyricsOut`, `AutoTimeOut`, `CapabilitiesOut`, `DashboardOut`, `HealthOut`, …) plus `RIGHTS_ITEMS`/`REQUIRED_RIGHTS_KEYS`.
+- **services.errors**: each class has `status_code` (MediaValidation 400 — 413 for size, LyricsParse 400, WhisperUnavailable 503, ProviderNotConfigured 422, BudgetExceeded 422, ProviderError 502, others 500) and `code`. A `ServiceError` escaping a route becomes `{"detail": <ja message>, "code": <code>}` with that status. `RenderError(message, stderr_tail)`, `ProviderError(message, *, retryable)`, `BudgetExceeded(message, *, estimate_usd, limit_usd)`.
+- **services.media**: `probe(path)` → `{duration, has_audio, has_video (cover art excluded), width, height (display size after rotation), coded_width, coded_height, fps, rotation, codecs:{video,audio}, pix_fmt, sample_rate, channels, format_name, bit_rate, size}`; `validate_audio_upload(path, filename)`, `validate_video_upload(path, filename)`, `make_thumbnail(video, out_jpg, at=1.0, width=540)`, `sanitize_filename`, `check_extension`, `save_upload_stream` (async) / `save_upload_file` (sync), `copy_stream_limited`, `sha256_file`.
+- **worker**: `register_task(name, fn)`, `get_task`, `enqueue(name, *args)` (inline: `Future`; celery: `AsyncResult`; unregistered name: warning + `None`; broker down: `QueueUnavailable` 503), `DISPATCHERS` (`inline`, `celery`), `celery_app`, `CELERY_TASK_NAMES`, `shutdown()`. Task names: `analyze`, `run_batch`, `render_video`, registered by importing `app.pipeline` (done by `app.main` and by the Celery `imports` setting).
+- **HTTP behaviour**: `POST /api/projects` → 201. Project delete and audio replacement → 409 while a batch is active; clip delete → 409 while generating or referenced by a queued/waiting/rendering video. Upload requests are rejected with 413 from `Content-Length` before the body is read (audio: `MAX_AUDIO_MB`+1 MiB, clips: 20×`MAX_VIDEO_MB`+1 MiB, lyrics upload: 2 MiB) and per file while copying. Clip uploads are all-or-nothing.

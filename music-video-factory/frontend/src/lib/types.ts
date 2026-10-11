@@ -1,0 +1,735 @@
+/**
+ * API types mirroring ARCHITECTURE.md §5/§6 and `backend/app/schemas.py`.
+ * Timestamps are ISO-8601 strings; media URLs are signed absolute URLs.
+ */
+
+export type ISODateString = string;
+
+// --- enumerations ------------------------------------------------------------------
+
+export type AnalysisStatus = "none" | "queued" | "running" | "done" | "failed";
+export type LyricsFormat = "txt" | "lrc" | "srt";
+export type LyricsFormatInput = "auto" | LyricsFormat;
+export type LyricsExportFormat = "lrc" | "srt";
+export type LyricSource = "manual" | "lrc" | "srt" | "txt" | "heuristic" | "whisper";
+export type AssetKind = "audio" | "lyrics" | "material" | "clip" | "render" | "thumbnail" | "zip";
+export type ClipSource = "upload" | "mock" | "kling" | "runway" | "veo";
+export type ClipStatus = "pending" | "generating" | "ready" | "failed" | "cancelled";
+export type BatchStatus =
+  | "queued"
+  | "planning"
+  | "generating_clips"
+  | "rendering"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "cancelled"
+  | "budget_exceeded";
+export type VideoStatus = "queued" | "waiting_clips" | "rendering" | "done" | "failed" | "cancelled";
+export type PresetId =
+  | "cinematic"
+  | "emotional"
+  | "urban_night"
+  | "nostalgic"
+  | "nature"
+  | "dark"
+  | "dreamy"
+  | "documentary"
+  | "custom";
+export type ProviderId = "mock" | "library" | "kling" | "runway" | "veo";
+export type ProviderKind = "mock" | "library" | "api";
+export type LyricStyleId = "simple" | "cinematic" | "minimal" | "karaoke" | "fade";
+export type StartStrategy = "segment" | "chorus" | "varied" | "custom";
+export type ReuseMode = "max_variety" | "balanced" | "economy";
+export type Transition = "cut" | "crossfade";
+export type Pan = "left" | "right" | "up" | "down" | "center";
+export type FontWeight = "bold" | "regular" | "light";
+export type TextPosition = "bottom" | "center" | "top";
+export type AutoTimeMethod = "heuristic" | "whisper";
+export type SectionLabel = "intro" | "verse" | "chorus" | "bridge" | "outro" | "break";
+export type RightsKey =
+  | "audio_rights"
+  | "lyrics_rights"
+  | "no_real_person_likeness"
+  | "model_terms_checked"
+  | "platform_terms";
+
+// --- shared ------------------------------------------------------------------------
+
+export interface Segment {
+  start: number;
+  end: number;
+}
+
+export interface AssetOut {
+  id: string;
+  kind: AssetKind;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+  url: string;
+  created_at: ISODateString;
+}
+
+// --- audio analysis (§6.1) -----------------------------------------------------------
+
+export interface AnalysisSection {
+  start: number;
+  end: number;
+  label: SectionLabel | string;
+  energy: number;
+  is_chorus_candidate: boolean;
+}
+
+export interface ScoredRange {
+  start: number;
+  end: number;
+  score: number;
+}
+
+export interface EnergyRange {
+  start: number;
+  end: number;
+  energy: number;
+}
+
+export interface SuggestedSegment {
+  start: number;
+  end: number;
+  duration: number;
+  score: number;
+  reason: string;
+}
+
+export interface AudioMood {
+  energy: number;
+  tempo_class: "slow" | "mid" | "fast";
+  brightness: number;
+  mode_guess: "major" | "minor";
+  tags: string[];
+}
+
+export interface AudioAnalysis {
+  version: number;
+  duration: number;
+  sample_rate: number;
+  channels: number;
+  codec: string;
+  bit_rate: number | null;
+  bpm: number;
+  bpm_confidence: number;
+  beats: number[];
+  downbeats: number[];
+  loudness: { hop: number; rms_db: number[] };
+  waveform: { points: number; peaks: number[] };
+  sections: AnalysisSection[];
+  chorus_candidates: ScoredRange[];
+  highlights: EnergyRange[];
+  quiet_parts: Segment[];
+  suggested_segments: SuggestedSegment[];
+  vocal_activity: { hop: number; values: number[] };
+  mood: AudioMood;
+}
+
+export interface AnalysisOut {
+  status: AnalysisStatus;
+  error: string | null;
+  analysis: AudioAnalysis | null;
+  segment: Segment | null;
+}
+
+export interface AnalysisRerunOut {
+  status: AnalysisStatus;
+}
+
+export interface SegmentUpdate {
+  start: number;
+  end: number;
+}
+
+export interface SegmentOut {
+  segment: Segment;
+}
+
+// --- lyrics (§6.2) -----------------------------------------------------------------------
+
+export interface WordTiming {
+  text: string;
+  start: number | null;
+  end: number | null;
+}
+
+export interface LyricLine {
+  id: string;
+  text: string;
+  /** Absolute seconds in the song. */
+  start: number | null;
+  end: number | null;
+  words: WordTiming[] | null;
+  source: LyricSource;
+  confidence: number | null;
+}
+
+export interface LyricsUpdate {
+  text: string;
+  format?: LyricsFormatInput;
+}
+
+export interface LyricsParseOut {
+  format: LyricsFormat;
+  lines: LyricLine[];
+  warnings: string[];
+}
+
+export interface LyricsOut {
+  text: string;
+  format: LyricsFormat;
+  lines: LyricLine[];
+}
+
+export interface LyricLinesOut {
+  lines: LyricLine[];
+}
+
+export interface AutoTimeRequest {
+  method: AutoTimeMethod;
+  start?: number | null;
+  end?: number | null;
+  overwrite_timed?: boolean;
+}
+
+export interface AutoTimeOut {
+  lines: LyricLine[];
+  method_used: AutoTimeMethod;
+  warnings: string[];
+}
+
+// --- projects (§5.2) ---------------------------------------------------------------------
+
+export interface ProjectCreate {
+  title: string;
+  artist_name: string;
+  mood?: string | null;
+  purpose?: string | null;
+  notes?: string | null;
+  world_preset?: PresetId;
+  custom_world?: string | null;
+  budget_limit_usd?: number | null;
+}
+
+export type ProjectUpdate = Partial<ProjectCreate>;
+
+export interface ProjectCounts {
+  clips: number;
+  videos: number;
+  batches: number;
+}
+
+export interface ProjectOut {
+  id: string;
+  title: string;
+  artist_name: string;
+  mood: string | null;
+  purpose: string | null;
+  notes: string | null;
+  audio_asset_id: string | null;
+  audio: AssetOut | null;
+  analysis: AudioAnalysis | null;
+  analysis_status: AnalysisStatus;
+  analysis_error: string | null;
+  lyrics_text: string;
+  lyrics_format: LyricsFormat;
+  lyric_lines: LyricLine[];
+  segment_start: number | null;
+  segment_end: number | null;
+  world_preset: PresetId | string;
+  custom_world: string | null;
+  rights: Partial<Record<RightsKey, boolean>>;
+  rights_confirmed_at: ISODateString | null;
+  budget_limit_usd: number | null;
+  created_at: ISODateString;
+  updated_at: ISODateString;
+  counts: ProjectCounts;
+}
+
+export interface ProjectSummary {
+  id: string;
+  title: string;
+  artist_name: string;
+  created_at: ISODateString;
+  updated_at: ISODateString;
+  has_audio: boolean;
+  analysis_status: AnalysisStatus;
+  lyric_line_count: number;
+  video_count: number;
+  cover_url: string | null;
+}
+
+export interface RightsUpdate {
+  items: Partial<Record<RightsKey, boolean>>;
+}
+
+// --- clips (§5.5) ----------------------------------------------------------------------------
+
+export interface ClipOut {
+  id: string;
+  source: ClipSource;
+  provider: string;
+  model: string | null;
+  scene_id: string | null;
+  prompt: string | null;
+  status: ClipStatus;
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+  cost_usd: number;
+  error: string | null;
+  url: string | null;
+  thumbnail_url: string | null;
+  created_at: ISODateString;
+  used_in_videos: number;
+}
+
+// --- rendering / text style (§6.6) -----------------------------------------------------------
+
+export interface TextStyle {
+  font_family?: string | null;
+  font_weight?: FontWeight | null;
+  font_size?: number | null;
+  primary_color?: string | null;
+  highlight_color?: string | null;
+  outline_color?: string | null;
+  outline_width?: number | null;
+  shadow?: number | null;
+  position?: TextPosition | null;
+  bg_opacity?: number | null;
+  letter_spacing?: number | null;
+  max_chars_per_line?: number | null;
+}
+
+// --- generation (§5.6) --------------------------------------------------------------------------
+
+export interface GenerationSettings {
+  preset: PresetId;
+  custom_world: string | null;
+  provider: ProviderId;
+  /** Provider default when null. */
+  model: string | null;
+  /** 5..90 seconds. */
+  duration_sec: number;
+  /** 1..50 videos. */
+  count: number;
+  lyric_style: LyricStyleId;
+  text_style: TextStyle | null;
+  /** `auto` or a color grade id. */
+  color_grade: string;
+  start_strategy: StartStrategy;
+  /** Used when `start_strategy` is `custom`. */
+  start_sec: number | null;
+  reuse: ReuseMode;
+  max_new_clips: number | null;
+  budget_limit_usd: number | null;
+  seed: number | null;
+}
+
+/** Request body for estimate / batch creation: omitted fields take server defaults. */
+export type GenerationSettingsInput = Partial<GenerationSettings>;
+
+export interface StoryboardRequest {
+  preset: PresetId;
+  custom_world?: string | null;
+  scenes?: number | null;
+}
+
+export interface WorldBible {
+  summary_ja: string;
+  look_en: string;
+  protagonist_en: string;
+  location_en: string;
+  palette: string[];
+  consistency_tokens_en: string;
+}
+
+export interface StoryboardScene {
+  id: string;
+  section: string | null;
+  lyric_ref: string | null;
+  scene_type: string | null;
+  camera_angle: string | null;
+  camera_move: string | null;
+  description_ja: string;
+  prompt_en: string;
+  negative_prompt_en: string;
+  duration_hint: number | null;
+  /** Additive (§6.3): song seconds of the scene's slot, null when unknown. */
+  start?: number | null;
+  end?: number | null;
+}
+
+export interface Storyboard {
+  source: "claude" | "template";
+  model: string | null;
+  usage: { input_tokens: number; output_tokens: number } | null;
+  cost_usd: number;
+  world_bible: WorldBible;
+  scenes: StoryboardScene[];
+  warnings: string[];
+}
+
+export interface EstimateComparison {
+  provider: string;
+  model: string;
+  total_usd: number;
+  configured: boolean;
+  /** Additive (§6.5 "As implemented"). */
+  name?: string;
+  selected?: boolean;
+  clip_duration?: number;
+  price_per_second_usd?: number;
+  video_generation_usd?: number;
+  verified?: boolean;
+}
+
+export interface Estimate {
+  provider: string;
+  model: string;
+  clip_duration: number;
+  videos: number;
+  shots_total: number;
+  unique_clips: number;
+  new_clips: number;
+  cached_clips: number;
+  price_per_second_usd: number;
+  video_generation_usd: number;
+  llm_usd: number;
+  total_usd: number;
+  /** Every shot generated fresh. */
+  naive_total_usd: number;
+  savings_usd: number;
+  budget_limit_usd: number | null;
+  within_budget: boolean;
+  variety_score: number | null;
+  variety_warning: string | null;
+  comparison: EstimateComparison[];
+  notes: string[];
+  /** Additive (§6.5): the selected model is usable now. */
+  configured?: boolean;
+  as_of?: string | null;
+  pricing_verified?: boolean;
+  pricing_source_url?: string | null;
+}
+
+// --- plans (§6.4) ----------------------------------------------------------------------------------
+
+export interface ShotPlan {
+  clip_key: string | null;
+  clip_id: string | null;
+  src_in: number;
+  duration: number;
+  hflip: boolean;
+  zoom_from: number;
+  zoom_to: number;
+  pan: Pan;
+  speed: number;
+  /** Additive (§6.4). */
+  scene_id?: string | null;
+  section?: string | null;
+}
+
+export interface VideoPlan {
+  index: number;
+  title: string;
+  seed: number | null;
+  start: number;
+  duration: number;
+  lyric_style: LyricStyleId | string;
+  text_style: TextStyle;
+  color_grade: string;
+  shots: ShotPlan[];
+  transition: Transition;
+}
+
+export interface ClipSpec {
+  key: string;
+  scene_id: string | null;
+  prompt: string;
+  negative_prompt: string;
+  duration: number;
+  seed: number | null;
+  cache_key: string;
+  existing_clip_id: string | null;
+  clip_id?: string | null;
+}
+
+export interface BatchPlanStats {
+  videos: number;
+  shots_total: number;
+  unique_clips: number;
+  new_clips: number;
+  reused_clips: number;
+  variety_score: number;
+  variety_warning: string | null;
+}
+
+export interface BatchPlan {
+  clip_specs: ClipSpec[];
+  videos: VideoPlan[];
+  stats: BatchPlanStats;
+}
+
+// --- quality (§6.6) ---------------------------------------------------------------------------------
+
+export interface QualityCheck {
+  name: string;
+  passed: boolean;
+  value: unknown;
+  expected: unknown;
+}
+
+export interface QualityReport {
+  passed: boolean;
+  checks: QualityCheck[];
+  loudness_lufs: number | null;
+  black_ratio: number | null;
+}
+
+// --- videos (§5.7) ----------------------------------------------------------------------------------
+
+export interface VideoOut {
+  id: string;
+  project_id: string;
+  batch_id: string;
+  index: number;
+  title: string;
+  status: VideoStatus;
+  /** 0..1 */
+  progress: number;
+  error: string | null;
+  favorite: boolean;
+  url: string | null;
+  thumbnail_url: string | null;
+  duration: number | null;
+  quality: QualityReport | null;
+  plan: VideoPlan;
+  render_version: number;
+  created_at: ISODateString;
+  rendered_at: ISODateString | null;
+}
+
+export interface VideoDetailOut extends VideoOut {
+  /** Lyric lines effective for this video (absolute song times). */
+  lyric_lines: LyricLine[];
+  /** Ready clips that can be swapped into a shot. */
+  available_clips: ClipOut[];
+}
+
+export interface VideoUpdate {
+  favorite?: boolean;
+  title?: string;
+}
+
+export interface VideoRegenerateRequest {
+  new_clips?: boolean;
+}
+
+export interface LyricOffset {
+  start: number;
+  end: number;
+}
+
+export interface ShotEdit {
+  index: number;
+  clip_id: string;
+  src_in?: number | null;
+}
+
+export interface VideoEdit {
+  start?: number | null;
+  lyric_style?: LyricStyleId | null;
+  text_style?: TextStyle | null;
+  color_grade?: string | null;
+  lyric_offsets?: Record<string, LyricOffset> | null;
+  shots?: ShotEdit[] | null;
+}
+
+export interface VideoListFilters {
+  favorite?: boolean;
+  batch_id?: string;
+}
+
+// --- batches (§5.6) ----------------------------------------------------------------------------------
+
+export interface BatchCounts {
+  total: number;
+  done: number;
+  rendering: number;
+  queued: number;
+  failed: number;
+  cancelled: number;
+}
+
+export interface ClipCounts {
+  total: number;
+  ready: number;
+  generating: number;
+  failed: number;
+  reused: number;
+}
+
+export interface BatchOut {
+  id: string;
+  project_id: string;
+  status: BatchStatus;
+  settings: GenerationSettings;
+  estimate: Estimate | null;
+  storyboard: Storyboard | null;
+  error: string | null;
+  cost_usd: number;
+  created_at: ISODateString;
+  started_at: ISODateString | null;
+  finished_at: ISODateString | null;
+  counts: BatchCounts;
+  clip_counts: ClipCounts;
+}
+
+/** `GET /api/batches/{id}` includes the batch's videos and clips. */
+export interface BatchDetailOut extends BatchOut {
+  videos: VideoOut[];
+  clips: ClipOut[];
+}
+
+// --- system & dashboard (§5.1) ------------------------------------------------------------------------
+
+export interface HealthOut {
+  status: "ok" | "degraded";
+  db: boolean;
+  redis: boolean;
+  ffmpeg: boolean;
+  task_mode: string;
+  storage_backend: string;
+}
+
+export interface ProviderModelInfo {
+  id: string;
+  name: string;
+  clip_durations: number[];
+  max_clip_duration: number;
+  resolution: string;
+  supports_vertical: boolean;
+  price_per_second_usd: number;
+  price_note: string;
+  verified: boolean;
+  /** Additive (§6.7 "As implemented"): clip length used for a 5 s request. */
+  default_duration?: number;
+  /** `false` marks image-only models (e.g. Runway gen4_turbo). */
+  text_to_video?: boolean;
+  image_to_video?: boolean;
+  as_of?: string;
+  source_url?: string;
+}
+
+export interface ProviderInfo {
+  id: ProviderId | string;
+  name: string;
+  configured: boolean;
+  available: boolean;
+  reason: string | null;
+  kind: ProviderKind;
+  commercial_use_note: string;
+  models: ProviderModelInfo[];
+  /** Additive (§6.7): model used when `GenerationSettings.model` is null. */
+  default_model?: string;
+}
+
+export interface WhisperInfo {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface WorldPresetInfo {
+  id: PresetId | string;
+  name_ja: string;
+  name_en: string;
+  description_ja: string;
+  palette: string[];
+}
+
+export interface LyricStyleInfo {
+  id: LyricStyleId | string;
+  name_ja: string;
+  description: string;
+}
+
+export interface ColorGradeInfo {
+  id: string;
+  name: string;
+}
+
+export interface FontInfo {
+  id: string;
+  family: string;
+  label: string;
+}
+
+export interface LimitsInfo {
+  max_audio_mb: number;
+  max_video_mb: number;
+  max_count: number;
+  min_duration: number;
+  max_duration: number;
+}
+
+export interface CapabilitiesOut {
+  providers: ProviderInfo[];
+  claude_configured: boolean;
+  whisper: WhisperInfo;
+  presets: WorldPresetInfo[];
+  lyric_styles: LyricStyleInfo[];
+  color_grades: ColorGradeInfo[];
+  fonts: FontInfo[];
+  durations: number[];
+  counts: number[];
+  limits: LimitsInfo;
+}
+
+export interface ActiveJob {
+  batch_id: string;
+  project_id: string;
+  project_title: string;
+  status: BatchStatus;
+  done: number;
+  total: number;
+  failed: number;
+}
+
+export interface ProviderUsage {
+  provider: string;
+  amount_usd: number;
+  clips: number;
+}
+
+export interface UsageOut {
+  total_usd: number;
+  month_usd: number;
+  by_provider: ProviderUsage[];
+  clips_generated: number;
+  clips_reused: number;
+  saved_usd: number;
+}
+
+export interface DashboardOut {
+  projects: number;
+  videos_done: number;
+  videos_total: number;
+  active_jobs: ActiveJob[];
+  recent_videos: VideoOut[];
+  usage: UsageOut;
+  pending_estimate_usd: number;
+}
+
+export interface StatusOut {
+  status: string;
+}

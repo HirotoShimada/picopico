@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+timeout = 300
+markers = [
+    "slow: long-running tests (rendering, audio analysis)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:botocore.*",
+]

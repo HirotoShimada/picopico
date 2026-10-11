@@ -1,26 +1,142 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/*
+ * Design tokens (ARCHITECTURE.md §8): dark only. Blue (`primary`) is reserved
+ * for primary actions and progress; red (`danger`) for errors. Status hues
+ * (success / warning) are only used in status badges with a label.
+ */
+@theme {
+  --color-background: #0a0a0a;
+  --color-surface: #111113;
+  --color-surface-raised: #18181b;
+  --color-surface-hover: #1f1f23;
+  --color-border: #27272a;
+  --color-border-strong: #3f3f46;
+
+  --color-foreground: #e4e4e7;
+  --color-muted-foreground: #a1a1aa;
+  --color-subtle-foreground: #71717a;
+  --color-inverse-foreground: #0a0a0a;
+
+  --color-primary: #3b82f6;
+  --color-primary-hover: #2563eb;
+  --color-primary-foreground: #ffffff;
+  --color-primary-soft: rgb(59 130 246 / 0.14);
+
+  --color-danger: #ef4444;
+  --color-danger-hover: #dc2626;
+  --color-danger-foreground: #fca5a5;
+  --color-danger-soft: rgb(239 68 68 / 0.12);
+
+  --color-success: #22c55e;
+  --color-success-foreground: #86efac;
+  --color-success-soft: rgb(34 197 94 / 0.12);
+
+  --color-warning: #f59e0b;
+  --color-warning-foreground: #fcd34d;
+  --color-warning-soft: rgb(245 158 11 / 0.12);
+
+  /* Neutral focus ring keeps blue exclusive to primary actions. */
+  --color-ring: #d4d4d8;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans:
+    var(--font-geist-sans), "Noto Sans JP", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP",
+    "Yu Gothic UI", Meiryo, sans-serif;
+  --font-mono:
+    var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, "Noto Sans Mono CJK JP", monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@layer base {
+  html {
+    color-scheme: dark;
+    background-color: var(--color-background);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-feature-settings: "palt" 0;
+    text-rendering: optimizeLegibility;
+  }
+
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-border);
+  }
+
+  ::selection {
+    background-color: rgb(161 161 170 / 0.35);
+    color: #fafafa;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  /* Components that draw their own ring opt out of the outline. */
+  .focus-ring-custom:focus-visible {
+    outline: none;
+  }
+
+  /* Dark scrollbars (standard + WebKit). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #3f3f46 transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: #3f3f46;
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background-clip: padding-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: #52525b;
+  }
+
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    opacity: 0.4;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@utility tabular {
+  font-variant-numeric: tabular-nums;
 }

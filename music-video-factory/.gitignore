@@ -17,3 +17,5 @@ frontend/playwright-report/
 *.wav
 *.mp3
 !frontend/public/**/*.mp4
+# Redis snapshots (a redis-server started from backend/ writes dump.rdb there)
+*.rdb
