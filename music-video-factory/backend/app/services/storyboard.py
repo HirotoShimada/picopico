@@ -5,10 +5,15 @@ look) plus N scenes mapped onto the song's sections and lyric lines. Every
 scene carries a complete English text-to-video prompt, so each clip can be
 generated independently and still look like part of the same music video.
 
-* **Claude** (``ANTHROPIC_API_KEY`` set and ``use_claude``): one structured-
-  output request; the system prompt is stable (cacheable) and all
-  song-specific data goes into the user message. Refusals, API errors and
-  unparsable output fall back to the template with a Japanese warning.
+* **Claude** (``use_claude`` and a route configured — Anthropic directly with
+  ``ANTHROPIC_API_KEY``, else OpenRouter with ``OPENROUTER_API_KEY``, see
+  :mod:`app.services.llm`): one structured-output request with the same
+  ``STORYBOARD_SCHEMA`` on both routes; the system prompt is stable
+  (cacheable) and all song-specific data goes into the user message.
+  Refusals (incl. OpenRouter ``content_filter``), truncated answers, API
+  errors and unparsable output fall back to the template with a Japanese
+  warning. The result says which route was used (``route``) and which model
+  answered (``model``, e.g. ``anthropic/claude-opus-5.5`` via OpenRouter).
 * **Template**: deterministic for a given seed; picks scene types, camera
   angles and moves from the preset vocabulary according to each section's
   energy.
@@ -38,7 +43,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from app.config import get_settings
+from app.services.llm import (
+    LlmCallError,
+    LlmReply,
+    api_label,
+    complete,
+    pricing_model_id,
+    route_of,
+)
 from app.services.presets import (
     CAMERA_ANGLES,
     CAMERA_MOVES,
@@ -49,10 +61,8 @@ from app.services.presets import (
     get_preset,
 )
 from app.services.prompting import (
-    FALLBACK_BETA,
     MAX_PROMPT_CHARS,
     artist_name_variants,
-    first_text_block,
     glossary_keywords,
     make_claude_client,
     mood_keywords,
@@ -100,8 +110,10 @@ BASE_NEGATIVE_EN = (
 )
 
 # $ per million tokens: (input, output, cache read). Cache writes (5 min TTL) cost 1.25× input.
+# OpenRouter ids (``anthropic/claude-opus-5.5``) are mapped by ``llm.pricing_model_id``.
 _CLAUDE_PRICING: dict[str, tuple[float, float, float]] = {
     "claude-opus-5-5": (4.0, 20.0, 0.20),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.20),  # Anthropic list price (docs/VIDEO_PROVIDERS.md §8.4, unverified)
     "claude-opus-5": (5.0, 25.0, 0.50),
     "claude-opus-4-8": (5.0, 25.0, 0.50),
 }
@@ -192,10 +204,14 @@ def _merge_negative(*parts: str) -> str:
 
 
 def claude_cost_usd(model: str | None, usage: Mapping[str, int] | None) -> float:
-    """USD cost of one Messages API call from its ``usage`` (Opus 5.5: $4/MTok in, $20/MTok out)."""
+    """USD cost of one Claude call from its ``usage`` (Opus 5.5: $4/MTok in, $20/MTok out).
+
+    ``model`` may be an Anthropic id (``claude-opus-5-5``) or an OpenRouter id
+    (``anthropic/claude-opus-5.5``); unknown models are priced like Opus 5.5.
+    """
     if not usage:
         return 0.0
-    price_in, price_out, price_cache_read = _CLAUDE_PRICING.get(model or "", _DEFAULT_PRICING)
+    price_in, price_out, price_cache_read = _CLAUDE_PRICING.get(pricing_model_id(model), _DEFAULT_PRICING)
     cost = (
         usage.get("input_tokens", 0) * price_in
         + usage.get("output_tokens", 0) * price_out
@@ -740,25 +756,99 @@ STORYBOARD_SCHEMA: dict[str, Any] = {
 
 
 class _ClaudeFailure(Exception):
-    """Claude produced no usable storyboard; ``warning`` is shown to the user."""
+    """Claude produced no usable storyboard; ``warning`` is shown to the user.
 
-    def __init__(self, warning: str, *, model: str | None = None, usage: dict[str, int] | None = None):
+    ``model``/``usage``/``cost_usd`` describe a call that was answered (and billed) but unusable.
+    """
+
+    def __init__(
+        self,
+        warning: str,
+        *,
+        route: str | None = None,
+        model: str | None = None,
+        usage: dict[str, int] | None = None,
+        cost_usd: float | None = None,
+    ):
         super().__init__(warning)
         self.warning = warning
+        self.route = route
         self.model = model
         self.usage = usage
+        self.cost_usd = cost_usd
 
 
-def _usage_dict(response: Any) -> dict[str, int] | None:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return None
-    result: dict[str, int] = {}
-    for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
-        value = getattr(usage, key, None)
-        if isinstance(value, int):
-            result[key] = value
-    return result
+def _reply_cost(reply: LlmReply) -> float:
+    """OpenRouter's reported ``usage.cost`` when present, else the tokens at Anthropic list prices.
+
+    BYOK (``is_byok``: the vendor bills the user's own key) [B]: ``usage.cost`` may be OpenRouter's fee
+    only, so the reported upstream cost is added, or — when none is reported — at least the token
+    price is booked (the spend is never under-counted).
+    """
+    if reply.cost_usd is None:
+        return claude_cost_usd(reply.model, reply.usage)
+    cost = float(reply.cost_usd)
+    if reply.is_byok:
+        if reply.upstream_cost_usd is not None:
+            cost += float(reply.upstream_cost_usd)
+        else:
+            cost = max(cost, claude_cost_usd(reply.model, reply.usage))
+    return round(cost, 6)
+
+
+def _call_failure_warning(exc: LlmCallError) -> str:
+    """Japanese fallback warning for a request that got no answer (identical texts on the Anthropic route)."""
+    api = api_label(exc.route)
+    tail = "、テンプレートで絵コンテを作成しました"
+    messages = {
+        "bad_request": f"{api} がリクエストを受け付けなかったため{tail}",
+        "rate_limited": f"{api} の利用上限に達したため{tail}",
+        "connection": f"{api} に接続できなかったため{tail}",
+        "credits": f"OpenRouter のクレジットが不足しているため{tail}",
+        "moderation": f"OpenRouter のモデレーション（ガードレール）でリクエストが拒否されたため{tail}",
+        "no_provider": (
+            "データを収集・保持しない提供元（data_collection: deny・ZDR）で Claude を使える提供元が"
+            f"見つからなかったため{tail}"
+        ),
+        "auth": f"OpenRouter の API キーが無効なため{tail}",
+        "bad_response": f"{api} の応答を読み取れなかったため{tail}",
+    }
+    return messages.get(exc.kind) or f"{api} でエラーが発生したため（HTTP {exc.status}）{tail}"
+
+
+def _call_claude(
+    client: Any, *, user_message: str, end_user: str | None = None
+) -> tuple[dict[str, Any], LlmReply]:
+    """One storyboard request on the client's route → ``(storyboard JSON, reply)``; else :class:`_ClaudeFailure`."""
+    try:
+        reply = complete(
+            client, system=SYSTEM_PROMPT, user=user_message, max_tokens=16000, json_schema=STORYBOARD_SCHEMA,
+            schema_name="storyboard", cache_system=True, end_user=end_user, purpose="storyboard",
+        )  # fmt: skip
+    except LlmCallError as exc:
+        raise _ClaudeFailure(_call_failure_warning(exc), route=exc.route) from exc
+
+    def billed(warning: str) -> _ClaudeFailure:  # an answered (billed) call whose answer is unusable
+        return _ClaudeFailure(warning, route=reply.route, model=reply.model, usage=reply.usage,
+                              cost_usd=_reply_cost(reply))  # fmt: skip
+
+    if reply.finish == "refusal":
+        who = "Claude（OpenRouter 経由）" if reply.route == "openrouter" else "Claude"
+        raise billed(f"{who} がこの内容の絵コンテ作成を見送ったため、テンプレートで作成しました")
+    if reply.finish == "length":
+        raise billed("Claude の応答が長さの上限で途中までになったため、テンプレートで絵コンテを作成しました")
+    if reply.finish == "error":
+        raise billed("OpenRouter の提供元でエラーが発生したため、テンプレートで絵コンテを作成しました")
+    try:
+        data = json.loads(reply.text or "")
+        if not isinstance(data, dict) or not isinstance(data.get("world_bible"), dict):
+            raise ValueError("world_bible missing")
+        if not isinstance(data.get("scenes"), list) or not data["scenes"]:
+            raise ValueError("scenes missing")
+    except (TypeError, ValueError) as exc:
+        logger.warning("Claude storyboard output was not valid storyboard JSON (route=%s)", reply.route)
+        raise billed("Claude の応答を解析できなかったため、テンプレートで絵コンテを作成しました") from exc
+    return data, reply
 
 
 def _user_message(
@@ -829,58 +919,6 @@ def _user_message(
         },
     }
     return json.dumps(payload, ensure_ascii=False)
-
-
-def _call_claude(client: Any, *, user_message: str) -> tuple[dict[str, Any], str, dict[str, int] | None]:
-    import anthropic
-
-    settings = get_settings()
-    try:
-        response = client.beta.messages.create(
-            model=settings.ANTHROPIC_MODEL,
-            max_tokens=16000,
-            betas=[FALLBACK_BETA],
-            fallbacks="default",
-            output_config={"format": {"type": "json_schema", "schema": STORYBOARD_SCHEMA}, "effort": "low"},
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user_message}],
-        )
-    except anthropic.BadRequestError as exc:
-        logger.warning("Claude storyboard request rejected (400): %s", exc.message)
-        raise _ClaudeFailure(
-            "Claude API がリクエストを受け付けなかったため、テンプレートで絵コンテを作成しました"
-        ) from exc
-    except anthropic.RateLimitError as exc:
-        logger.warning("Claude storyboard request rate limited")
-        raise _ClaudeFailure("Claude API の利用上限に達したため、テンプレートで絵コンテを作成しました") from exc
-    except anthropic.APIStatusError as exc:
-        logger.warning("Claude storyboard request failed with HTTP %s", exc.status_code)
-        raise _ClaudeFailure(
-            f"Claude API でエラーが発生したため（HTTP {exc.status_code}）、テンプレートで絵コンテを作成しました"
-        ) from exc
-    except anthropic.APIConnectionError as exc:
-        logger.warning("Claude storyboard request: connection error (%s)", type(exc).__name__)
-        raise _ClaudeFailure("Claude API に接続できなかったため、テンプレートで絵コンテを作成しました") from exc
-
-    model = str(getattr(response, "model", None) or settings.ANTHROPIC_MODEL)
-    usage = _usage_dict(response)
-    if getattr(response, "stop_reason", None) == "refusal":
-        raise _ClaudeFailure(
-            "Claude がこの内容の絵コンテ作成を見送ったため、テンプレートで作成しました", model=model, usage=usage
-        )
-    try:
-        data = json.loads(first_text_block(response) or "")
-        if not isinstance(data, dict) or not isinstance(data.get("world_bible"), dict):
-            raise ValueError("world_bible missing")
-        if not isinstance(data.get("scenes"), list) or not data["scenes"]:
-            raise ValueError("scenes missing")
-    except (TypeError, ValueError) as exc:
-        logger.warning("Claude storyboard output was not valid storyboard JSON (stop_reason=%s)",
-                       getattr(response, "stop_reason", None))  # fmt: skip
-        raise _ClaudeFailure(
-            "Claude の応答を解析できなかったため、テンプレートで絵コンテを作成しました", model=model, usage=usage
-        ) from exc
-    return data, model, usage
 
 
 _HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -1014,12 +1052,18 @@ def generate_storyboard(
     use_claude: bool = True,
     client: Any | None = None,
     artist_aliases: Sequence[str] | None = None,
+    end_user: str | None = None,
 ) -> dict[str, Any]:
     """Build a Storyboard (ARCHITECTURE.md §6.3).
 
-    Claude is used when ``use_claude`` is true and an Anthropic client is
-    available (``client`` argument — used by tests — or ``ANTHROPIC_API_KEY``).
-    The template path is deterministic for a given ``seed`` (``None`` derives
+    Claude is used when ``use_claude`` is true and a Claude client is
+    available: ``client`` (an ``anthropic.Anthropic`` or an OpenRouter chat
+    client — used by tests) or the configured route (``ANTHROPIC_API_KEY``,
+    else ``OPENROUTER_API_KEY``; :func:`app.services.llm.make_llm_client`).
+    ``end_user`` (the owner id) becomes OpenRouter's pseudonymous ``user``
+    (an HMAC; the raw id is never sent). The result's ``route`` is
+    ``"anthropic"`` / ``"openrouter"`` when Claude was called (also when its
+    answer was unusable), else ``None``. The template path is deterministic for a given ``seed`` (``None`` derives
     a stable seed from title/preset/custom world). The artist name (plus
     ``artist_aliases``, e.g. romanised or English names, and kana
     romanisations) is only ever used as a forbidden-likeness constraint, as
@@ -1031,8 +1075,10 @@ def generate_storyboard(
     forbidden = _forbidden_names(artist_name, artist_aliases)
     lyrics = list(lyrics or [])
     warnings: list[str] = []
+    claude_route: str | None = None
     claude_model: str | None = None
     claude_usage: dict[str, int] | None = None
+    claude_cost = 0.0
 
     # People named in the user's free text are forbidden everywhere (prompts, Claude, lyric excerpts).
     custom_world_clean, world_names, world_warnings = screen_free_text(
@@ -1054,15 +1100,16 @@ def generate_storyboard(
                 custom_world=custom_world, n_scenes=n, forbidden=forbidden, estimate=estimate,
             )  # fmt: skip
             try:
-                data, claude_model, claude_usage = _call_claude(claude, user_message=message)
+                data, reply = _call_claude(claude, user_message=message, end_user=end_user)
                 world, scenes, normalize_warnings = _normalize_claude(
                     data, preset=preset, lyrics=lyrics, n_scenes=n, forbidden=forbidden
                 )
                 return {
                     "source": "claude",
-                    "model": claude_model,
-                    "usage": claude_usage,
-                    "cost_usd": claude_cost_usd(claude_model, claude_usage),
+                    "route": reply.route,
+                    "model": reply.model,
+                    "usage": reply.usage,
+                    "cost_usd": _reply_cost(reply),
                     "world_bible": world,
                     "scenes": scenes,
                     "warnings": list(dict.fromkeys([*screen_warnings, *normalize_warnings])),
@@ -1072,7 +1119,9 @@ def generate_storyboard(
                 }
             except _ClaudeFailure as failure:
                 warnings.append(failure.warning)
+                claude_route = failure.route or route_of(claude)
                 claude_model, claude_usage = failure.model, failure.usage
+                claude_cost = float(failure.cost_usd or 0.0)
 
     effective_seed = seed if seed is not None else _stable_int(title, preset["id"], custom_world or "")
     rng = random.Random(_stable_int("storyboard", effective_seed, preset["id"]))
@@ -1116,10 +1165,11 @@ def generate_storyboard(
     warnings.extend(scene_warnings)
     return {
         "source": "template",
-        # model/usage/cost are those of a failed Claude attempt (tokens are still billed), else null/0.
+        # route/model/usage/cost are those of a failed Claude attempt (tokens are still billed), else null/0.
+        "route": claude_route,
         "model": claude_model,
         "usage": claude_usage,
-        "cost_usd": claude_cost_usd(claude_model, claude_usage),
+        "cost_usd": claude_cost,
         "world_bible": world,
         "scenes": scenes,
         "warnings": list(dict.fromkeys(warnings)),

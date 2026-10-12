@@ -11,9 +11,14 @@ import { RadioCards, type RadioCardOption } from "@/components/ui/radio-cards";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { PROVIDER_KIND_LABELS, providerLabel } from "@/lib/constants";
 import { formatPricePerSecond } from "@/lib/format";
+import { isOpenRouter, isPriceKnown, openRouterVendor } from "@/lib/llm";
 import type { ProviderId, ProviderInfo, ProviderModelInfo } from "@/lib/types";
 
 import { projectTabHref } from "./links";
+import { OpenRouterNotes } from "./openrouter-notes";
+
+/** Shown instead of a price for a model without a readable price (OpenRouter listing). */
+export const PRICE_UNKNOWN_LABEL = "料金未取得";
 
 /** Why a provider cannot be used right now (`null` when usable). */
 export function providerUnavailableReason(provider: ProviderInfo, libraryClipCount: number | undefined): string | null {
@@ -28,11 +33,18 @@ export function providerUnavailableReason(provider: ProviderInfo, libraryClipCou
 /**
  * Why a model cannot be chosen here (`null` when usable). Only generating (API)
  * models are restricted: an image-only model needs an input image this form does
- * not collect. `library` / `mock` never generate from text, so the flag does not apply.
+ * not collect, and a model without a known price cannot reserve the batch budget.
+ * `library` / `mock` never generate from text, so the flags do not apply.
  */
 export function modelUnavailableReason(model: ProviderModelInfo, providerKind: ProviderInfo["kind"]): string | null {
   if (providerKind !== "api") return null;
+  if (!isPriceKnown(model)) return `${PRICE_UNKNOWN_LABEL}のため選択できません（素材ごとに予算を確保できないため）。`;
   return model.text_to_video === false ? "入力画像が必要なモデルのため、この画面からは使用できません。" : null;
+}
+
+/** `$0.05/秒`, 「無料」 or 「料金未取得」. */
+export function modelPriceLabel(model: Pick<ProviderModelInfo, "price_known" | "price_per_second_usd">): string {
+  return isPriceKnown(model) ? formatPricePerSecond(model.price_per_second_usd) : PRICE_UNKNOWN_LABEL;
 }
 
 export function resolveModel(provider: ProviderInfo | undefined, modelId: string | null): ProviderModelInfo | undefined {
@@ -42,8 +54,9 @@ export function resolveModel(provider: ProviderInfo | undefined, modelId: string
 }
 
 function priceSummary(provider: ProviderInfo): string {
-  const prices = provider.models.filter((m) => m.text_to_video !== false || provider.kind !== "api").map((m) => m.price_per_second_usd);
-  if (prices.length === 0) return "—";
+  const usable = provider.models.filter((m) => m.text_to_video !== false || provider.kind !== "api");
+  const prices = usable.flatMap((m) => (isPriceKnown(m) && m.price_per_second_usd !== null ? [m.price_per_second_usd] : []));
+  if (prices.length === 0) return usable.length > 0 ? PRICE_UNKNOWN_LABEL : "—";
   const min = Math.min(...prices);
   const max = Math.max(...prices);
   if (max === 0) return "無料";
@@ -82,7 +95,13 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
       meta: (
         <>
           <Badge tone="outline">{PROVIDER_KIND_LABELS[p.kind] ?? p.kind}</Badge>
-          {unverified ? (
+          {/* OpenRouter: not only the prices but the whole integration is untested with a real key. */}
+          {isOpenRouter(p.id) ? (
+            <Badge tone="warning">
+              <TriangleAlert aria-hidden />
+              未検証
+            </Badge>
+          ) : unverified ? (
             <Badge tone="warning">
               <TriangleAlert aria-hidden />
               価格未検証
@@ -149,12 +168,16 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
               <SelectContent>
                 {selected.models.map((m) => {
                   const reason = modelUnavailableReason(m, selected.kind);
+                  const vendor = isOpenRouter(selected.id) ? openRouterVendor(m.id) : null;
+                  const details = [vendor ? `提供元 ${vendor}` : null, m.resolution, clipDurationsLabel(m), modelPriceLabel(m)];
                   return (
                     <SelectItem
                       key={m.id}
                       value={m.id}
                       disabled={reason !== null}
-                      description={reason ?? `${m.resolution} ・ ${clipDurationsLabel(m)} ・ ${formatPricePerSecond(m.price_per_second_usd)}${m.verified ? "" : "（未検証）"}`}
+                      description={
+                        reason ?? `${details.filter(Boolean).join(" ・ ")}${m.verified ? "" : "（未検証）"}`
+                      }
                     >
                       {m.name || m.id}
                       {m.id === selected.default_model ? "（既定）" : ""}
@@ -167,17 +190,26 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
           {selectedModel ? (
             <div className="flex min-w-0 flex-col gap-1.5 rounded-md border border-border bg-surface-raised/50 px-3 py-2.5 text-xs leading-5">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-sm text-foreground">{formatPricePerSecond(selectedModel.price_per_second_usd)}</span>
-                {!selectedModel.verified && selectedModel.price_per_second_usd > 0 ? (
+                <span className={isPriceKnown(selectedModel) ? "font-mono text-sm text-foreground" : "text-sm text-foreground"}>
+                  {modelPriceLabel(selectedModel)}
+                </span>
+                {!selectedModel.verified && (selectedModel.price_per_second_usd ?? 0) > 0 ? (
                   <Badge tone="warning">
                     <TriangleAlert aria-hidden />
                     未検証
                   </Badge>
                 ) : null}
+                {!selectedModel.supports_vertical ? (
+                  <Badge tone="warning" title="モデルの情報に 9:16（縦型）への対応が記載されていません。詳細は下の説明を参照してください。">
+                    9:16 未確認
+                  </Badge>
+                ) : null}
                 <span className="text-subtle-foreground">
+                  {isOpenRouter(selected.id) && openRouterVendor(selectedModel.id) ? `提供元 ${openRouterVendor(selectedModel.id)} ・ ` : ""}
                   {selectedModel.resolution} ・ クリップ {clipDurationsLabel(selectedModel)}
                 </span>
               </div>
+              {isOpenRouter(selected.id) ? <p className="font-mono text-2xs break-all text-subtle-foreground">{selectedModel.id}</p> : null}
               {selectedModel.price_note ? <p className="text-muted-foreground">{selectedModel.price_note}</p> : null}
               {selectedModel.source_url ? (
                 <a
@@ -186,7 +218,8 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
                   rel="noreferrer noopener"
                   className="inline-flex w-fit items-center gap-1 text-subtle-foreground underline-offset-2 hover:text-foreground hover:underline"
                 >
-                  公式料金表{selectedModel.as_of ? `（${selectedModel.as_of} 時点）` : ""}
+                  {isOpenRouter(selected.id) ? "OpenRouter のモデルページ" : "公式料金表"}
+                  {selectedModel.as_of ? `（${selectedModel.as_of} 時点）` : ""}
                   <ExternalLink className="size-3" aria-hidden />
                 </a>
               ) : null}
@@ -194,6 +227,8 @@ export function ProviderPicker({ projectId, providers, provider, model, onChange
           ) : null}
         </div>
       ) : null}
+
+      {selected && isOpenRouter(selected.id) ? <OpenRouterNotes provider={selected} model={selectedModel} /> : null}
 
       {selected?.commercial_use_note ? (
         <p className="flex items-start gap-2 text-xs leading-5 text-muted-foreground">

@@ -10,6 +10,9 @@ construction with the contract fields keeps working.
 
 * errors are :class:`ProviderError` with ``retryable`` set for HTTP 429/5xx,
   timeouts and connection failures, and cleared for other 4xx answers;
+  job-creating requests sent through ``_submit_request`` (no idempotency key)
+  are retryable only when no job can exist, and otherwise raise
+  :class:`ProviderSubmitAmbiguous` (never resent, presumed billed);
 * failures of a submitted remote job are :class:`ProviderTaskError` (they
   carry ``external_job_id`` so the pipeline can record the job);
 * ``cancel_check()`` is honoured before submitting, between polls and while
@@ -63,6 +66,7 @@ __all__ = [
     "ProgressCallback",
     "ProviderCancelled",
     "ProviderModel",
+    "ProviderSubmitAmbiguous",
     "ProviderTaskError",
     "SubmitCallback",
     "SubmittedJob",
@@ -84,6 +88,15 @@ MAX_CONSECUTIVE_POLL_ERRORS = 5
 # Download/probe tries for the video of a finished (billed) job; the job itself is never resubmitted.
 OUTPUT_FETCH_ATTEMPTS = 3
 DEFAULT_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+# Transport errors raised before a request left this process (connecting, waiting for a pooled
+# connection, the proxy tunnel, an unusable URL): the provider never saw it, so it is safe to send again.
+_UNSENT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+)
 _MAX_REDIRECTS = 5
 _DOWNLOAD_CHUNK = 1024 * 1024
 _DETAIL_MAX_CHARS = 300
@@ -122,6 +135,10 @@ class ProviderModel:
     source_url: str = ""  # official pricing page
     as_of: str = ""  # date the price was taken from source_url
     params: dict[str, Any] = field(default_factory=dict)  # adapter-specific request settings
+    # False: no usable price (e.g. an OpenRouter listing entry without readable pricing). Such a model
+    # is listed with ``price_per_second_usd: null`` but refused by ``check_model``: without a price the
+    # batch budget cannot be reserved before each paid attempt.
+    price_known: bool = True
 
     def snap_duration(self, wanted: float) -> float:
         return snap_duration(self.clip_durations, self.max_clip_duration, wanted)
@@ -138,9 +155,10 @@ class ProviderModel:
             "max_clip_duration": self.max_clip_duration,
             "resolution": self.resolution,
             "supports_vertical": self.supports_vertical,
-            "price_per_second_usd": self.price_per_second_usd,
+            "price_per_second_usd": self.price_per_second_usd if self.price_known else None,
             "price_note": self.price_note,
             "verified": self.verified,
+            "price_known": self.price_known,
             "default_duration": self.default_duration,
             "text_to_video": self.text_to_video,
             "image_to_video": self.image_to_video,
@@ -192,12 +210,14 @@ class ProviderTaskError(ProviderError):
         external_job_id: str | None = None,
         failure_code: str | None = None,
         cost_usd: float | None = None,
+        http_status: int | None = None,
         **kwargs: Any,
     ):
         super().__init__(message, retryable=retryable, **kwargs)
         self.external_job_id = external_job_id
         self.failure_code = failure_code
         self.cost_usd = cost_usd
+        self.http_status = http_status  # status of the failed HTTP response (downloads), when there was one
 
 
 class ProviderCancelled(ProviderTaskError):
@@ -207,6 +227,24 @@ class ProviderCancelled(ProviderTaskError):
 
     def __init__(self, message: str = "生成がキャンセルされました", **kwargs: Any):
         kwargs.setdefault("retryable", False)
+        super().__init__(message, **kwargs)
+
+
+class ProviderSubmitAmbiguous(ProviderError):
+    """A job-creating request failed after it may have reached the provider (no idempotency key).
+
+    A read timeout, a dropped connection, a gateway 5xx or an accepted (2xx)
+    answer that cannot be read all leave open whether a job was created — and
+    it would be billed. Sending the request again could pay twice, so this is
+    never retryable, and ``billed`` tells the caller to book the attempt's
+    estimate as presumed billed (no job id is known, so it cannot be resumed).
+    """
+
+    code = "provider_submit_ambiguous"
+    billed = True
+
+    def __init__(self, message: str = "", **kwargs: Any):
+        kwargs["retryable"] = False
         super().__init__(message, **kwargs)
 
 
@@ -351,11 +389,14 @@ def download_file(
     max_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
     cancel_check: CancelCheck | None = None,
     external_job_id: str | None = None,
+    allow_url: Callable[[str], bool] | None = None,
 ) -> int:
     """Stream ``url`` into ``dest`` (atomically) and return the byte count.
 
     Redirects are followed manually: ``headers`` (credentials) are sent only to
     the origin of ``url``, never to the storage host a redirect points at.
+    ``allow_url`` (optional) vets every hop, redirects included (SSRF guard);
+    a refused URL is a non-retryable ``provider_bad_output``.
     """
     dest_path = Path(dest)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +409,11 @@ def download_file(
                 raise ProviderTaskError(
                     f"{provider_name}: 動画の URL が不正です", retryable=False, external_job_id=external_job_id
                 )
+            if allow_url is not None and not allow_url(current):
+                raise ProviderTaskError(
+                    f"{provider_name}: 動画の URL が許可されていない宛先です",
+                    retryable=False, code="provider_bad_output", external_job_id=external_job_id,
+                )  # fmt: skip
             send_headers = dict(headers or {}) if _same_origin(current, origin) else {}
             request = client.build_request("GET", current, headers=send_headers)
             try:
@@ -400,6 +446,7 @@ def download_file(
                         f"{provider_name}: 動画をダウンロードできませんでした（{summary}、HTTP {response.status_code}"
                         f"{': ' + detail if detail else ''}）",
                         retryable=retryable, code=code, external_job_id=external_job_id,
+                        http_status=response.status_code,
                     )  # fmt: skip
                 declared = response.headers.get("content-length")
                 if declared and declared.isdigit() and int(declared) > max_bytes:
@@ -565,6 +612,11 @@ class VideoProvider(ABC):
         problem = self.model_credentials_problem(entry)
         if problem:
             return False, problem
+        if not entry.price_known:
+            return False, (
+                f"{entry.name} は料金を確認できないため使用できません（素材ごとに予算を確保できないため）。"
+                "料金が分かる別のモデルを選んでください"
+            )
         if not entry.text_to_video and not has_image:
             return False, (
                 f"{entry.name} は画像→動画専用のモデルです。入力画像がないため、テキストだけでは生成できません"
@@ -637,6 +689,9 @@ class ApiVideoProvider(VideoProvider):
     api_timeout: ClassVar[httpx.Timeout] = httpx.Timeout(30.0, connect=10.0)
     download_timeout: ClassVar[httpx.Timeout] = httpx.Timeout(120.0, connect=10.0)
     supported_aspects: ClassVar[tuple[str, ...]] = ("9:16", "16:9")
+    # Answers to a job-creating request (:meth:`_submit_request`) that prove no job exists:
+    # timeout before the request was read, too early, rate limit, unavailable, overloaded.
+    submit_retryable_statuses: ClassVar[frozenset[int]] = frozenset({408, 425, 429, 503, 529})
 
     # -- hooks ------------------------------------------------------------------------------------
 
@@ -713,6 +768,51 @@ class ApiVideoProvider(VideoProvider):
             raise ProviderError(f"{self.name}: {what}の応答形式が想定外です", retryable=True, code="provider_bad_response")
         return body
 
+    def _submit_request(
+        self, client: httpx.Client, method: str, url: str, *, what: str, **kwargs: Any
+    ) -> httpx.Response:
+        """Send a request that **creates a job** and has no idempotency key; returns a 2xx response.
+
+        Unlike :meth:`_request`, only failures that prove no job was created are
+        retryable: a connect-phase transport error (:data:`_UNSENT_ERRORS`) or a
+        status in :attr:`submit_retryable_statuses`. A failure after the request
+        may have reached the provider (read/write timeout, dropped connection,
+        any other 5xx such as 500/502/504/524) raises
+        :class:`ProviderSubmitAmbiguous`; other 4xx answers are rejections
+        (:meth:`_http_error`, not retryable). Adapters must also turn an
+        unreadable 2xx answer into :meth:`_submit_ambiguous`.
+        """
+        try:
+            response = client.request(method, url, **kwargs)
+        except _UNSENT_ERRORS as exc:
+            if isinstance(exc, httpx.TimeoutException):
+                raise ProviderError(
+                    f"{self.name}: {what}がタイムアウトしました（接続できませんでした）", retryable=True,
+                    code="provider_timeout",
+                ) from exc  # fmt: skip
+            raise ProviderError(
+                f"{self.name}: {what}で接続エラーが発生しました（{type(exc).__name__}）",
+                retryable=True, code="provider_unreachable",
+            ) from exc  # fmt: skip
+        except httpx.TimeoutException as exc:
+            raise self._submit_ambiguous(what, "応答がタイムアウトしました") from exc
+        except httpx.HTTPError as exc:
+            raise self._submit_ambiguous(what, f"接続が途中で切れました: {type(exc).__name__}") from exc
+        if response.is_success:
+            return response
+        status = response.status_code
+        if status >= 500 and status not in self.submit_retryable_statuses:
+            detail = error_detail(response)
+            raise self._submit_ambiguous(what, f"HTTP {status}{': ' + detail if detail else ''}")
+        raise self._http_error(response, what)
+
+    def _submit_ambiguous(self, what: str, reason: str) -> ProviderSubmitAmbiguous:
+        """The error for a job-creating request whose outcome is unknown (never resent; presumed billed)."""
+        return ProviderSubmitAmbiguous(
+            f"{self.name}: {what}の結果を確認できませんでした（{reason}）。生成ジョブが作成された可能性があるため、"
+            "重複課金を避けて再送信しませんでした（推定額を課金済みとして計上します）"
+        )
+
     # -- flow -------------------------------------------------------------------------------------
 
     def generate(
@@ -748,14 +848,17 @@ class ApiVideoProvider(VideoProvider):
         timeout: float = 900,
         cancel_check: CancelCheck | None = None,
         on_progress: ProgressCallback | None = None,
+        submitted_usd: float | None = None,
     ) -> ClipResult:
         """Finish a job submitted earlier (``job_id`` = its ``resume_token``) without submitting again.
 
         Polls the existing job and fetches its output; errors are the same as
         :meth:`generate` (a job the provider no longer knows fails with a
-        non-retryable :class:`ProviderTaskError`).
+        non-retryable :class:`ProviderTaskError`). ``submitted_usd`` is what the
+        job was estimated to cost when it was submitted; adapters whose model
+        catalogue can change meanwhile price the job with it (:meth:`_prepare_resume`).
         """
-        model, duration = self._prepare(req)
+        model, duration = self._prepare_resume(req, submitted_usd=submitted_usd)
         if _cancelled(cancel_check):
             raise ProviderCancelled(external_job_id=str(job_id))
         job = self._job_from_token(str(job_id), req, model)
@@ -774,6 +877,16 @@ class ApiVideoProvider(VideoProvider):
                 f"{self.name} はアスペクト比 {req.aspect_ratio} に対応していません", retryable=False, code="provider_bad_input"
             )
         return model, model.snap_duration(req.duration)
+
+    def _prepare_resume(self, req: ClipRequest, *, submitted_usd: float | None = None) -> tuple[ProviderModel, float]:
+        """Model and clip duration for :meth:`resume`. Default: the submission checks (:meth:`_prepare`).
+
+        The catalogues of the built-in adapters are fixed in code. An adapter whose
+        catalogue can change while a job runs (OpenRouter's live listing) overrides
+        this: the job exists already, so it must be followed even when its model is
+        no longer listed or priced (``submitted_usd`` then prices it).
+        """
+        return self._prepare(req)
 
     def _notify_submitted(self, on_submitted: SubmitCallback | None, job: SubmittedJob) -> None:
         if on_submitted is None:
@@ -911,11 +1024,7 @@ class ApiVideoProvider(VideoProvider):
                 with httpx.Client(
                     timeout=self.download_timeout, transport=self._transport, follow_redirects=False
                 ) as dl:
-                    size = download_file(
-                        dl, outcome.video_url, out_path, provider_name=self.name,
-                        headers=self._download_headers(outcome.video_url), max_bytes=_max_download_bytes(),
-                        cancel_check=cancel_check, external_job_id=job.id,
-                    )  # fmt: skip
+                    size = self._download_output(dl, job, outcome, out_path, cancel_check=cancel_check)
                 return outcome, size, self._probe_output(out_path, job.id)
             except ProviderCancelled as exc:
                 exc.cost_usd = cost
@@ -933,6 +1042,7 @@ class ApiVideoProvider(VideoProvider):
                     f"{error.message}。生成は完了・課金済みのため、新しいジョブは送信しません（取得を {attempt} 回試行）",
                     retryable=False, code=error.code, external_job_id=job.id,
                     failure_code=getattr(error, "failure_code", None), cost_usd=cost,
+                    http_status=getattr(error, "http_status", None),
                 ) from error  # fmt: skip
             logger.warning("%s: fetching the output of job %s failed (try %d): %s", self.id, job.id, attempt, error)
             self._sleep(min(self.poll.interval(attempt - 1, self._rng), remaining))
@@ -948,6 +1058,23 @@ class ApiVideoProvider(VideoProvider):
                         refreshed = replace(refreshed, cost_usd=outcome.cost_usd)
                     outcome = refreshed
                     cost = _job_cost(outcome, model, duration)
+
+    def _download_output(
+        self,
+        dl: httpx.Client,
+        job: SubmittedJob,
+        outcome: PollOutcome,
+        out_path: str,
+        *,
+        cancel_check: CancelCheck | None,
+    ) -> int:
+        """Fetch the finished job's video into ``out_path`` (one try); returns the byte count."""
+        assert outcome.video_url is not None
+        return download_file(
+            dl, outcome.video_url, out_path, provider_name=self.name,
+            headers=self._download_headers(outcome.video_url), max_bytes=_max_download_bytes(),
+            cancel_check=cancel_check, external_job_id=job.id,
+        )  # fmt: skip
 
     def _try_cancel_remote(self, client: httpx.Client, job: SubmittedJob) -> None:
         try:

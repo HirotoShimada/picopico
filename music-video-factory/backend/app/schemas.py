@@ -22,7 +22,7 @@ LyricsFormatT = Literal["txt", "lrc", "srt"]
 LyricsFormatInT = Literal["auto", "txt", "lrc", "srt"]
 LyricSourceT = Literal["manual", "lrc", "srt", "txt", "heuristic", "whisper"]
 AssetKindT = Literal["audio", "lyrics", "material", "clip", "render", "thumbnail", "zip"]
-ClipSourceT = Literal["upload", "mock", "kling", "runway", "veo"]
+ClipSourceT = Literal["upload", "mock", "kling", "runway", "veo", "openrouter"]
 ClipStatusT = Literal["pending", "generating", "ready", "failed", "cancelled"]
 BatchStatusT = Literal[
     "queued", "planning", "generating_clips", "rendering",
@@ -32,7 +32,7 @@ VideoStatusT = Literal["queued", "waiting_clips", "rendering", "done", "failed",
 PresetIdT = Literal[
     "cinematic", "emotional", "urban_night", "nostalgic", "nature", "dark", "dreamy", "documentary", "custom"
 ]
-ProviderIdT = Literal["mock", "library", "kling", "runway", "veo"]
+ProviderIdT = Literal["mock", "library", "kling", "runway", "veo", "openrouter"]
 LyricStyleT = Literal["simple", "cinematic", "minimal", "karaoke", "fade"]
 StartStrategyT = Literal["segment", "chorus", "varied", "custom"]
 ReuseModeT = Literal["max_variety", "balanced", "economy"]
@@ -518,6 +518,8 @@ class Storyboard(LooseModel):
     """§6.3 Storyboard document."""
 
     source: Literal["claude", "template"]
+    # Extension: how Claude was reached when it was called (also for a template fallback after a call).
+    route: Literal["anthropic", "openrouter"] | None = None
     model: str | None = None
     usage: dict[str, int] | None = None
     cost_usd: float = 0.0
@@ -745,9 +747,11 @@ class ProviderModelInfo(LooseModel):
     max_clip_duration: float
     resolution: str
     supports_vertical: bool
-    price_per_second_usd: float
+    # null when the price is unknown (OpenRouter listing entry without a readable price; see price_known)
+    price_per_second_usd: float | None
     price_note: str = ""
     verified: bool = False
+    price_known: bool = True  # extension: False = not usable (the budget cannot be reserved)
 
 
 class ProviderInfo(LooseModel):
@@ -764,6 +768,15 @@ class ProviderInfo(LooseModel):
 class WhisperInfo(APIModel):
     available: bool
     reason: str | None = None
+
+
+class LlmInfo(APIModel):
+    """Extension: how Claude is reached for storyboards/translation (no secrets)."""
+
+    route: Literal["anthropic", "openrouter"] | None = None  # None = template only
+    model: str | None = None
+    data_policy_note: str = ""
+    verified: bool = False
 
 
 class WorldPresetInfo(LooseModel):
@@ -824,7 +837,8 @@ GENERATION_OPTIONS: tuple[GenerationOptionInfo, ...] = (
 
 class CapabilitiesOut(APIModel):
     providers: list[ProviderInfo]
-    claude_configured: bool
+    claude_configured: bool  # true for either Claude route (Anthropic direct or OpenRouter)
+    llm: LlmInfo = Field(default_factory=LlmInfo)
     whisper: WhisperInfo
     presets: list[WorldPresetInfo]
     lyric_styles: list[LyricStyleInfo]

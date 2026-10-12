@@ -20,7 +20,14 @@ from app import worker
 from app.config import get_settings
 from app.db import DbSession
 from app.models import Batch, BatchStatus, utcnow
-from app.pipeline import cancel_batch, create_batch, llm_cost_record, preview_batch, update_batch_budget
+from app.pipeline import (
+    cancel_batch,
+    create_batch,
+    llm_cost_label,
+    llm_cost_record,
+    preview_batch,
+    update_batch_budget,
+)
 from app.routers.videos import zip_link, zip_response
 from app.schemas import (
     BatchOut,
@@ -65,15 +72,16 @@ def _claude_preview_allowed(user_id: str) -> None:
 def preview_storyboard(project_id: str, body: StoryboardRequest, db: DbSession, user: CurrentUser) -> Any:
     """Storyboard preview (not stored). Uses Claude when configured; its cost is still recorded.
 
-    Claude receives the lyrics, so it is used only when the ``lyrics_rights`` item is confirmed
-    (otherwise the template is used, with a warning), and at most ``CLAUDE_PREVIEW_LIMIT`` times per
-    ``CLAUDE_PREVIEW_WINDOW_SEC`` per user (429 ``rate_limited``).
+    Claude is reached directly (``ANTHROPIC_API_KEY``) or else via OpenRouter (``OPENROUTER_API_KEY``);
+    both routes get the same guards. Claude receives the lyrics, so it is used only when the
+    ``lyrics_rights`` item is confirmed (otherwise the template is used, with a warning), and at most
+    ``CLAUDE_PREVIEW_LIMIT`` times per ``CLAUDE_PREVIEW_WINDOW_SEC`` per user (429 ``rate_limited``).
     """
     from app.services.storyboard import generate_storyboard
 
     project = get_owned_project(db, project_id, user)
     settings = get_settings()
-    use_claude = settings.anthropic_configured
+    use_claude = settings.llm_configured  # Anthropic direct or OpenRouter: same guards for both routes
     warnings: list[str] = []
     if use_claude and project.lyric_lines and not (project.rights or {}).get("lyrics_rights"):
         use_claude = False
@@ -93,12 +101,13 @@ def preview_storyboard(project_id: str, body: StoryboardRequest, db: DbSession, 
         seed=None,
         use_claude=use_claude,
         artist_aliases=list(project.artist_aliases or []),
+        end_user=user.id,
     )
     if warnings:
         storyboard["warnings"] = [*warnings, *(storyboard.get("warnings") or [])]
     record = llm_cost_record(project.id, None, storyboard)
     if record is not None:
-        record.note = "絵コンテのプレビュー（Claude）"
+        record.note = llm_cost_label(storyboard, "絵コンテのプレビュー")
         db.add(record)
         db.commit()
     return storyboard

@@ -1,10 +1,11 @@
-"""Video generation providers (ARCHITECTURE.md §6.7): mock, library, veo, runway, kling."""
+"""Video generation providers (ARCHITECTURE.md §6.7): mock, library, veo, runway, kling, openrouter."""
 
 from app.services.providers.base import (
     ClipRequest,
     ClipResult,
     ProviderCancelled,
     ProviderModel,
+    ProviderSubmitAmbiguous,
     ProviderTaskError,
     VideoProvider,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "ClipResult",
     "ProviderCancelled",
     "ProviderModel",
+    "ProviderSubmitAmbiguous",
     "ProviderTaskError",
     "VideoProvider",
     "get_provider",

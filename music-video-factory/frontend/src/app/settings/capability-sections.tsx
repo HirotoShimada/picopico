@@ -1,14 +1,16 @@
 "use client";
 
-import { Bot, Captions, CircleCheck, CircleMinus, TriangleAlert } from "lucide-react";
+import { Bot, Captions, CircleCheck, CircleMinus, ListChecks, ShieldAlert, TriangleAlert } from "lucide-react";
 import * as React from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useNow } from "@/hooks/use-now";
 import { PROVIDER_KIND_LABELS, RIGHTS_ITEMS, providerLabel } from "@/lib/constants";
-import { formatPricePerSecond, formatUsd } from "@/lib/format";
-import type { CapabilitiesOut, ProviderInfo } from "@/lib/types";
+import { formatCount, formatDateTime, formatPricePerSecond, formatRelativeTime, formatUsd } from "@/lib/format";
+import { isOpenRouter, isPriceKnown, llmRouteLabel, modelsSourceLabel, resolveLlm } from "@/lib/llm";
+import type { CapabilitiesOut, LlmInfo, ProviderInfo } from "@/lib/types";
 
 import { SettingsSection } from "./section";
 
@@ -52,24 +54,68 @@ function FeatureRow({
   );
 }
 
+function ClaudeRouteDetail({ llm }: { llm: LlmInfo }) {
+  const model = llm.model ? <code className="font-mono text-2xs text-foreground">{llm.model}</code> : null;
+  if (llm.route === "anthropic") {
+    return <>ANTHROPIC_API_KEY が設定されているため、Anthropic の API に直接送ります{model ? <>（モデル {model}）</> : null}。費用は LLM 利用額として記録されます。</>;
+  }
+  if (llm.route === "openrouter") {
+    return (
+      <>
+        ANTHROPIC_API_KEY が未設定で OPENROUTER_API_KEY が設定されているため、OpenRouter 経由で Claude を使います{model ? <>（モデル {model}）</> : null}。
+        費用は OpenRouter の利用額として記録されます。
+      </>
+    );
+  }
+  return <>ANTHROPIC_API_KEY・OPENROUTER_API_KEY がどちらも未設定のため、テンプレートによる絵コンテ生成と内蔵辞書による翻訳を使用します。</>;
+}
+
+/** Which Claude route is in use (Anthropic directly / via OpenRouter / template), its model and data policy. */
+function ClaudeRouteRow({ llm }: { llm: LlmInfo }) {
+  return (
+    <div className="flex items-start gap-3 py-3 first:pt-0 last:pb-0" data-testid="claude-route">
+      <div className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-surface-raised">
+        <Bot className="size-4 text-muted-foreground" aria-hidden />
+      </div>
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm font-medium text-foreground">Claude（絵コンテ生成・プロンプト翻訳）</p>
+          <Badge tone={llm.route ? "success" : "neutral"}>{llmRouteLabel(llm.route)}</Badge>
+          {llm.route && !llm.verified ? (
+            <Badge tone="warning" title="実際の API キーでの呼び出しはまだ確認していません（モックした応答でのみテスト済み）">
+              <TriangleAlert aria-hidden />
+              未検証
+            </Badge>
+          ) : null}
+        </div>
+        <p className="text-xs leading-5 text-muted-foreground">歌詞・雰囲気からシーン構成と英語プロンプトを作成します。</p>
+        <p className="text-xs leading-5 text-foreground/80">
+          <ClaudeRouteDetail llm={llm} />
+        </p>
+        <p className="text-2xs leading-4 text-subtle-foreground">
+          経路の優先順: ANTHROPIC_API_KEY（Anthropic 直接）→ OPENROUTER_API_KEY（OpenRouter 経由）→ テンプレート
+        </p>
+        {llm.data_policy_note ? (
+          <div className="mt-1 flex items-start gap-2 rounded-md border border-border bg-surface-raised/50 px-3 py-2 text-xs leading-5 text-muted-foreground">
+            <ShieldAlert className="mt-0.5 size-3.5 shrink-0 text-subtle-foreground" aria-hidden />
+            <p>
+              <span className="font-medium text-foreground/90">送信するデータ: </span>
+              {llm.data_policy_note}
+            </p>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 export function AiFeaturesSection({ capabilities }: { capabilities: CapabilitiesOut }) {
   const { whisper } = capabilities;
+  const llm = resolveLlm(capabilities);
   return (
     <SettingsSection id="ai" title="AI 機能" description="LLM と音声認識は任意です。未設定でも代替手段で動作します。">
       <div className="flex flex-col divide-y divide-border px-5 pb-5">
-        <FeatureRow
-          icon={Bot}
-          title="Claude（ストーリーボード生成・プロンプト翻訳）"
-          description="歌詞・雰囲気からシーン構成と英語プロンプトを作成します。"
-          ok={capabilities.claude_configured}
-          okLabel="利用可能"
-          ngLabel="未設定"
-          detail={
-            capabilities.claude_configured
-              ? "ANTHROPIC_API_KEY が設定されています。費用は LLM 利用額として記録されます。"
-              : "ANTHROPIC_API_KEY が未設定のため、テンプレートによるストーリーボード生成と内蔵辞書による翻訳を使用します。"
-          }
-        />
+        {llm ? <ClaudeRouteRow llm={llm} /> : null}
         <FeatureRow
           icon={Captions}
           title="Whisper（歌詞の自動タイミング合わせ）"
@@ -88,18 +134,42 @@ export function AiFeaturesSection({ capabilities }: { capabilities: Capabilities
   );
 }
 
+/** Where a fetched model list (OpenRouter) came from, how many models it has and how old it is. */
+function ModelListStatus({ provider }: { provider: ProviderInfo }) {
+  const now = useNow();
+  const source = modelsSourceLabel(provider);
+  const unknownPrice = provider.models.filter((model) => !isPriceKnown(model)).length;
+  const fetchedAt = provider.models_fetched_at;
+  const count = `${formatCount(provider.models.length)} モデル${unknownPrice > 0 ? `（料金未取得 ${formatCount(unknownPrice)}・選択不可）` : ""}`;
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-border bg-surface-raised/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
+      <p className="flex items-start gap-2">
+        <ListChecks className="mt-0.5 size-3.5 shrink-0 text-subtle-foreground" aria-hidden />
+        <span>
+          <span className="text-foreground/90">モデル一覧: {source}</span> ・ {count}
+          {/* The fetch time of the listing (also of a cached one); the built-in candidates have none. */}
+          {fetchedAt ? (
+            <span title={formatDateTime(fetchedAt)}> ・ 取得 {now > 0 ? formatRelativeTime(fetchedAt, now) : formatDateTime(fetchedAt)}</span>
+          ) : null}
+        </span>
+      </p>
+      {provider.models_note ? <p className="pl-5.5">{provider.models_note}</p> : null}
+    </div>
+  );
+}
+
 export function ProvidersSection({ capabilities }: { capabilities: CapabilitiesOut }) {
   return (
     <SettingsSection
       id="providers"
       title="動画生成プロバイダー"
-      description="API キーはバックエンドの環境変数（KLING_API_KEY / RUNWAY_API_KEY / GOOGLE_API_KEY）で設定します。"
+      description="API キーはバックエンドの環境変数（KLING_API_KEY / RUNWAY_API_KEY / GOOGLE_API_KEY / OPENROUTER_API_KEY）で設定します。"
     >
       <ul className="flex flex-col divide-y divide-border border-t border-border">
         {capabilities.providers.map((provider) => {
           const unverified = provider.models.filter((model) => !model.verified).length;
           return (
-            <li key={provider.id} className="flex flex-col gap-2 px-5 py-4">
+            <li key={provider.id} className="flex flex-col gap-2 px-5 py-4" data-provider={provider.id}>
               <div className="flex flex-wrap items-center gap-2">
                 <p className="text-sm font-medium text-foreground">{provider.name || providerLabel(provider.id)}</p>
                 <Badge tone="outline">{PROVIDER_KIND_LABELS[provider.kind] ?? provider.kind}</Badge>
@@ -127,9 +197,16 @@ export function ProvidersSection({ capabilities }: { capabilities: CapabilitiesO
                   生成に使用できます
                 </p>
               ) : null}
+              {provider.models_source ? <ModelListStatus provider={provider} /> : null}
               {provider.models.length > 0 ? (
                 <p className="text-xs text-subtle-foreground">
                   モデル: {provider.models.map((model) => model.name || model.id).join(" / ")}
+                </p>
+              ) : null}
+              {isOpenRouter(provider.id) ? (
+                <p className="text-xs leading-5 text-subtle-foreground">
+                  OpenRouter は各社の動画モデルを中継します。プロンプトは OpenRouter とモデルの提供元に送られ、音声の生成はオフで依頼します。
+                  OPENROUTER_API_KEY だけを設定した場合は、Claude の絵コンテも OpenRouter 経由になります（上の「AI 機能」）。
                 </p>
               ) : null}
             </li>
@@ -182,15 +259,31 @@ export function PricingSection({ capabilities }: { capabilities: CapabilitiesOut
                     <span className="font-mono text-2xs break-all text-muted-foreground">{model.id}</span>
                   </div>
                 </TableCell>
-                <TableCell className="text-right whitespace-nowrap tabular">{formatPricePerSecond(model.price_per_second_usd)}</TableCell>
-                <TableCell className="text-right whitespace-nowrap tabular">{formatUsd(model.price_per_second_usd * 5)}</TableCell>
+                {isPriceKnown(model) && model.price_per_second_usd !== null ? (
+                  <>
+                    <TableCell className="text-right whitespace-nowrap tabular">{formatPricePerSecond(model.price_per_second_usd)}</TableCell>
+                    <TableCell className="text-right whitespace-nowrap tabular">{formatUsd(model.price_per_second_usd * 5)}</TableCell>
+                  </>
+                ) : (
+                  <>
+                    <TableCell className="text-right whitespace-nowrap text-muted-foreground">料金未取得</TableCell>
+                    <TableCell className="text-right text-muted-foreground">—</TableCell>
+                  </>
+                )}
                 <TableCell className="whitespace-nowrap text-muted-foreground tabular">
                   {clipDurationsLabel(model.clip_durations, model.max_clip_duration)}
                 </TableCell>
                 <TableCell>
                   <div className="flex flex-col items-start gap-1">
                     <span className="whitespace-nowrap text-muted-foreground">{model.resolution}</span>
-                    {model.supports_vertical ? <Badge tone="success">9:16 対応</Badge> : <Badge tone="warning">クロップ</Badge>}
+                    {model.supports_vertical ? (
+                      <Badge tone="success">9:16 対応</Badge>
+                    ) : isOpenRouter(provider.id) ? (
+                      // The listing does not say; OpenRouter is always asked for 9:16 (an unsupported model refuses it).
+                      <Badge tone="warning">9:16 未確認</Badge>
+                    ) : (
+                      <Badge tone="warning">クロップ</Badge>
+                    )}
                   </div>
                 </TableCell>
                 <TableCell>

@@ -18,6 +18,7 @@ from app.schemas import (
     FontInfo,
     HealthOut,
     LimitsInfo,
+    LlmInfo,
     LyricStyleInfo,
     ProviderInfo,
     WhisperInfo,
@@ -108,8 +109,10 @@ def available_fonts() -> list[FontInfo]:
 def capabilities(_user: CurrentUser) -> CapabilitiesOut:
     """Providers (configured/available, models, prices), Claude/Whisper availability, presets and limits.
 
-    Never contains secrets: only booleans and reasons.
+    ``claude_configured`` is true for either Claude route; ``llm`` says which one (Anthropic direct or
+    OpenRouter), its model and what is sent where. Never contains secrets: only booleans and reasons.
     """
+    from app.services.llm import llm_info
     from app.services.lyrics_align import whisper_available
     from app.services.presets import color_grade_infos, lyric_style_infos, preset_infos
     from app.services.providers import provider_info
@@ -118,7 +121,8 @@ def capabilities(_user: CurrentUser) -> CapabilitiesOut:
     whisper_ok, whisper_reason = whisper_available()
     return CapabilitiesOut(
         providers=[ProviderInfo.model_validate(p) for p in provider_info()],
-        claude_configured=settings.anthropic_configured,
+        claude_configured=settings.llm_configured,
+        llm=LlmInfo.model_validate(llm_info(settings)),
         whisper=WhisperInfo(available=whisper_ok, reason=whisper_reason),
         presets=[WorldPresetInfo.model_validate(p) for p in preset_infos()],
         lyric_styles=[LyricStyleInfo.model_validate(s) for s in lyric_style_infos()],

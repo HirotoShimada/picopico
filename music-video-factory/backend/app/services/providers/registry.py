@@ -1,7 +1,8 @@
 """Provider registry (ARCHITECTURE.md §6.7).
 
 Order = display order: free sources first, then the hosted APIs in the
-recommended implementation order (docs/VIDEO_PROVIDERS.md §2.1).
+recommended implementation order (docs/VIDEO_PROVIDERS.md §2.1), then the
+OpenRouter aggregator (§8).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from app.services.providers.base import VideoProvider
 from app.services.providers.kling import KlingProvider
 from app.services.providers.library import LibraryProvider
 from app.services.providers.mock import MockProvider
+from app.services.providers.openrouter import OpenRouterProvider
 from app.services.providers.runway import RunwayProvider
 from app.services.providers.veo import VeoProvider
 
@@ -24,6 +26,7 @@ PROVIDER_CLASSES: dict[str, type[VideoProvider]] = {
     VeoProvider.id: VeoProvider,
     RunwayProvider.id: RunwayProvider,
     KlingProvider.id: KlingProvider,
+    OpenRouterProvider.id: OpenRouterProvider,
 }
 PROVIDER_IDS: tuple[str, ...] = tuple(PROVIDER_CLASSES)
 

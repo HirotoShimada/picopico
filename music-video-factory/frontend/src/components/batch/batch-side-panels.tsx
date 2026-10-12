@@ -14,6 +14,7 @@ import { Thumbnail } from "@/components/ui/thumbnail";
 import { useCapabilities, usePresets } from "@/hooks/use-capabilities";
 import { providerLabel } from "@/lib/constants";
 import { formatCount, formatDuration, formatTime, formatUsd } from "@/lib/format";
+import { storyboardFallbackNote, storyboardSourceLabel } from "@/lib/llm";
 import type { BatchDetailOut, ClipOut } from "@/lib/types";
 
 function Row({ label, value }: { label: string; value: React.ReactNode }) {
@@ -151,8 +152,14 @@ export function BatchStoryboardCard({ batch }: { batch: BatchDetailOut }) {
           絵コンテ
         </CardTitle>
         <CardDescription>
-          {storyboard.source === "claude" ? "Claude" : "テンプレート"}で作成 ・ {formatCount(storyboard.scenes.length)} シーン
+          {storyboardSourceLabel(storyboard)}で作成 ・ {formatCount(storyboard.scenes.length)} シーン
           {storyboard.cost_usd > 0 ? ` ・ ${formatUsd(storyboard.cost_usd)}` : ""}
+          {storyboard.source === "claude" && storyboard.model ? (
+            <span className="block font-mono text-2xs break-all text-subtle-foreground" title="絵コンテを作成したモデル">
+              {storyboard.model}
+            </span>
+          ) : null}
+          {storyboardFallbackNote(storyboard) ? <span className="block">{storyboardFallbackNote(storyboard)}</span> : null}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">

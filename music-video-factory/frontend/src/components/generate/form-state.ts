@@ -1,4 +1,4 @@
-import { DEFAULT_COUNTS, DEFAULT_DURATIONS, DEFAULT_GENERATION_SETTINGS, PRESET_IDS } from "@/lib/constants";
+import { DEFAULT_COUNTS, DEFAULT_DURATIONS, DEFAULT_GENERATION_SETTINGS, PRESET_IDS, PROVIDER_LABELS } from "@/lib/constants";
 import type {
   GenerationSettings,
   GenerationSettingsInput,
@@ -48,7 +48,8 @@ export interface GenerateFormState {
 
 export type FormErrors = Partial<Record<"customWorld" | "duration" | "count" | "startSec" | "maxNewClips" | "budget", string>>;
 
-const PROVIDER_IDS: readonly ProviderId[] = ["mock", "library", "kling", "runway", "veo"];
+// Every provider id (PROVIDER_LABELS is a Record over ProviderId, so a new provider cannot be missed here).
+const PROVIDER_IDS = Object.keys(PROVIDER_LABELS) as ProviderId[];
 const START_STRATEGIES: readonly StartStrategy[] = ["segment", "chorus", "varied", "custom"];
 const REUSE_MODES: readonly ReuseMode[] = ["max_variety", "balanced", "economy"];
 

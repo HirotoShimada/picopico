@@ -13,6 +13,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { errorMessage } from "@/lib/api";
 import { providerLabel } from "@/lib/constants";
 import { formatCount, formatDuration, formatPercent, formatPricePerSecond, formatUsd } from "@/lib/format";
+import { isOpenRouter } from "@/lib/llm";
 import type { Estimate, EstimateComparison } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -45,9 +46,16 @@ function Row({
   );
 }
 
-function UnverifiedBadge() {
+function UnverifiedBadge({ provider }: { provider: string }) {
   return (
-    <Badge tone="warning" title="実際の API キーでの検証前の公式料金表に基づく価格です">
+    <Badge
+      tone="warning"
+      title={
+        isOpenRouter(provider)
+          ? "OpenRouter のモデル一覧（または調査値）に基づく価格です。実際の API キーでは未検証です"
+          : "実際の API キーでの検証前の公式料金表に基づく価格です"
+      }
+    >
       <TriangleAlert aria-hidden />
       未検証
     </Badge>
@@ -161,7 +169,7 @@ function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; s
         <div className="flex items-baseline justify-between gap-3 py-1">
           <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
             単価
-            {unverified ? <UnverifiedBadge /> : null}
+            {unverified ? <UnverifiedBadge provider={estimate.provider} /> : null}
           </dt>
           <dd className="text-right font-mono text-xs text-foreground tabular">{formatPricePerSecond(estimate.price_per_second_usd)}</dd>
         </div>

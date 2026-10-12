@@ -3,7 +3,11 @@
 ``PRICING`` is derived from the providers' ``ProviderModel`` entries
 (``app/services/providers``), which are the single source of truth for prices
 (researched in docs/VIDEO_PROVIDERS.md; all hosted-API prices are unverified
-until a real key test passes).
+until a real key test passes). Providers with a ``dynamic_catalogue``
+(OpenRouter: models and prices from its ``/videos/models`` listing, cached)
+are priced live by :func:`get_pricing`; ``PRICING`` only holds an offline
+snapshot of them. Models without a known price (``price_known=False``) are
+left out of the comparison and cannot be selected (``check_model``).
 
 Cost model: ``new clips x clip seconds x $/s`` (+ the storyboard LLM call).
 ``naive_total_usd`` prices the same batch with one freshly generated clip per
@@ -51,6 +55,7 @@ class ModelPricing:
     verified: bool
     text_to_video: bool
     price_note: str
+    price_known: bool = True
 
     @classmethod
     def from_model(cls, provider_id: str, model: ProviderModel) -> ModelPricing:
@@ -67,6 +72,7 @@ class ModelPricing:
             verified=model.verified,
             text_to_video=model.text_to_video,
             price_note=model.price_note,
+            price_known=model.price_known,
         )
 
     def clip_duration_for(self, wanted: float) -> float:
@@ -81,11 +87,17 @@ class ModelPricing:
         return data
 
 
+def _offline_models(provider: VideoProvider) -> list[ProviderModel]:
+    """The provider's models without network access (dynamic catalogues use their cache / built-in list)."""
+    cached = getattr(provider, "cached_models", None)
+    return list(cached()) if callable(cached) else provider.models()
+
+
 def build_pricing(providers: Sequence[VideoProvider] | None = None) -> dict[str, dict[str, ModelPricing]]:
-    """``{provider_id: {model_id: ModelPricing}}`` from the provider catalogue."""
+    """``{provider_id: {model_id: ModelPricing}}`` from the provider catalogue (never fetches)."""
     table: dict[str, dict[str, ModelPricing]] = {}
     for provider in providers if providers is not None else list_providers():
-        table[provider.id] = {m.id: ModelPricing.from_model(provider.id, m) for m in provider.models()}
+        table[provider.id] = {m.id: ModelPricing.from_model(provider.id, m) for m in _offline_models(provider)}
     return table
 
 
@@ -97,7 +109,10 @@ def get_pricing(provider: str, model: str | None = None) -> ModelPricing:
     models = PRICING.get(provider)
     if models is None:
         raise ServiceError(f"不明な動画生成プロバイダです: {provider}", status_code=422, code="provider_unknown")
-    model_id = model or get_provider(provider).default_model()
+    source = get_provider(provider)
+    if getattr(source, "dynamic_catalogue", False):
+        models = {m.id: ModelPricing.from_model(provider, m) for m in source.models()}
+    model_id = model or source.default_model()
     pricing = models.get(model_id)
     if pricing is None:
         raise ServiceError(
@@ -208,7 +223,13 @@ def estimate(
         )
     if not usable:
         notes.append(f"{source.name} はこのままでは生成を開始できません: {unusable_reason}")
-    if source.kind == "api":
+    if source.kind == "api" and getattr(source, "dynamic_catalogue", False):
+        notes.append(
+            "料金は OpenRouter のモデル一覧（または調査値）に基づく概算です。実際の請求額は、生成の完了時に"
+            "OpenRouter が返す実費（usage.cost）で記録します"
+            + ("" if pricing.verified else "（実際の API キーでの検証前のため未検証）")
+        )
+    elif source.kind == "api":
         notes.append(
             f"料金は {pricing.as_of} 時点の公式料金表に基づく概算で、実際の請求額とは異なる場合があります"
             + ("" if pricing.verified else "（実際の API キーでの検証前のため未検証）")
@@ -255,13 +276,14 @@ def _comparison(
 
     The selected model keeps its cache-aware cost; every other model generates
     all ``clips_needed`` clips at its own default clip length (clips cached for
-    one model are not reusable by another).
+    one model are not reusable by another). Models without a known price are
+    left out (they cannot be used).
     """
     rows: list[dict[str, Any]] = []
     for provider in list_providers():
         for model in provider.models():
             is_selected = provider.id == selected.provider and model.id == selected.model
-            if not is_selected and not model.text_to_video:
+            if not is_selected and (not model.text_to_video or not model.price_known):
                 continue
             if is_selected:
                 duration, generation = clip_duration, selected_generation_usd

@@ -114,6 +114,15 @@ export const PROVIDER_LABELS: Record<ProviderId, string> = {
   kling: "Kling",
   runway: "Runway",
   veo: "Veo（Gemini API）",
+  openrouter: "OpenRouter",
+};
+
+/**
+ * Other `CostRecord.provider` values (dashboard usage): the Claude storyboard calls made directly.
+ * Calls via OpenRouter are booked as `openrouter`, together with its video generation.
+ */
+export const COST_PROVIDER_LABELS: Record<string, string> = {
+  anthropic: "Claude（Anthropic 直接）",
 };
 
 export const PROVIDER_KIND_LABELS: Record<ProviderKind, string> = {
@@ -123,7 +132,7 @@ export const PROVIDER_KIND_LABELS: Record<ProviderKind, string> = {
 };
 
 export function providerLabel(id: string): string {
-  return (PROVIDER_LABELS as Record<string, string>)[id] ?? id;
+  return (PROVIDER_LABELS as Record<string, string>)[id] ?? COST_PROVIDER_LABELS[id] ?? id;
 }
 
 export const AUDIO_EXTENSIONS: readonly string[] = ["mp3", "wav", "m4a", "aac", "flac", "ogg"];

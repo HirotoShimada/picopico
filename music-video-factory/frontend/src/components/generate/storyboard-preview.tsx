@@ -15,7 +15,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, isApiError, previewStoryboard } from "@/lib/api";
 import { formatTime, formatUsd } from "@/lib/format";
-import type { PresetId, Storyboard, StoryboardScene } from "@/lib/types";
+import { claudeLabel, storyboardFallbackNote, storyboardSourceLabel } from "@/lib/llm";
+import type { LlmInfo, PresetId, Storyboard, StoryboardScene } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { projectTabHref } from "./links";
@@ -30,6 +31,8 @@ export interface StoryboardPreviewProps {
   /** Blocks the request (e.g. custom preset without text). */
   disabledReason?: string | null;
   claudeConfigured: boolean | undefined;
+  /** How Claude is reached (`CapabilitiesOut.llm`), for the route / model labels. */
+  llm?: LlmInfo;
   /**
    * The project has lyric lines but 「歌詞の権利」 is not confirmed: the server then does not send the
    * lyrics to Claude and previews with the template (with a warning).
@@ -119,6 +122,7 @@ export function StoryboardPreview({
   customWorld,
   disabledReason,
   claudeConfigured,
+  llm,
   lyricsRightsMissing = false,
 }: StoryboardPreviewProps) {
   const [sceneCount, setSceneCount] = React.useState<number>(8);
@@ -153,6 +157,8 @@ export function StoryboardPreview({
         <CardDescription>
           世界観と歌詞からシーン構成と生成プロンプトを試作します（保存されません。生成開始時に改めて作成されます）。
           {claudeConfigured === false ? " Claude が未設定のため、テンプレートで作成します。" : null}
+          {claudeConfigured && llm?.route ? ` ${claudeLabel(llm.route)}で作成します${llm.model ? `（モデル ${llm.model}）` : ""}。` : null}
+          {claudeConfigured && llm?.route === "openrouter" ? "歌詞の本文は OpenRouter を経由して Claude の提供元に送られます。" : null}
         </CardDescription>
         <CardAction>
           <Select value={String(sceneCount)} onValueChange={(value) => setSceneCount(Number(value))} disabled={loading}>
@@ -206,8 +212,14 @@ export function StoryboardPreview({
           </div>
         ) : storyboard ? (
           <div className="flex flex-col gap-4" aria-busy={loading || undefined}>
-            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <Badge tone="outline">{storyboard.source === "claude" ? `Claude${storyboard.model ? `（${storyboard.model}）` : ""}` : "テンプレート"}</Badge>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground" data-testid="storyboard-source">
+              <Badge tone="outline">{storyboardSourceLabel(storyboard)}</Badge>
+              {storyboard.source === "claude" && storyboard.model ? (
+                <span className="font-mono text-2xs text-subtle-foreground" title="絵コンテを作成したモデル">
+                  {storyboard.model}
+                </span>
+              ) : null}
+              {storyboardFallbackNote(storyboard) ? <span>{storyboardFallbackNote(storyboard)}</span> : null}
               <span>{storyboard.scenes.length} シーン</span>
               {storyboard.cost_usd > 0 ? <span>LLM 費用 {formatUsd(storyboard.cost_usd)}</span> : null}
               {outdated ? (

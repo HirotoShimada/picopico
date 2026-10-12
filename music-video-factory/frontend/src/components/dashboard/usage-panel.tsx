@@ -2,6 +2,7 @@ import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/ca
 import { Skeleton } from "@/components/ui/skeleton";
 import { providerLabel } from "@/lib/constants";
 import { formatCount, formatUsd } from "@/lib/format";
+import { isOpenRouter } from "@/lib/llm";
 import type { UsageOut } from "@/lib/types";
 
 /** API spend by provider: a single-series magnitude, so one neutral hue and values as text. */
@@ -67,6 +68,11 @@ export function UsagePanel({ usage, loading }: { usage: UsageOut | undefined; lo
                 </tbody>
               </table>
             )}
+            {rows.some((row) => isOpenRouter(row.provider)) ? (
+              <p className="text-2xs leading-4 text-subtle-foreground">
+                OpenRouter の金額には、動画生成に加えて OpenRouter 経由の Claude（絵コンテ）の費用も含みます。クリップ数は動画生成の分だけです。
+              </p>
+            ) : null}
 
             <dl className="grid grid-cols-3 gap-2 border-t border-border pt-3 text-center">
               <div>

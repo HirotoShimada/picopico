@@ -115,6 +115,7 @@ class ClipSource(StrEnum):
     KLING = "kling"
     RUNWAY = "runway"
     VEO = "veo"
+    OPENROUTER = "openrouter"
 
 
 class ClipStatus(StrEnum):

@@ -39,7 +39,8 @@ def test_pricing_is_derived_from_provider_models() -> None:
             assert list(pricing.clip_durations) == list(model.clip_durations)
             assert pricing.verified == model.verified
             if provider.kind == "api":
-                assert pricing.verified is False and pricing.as_of == "2026-10-11"
+                as_of = "2026-10-12" if provider.id == "openrouter" else "2026-10-11"
+                assert pricing.verified is False and pricing.as_of == as_of
                 assert pricing.source_url.startswith("https://")
             else:
                 assert pricing.price_per_second_usd == 0
@@ -137,7 +138,12 @@ def test_comparison_prices_the_plan_on_every_text_to_video_model(set_env: Callab
     assert rows[("veo", f"{VEO}@1080p")]["total_usd"] == pytest.approx(60 * 8 * 0.08)
     assert rows[("mock", "mock-v1")]["total_usd"] == 0 and rows[("mock", "mock-v1")]["configured"] is True
     assert rows[("runway", "gen4.5")]["configured"] is False and rows[("kling", "kling-3.0")]["configured"] is False
-    assert list(dict.fromkeys(r["provider"] for r in estimate["comparison"])) == ["mock", "veo", "runway", "kling"]
+    assert list(dict.fromkeys(r["provider"] for r in estimate["comparison"])) == [
+        "mock", "veo", "runway", "kling", "openrouter"
+    ]
+    # OpenRouter models (built-in list without a key) are priced at their own default length.
+    assert rows[("openrouter", "google/veo-3.1-lite")]["total_usd"] == pytest.approx(60 * 6 * 0.05)
+    assert rows[("openrouter", "google/veo-3.1-lite")]["configured"] is False
 
 
 def test_selected_image_only_model_is_still_listed() -> None:

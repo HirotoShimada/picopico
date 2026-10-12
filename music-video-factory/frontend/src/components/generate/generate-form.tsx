@@ -25,6 +25,7 @@ import { useClips } from "@/hooks/use-clips";
 import { apiPaths, createBatch, errorMessage } from "@/lib/api";
 import { DEFAULT_COUNTS, DEFAULT_DURATIONS, providerLabel } from "@/lib/constants";
 import { formatCount, formatDuration, formatUsd } from "@/lib/format";
+import { claudeLabel, isOpenRouter, resolveLlm } from "@/lib/llm";
 import type {
   EstimateComparison,
   GenerationSettings,
@@ -168,14 +169,23 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
   const [seed, setSeed] = React.useState(randomSeed);
   const validated = React.useMemo(() => validateForm(state, limits), [state, limits]);
   const errors = validated.errors;
-  const settings = React.useMemo(() => (validated.settings ? { ...validated.settings, seed } : null), [validated.settings, seed]);
+
+  const llm = resolveLlm(capabilities);
+  const providers = capabilities?.providers ?? [];
+  const providerInfo = providers.find((p) => p.id === state.provider);
+  // A model the provider no longer lists (e.g. gone from OpenRouter's model listing since the last batch) is sent
+  // as null = the provider default, which is also what the model select shows (resolveModel).
+  const requestModel =
+    providerInfo && state.model !== null && !providerInfo.models.some((model) => model.id === state.model) ? null : state.model;
+  const settings = React.useMemo(
+    () => (validated.settings ? { ...validated.settings, model: requestModel, seed } : null),
+    [validated.settings, requestModel, seed],
+  );
   const duration = formDuration(state);
   const count = formCount(state);
   const songDuration = project.analysis?.duration ?? project.audio?.duration ?? null;
 
-  const providers = capabilities?.providers ?? [];
-  const providerInfo = providers.find((p) => p.id === state.provider);
-  const modelInfo = resolveModel(providerInfo, state.model);
+  const modelInfo = resolveModel(providerInfo, requestModel);
   const libraryClipCount = clips?.filter((clip) => clip.source === "upload" && clip.status === "ready").length;
   const providerName = providerInfo?.name || providerLabel(state.provider);
   const providerReason = providerInfo
@@ -185,7 +195,10 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
       : null;
 
   const estimateReason = estimateUnavailableReason(project);
-  const estimate = useEstimate(project.id, settings, estimateReason === null);
+  // Wait for the provider list (or its error): until then a model the provider no longer lists cannot be told
+  // apart, and the estimate would price a model the form does not show (see requestModel).
+  const providersSettled = capabilities !== undefined || capabilitiesError !== undefined;
+  const estimate = useEstimate(project.id, settings, estimateReason === null && providersSettled);
   const rightsResets = useRightsResets(project);
 
   const readiness = computeReadiness({
@@ -553,8 +566,8 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
             <div className="flex flex-col gap-0.5">
               <Label htmlFor="generate-new-storyboard">絵コンテを Claude で新しく作り直す</Label>
               <p className="text-xs leading-5 text-muted-foreground">
-                オフの場合、同じ世界観・楽曲・歌詞で前回 Claude が作った絵コンテを再利用します（主人公や世界観がバッチ間で揃い、生成済みの素材も再利用できます）。オンにすると Claude
-                の利用料と、新しい素材の生成費用がかかります。この設定は次回の生成には引き継がれません。
+                オフの場合、同じ世界観・楽曲・歌詞で前回 Claude が作った絵コンテを再利用します（主人公や世界観がバッチ間で揃い、生成済みの素材も再利用できます）。オンにすると
+                {claudeLabel(llm?.route)}の利用料と、新しい素材の生成費用がかかります。この設定は次回の生成には引き継がれません。
               </p>
             </div>
             <Switch
@@ -571,6 +584,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
           customWorld={state.preset === CUSTOM ? state.customWorld.trim() || null : null}
           disabledReason={state.preset === CUSTOM && !state.customWorld.trim() ? "カスタム世界観を入力するとプレビューできます。" : null}
           claudeConfigured={capabilities?.claude_configured}
+          llm={llm}
           lyricsRightsMissing={project.lyric_lines.length > 0 && project.rights.lyrics_rights !== true}
         />
       </div>
@@ -638,7 +652,12 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
             : undefined
         }
       >
-        {estimate.data?.pricing_verified === false ? (
+        {estimate.data?.pricing_verified === false && isOpenRouter(estimate.data.provider) ? (
+          <Alert tone="warning">
+            この価格は OpenRouter のモデル一覧（取得できない場合は {estimate.data.as_of ?? "調査時点"} の調査値）に基づく概算で、実際の API キーでは未検証です。実際の請求額は生成の完了時に
+            OpenRouter が返す金額で記録します。プロンプトは OpenRouter を経由してモデルの提供元に送られます。
+          </Alert>
+        ) : estimate.data?.pricing_verified === false ? (
           <Alert tone="warning">
             この価格は {estimate.data.as_of ?? "調査時点"} の公式料金表に基づく概算で、実際の API キーでは未検証です。実際の請求額はプロバイダーの管理画面で確認してください。
           </Alert>

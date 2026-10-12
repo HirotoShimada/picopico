@@ -75,6 +75,19 @@ class Settings(BaseSettings):
     RUNWAY_API_KEY: str | None = Field(default=None, repr=False)
     RUNWAY_API_BASE: str = "https://api.dev.runwayml.com"
     GOOGLE_API_KEY: str | None = Field(default=None, repr=False)
+    # OpenRouter (docs/VIDEO_PROVIDERS.md §8): one key for the "openrouter" video provider and,
+    # when ANTHROPIC_API_KEY is not set, for Claude storyboards/translation. Never verified against
+    # the real API from the dev container (openrouter.ai is unreachable there).
+    OPENROUTER_API_KEY: str | None = Field(default=None, repr=False)
+    OPENROUTER_API_BASE: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_CLAUDE_MODEL: str = "anthropic/claude-opus-5.5"
+    # Optional app attribution headers (HTTP-Referer / X-OpenRouter-Title); blank = not sent.
+    OPENROUTER_APP_URL: str | None = None
+    OPENROUTER_APP_TITLE: str | None = "AI Music Video Factory"
+    OPENROUTER_VIDEO_DEFAULT_MODEL: str = "google/veo-3.1-lite"
+    # Seconds the GET /videos/models listing is reused (memory + WORK_DIR/cache file) before refetching
+    # (min 60: the catalogue is read many times per request).
+    OPENROUTER_MODELS_CACHE_TTL: int = Field(default=3600, ge=60)
 
     # --- generation defaults ----------------------------------------------------
     DEFAULT_BUDGET_USD: float = Field(default=50.0, ge=0)
@@ -95,6 +108,9 @@ class Settings(BaseSettings):
         "KLING_SECRET_KEY",
         "RUNWAY_API_KEY",
         "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_APP_URL",
+        "OPENROUTER_APP_TITLE",
         "FONTS_DIR",
         mode="before",
     )
@@ -115,10 +131,15 @@ class Settings(BaseSettings):
             value = BACKEND_DIR / value
         return value.resolve()
 
-    @field_validator("PUBLIC_API_BASE_URL")
+    @field_validator("PUBLIC_API_BASE_URL", "OPENROUTER_API_BASE")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("OPENROUTER_CLAUDE_MODEL", "OPENROUTER_VIDEO_DEFAULT_MODEL")
+    @classmethod
+    def _strip_model_id(cls, value: str) -> str:
+        return value.strip()
 
     # --- derived helpers ----------------------------------------------------------
     @property
@@ -140,6 +161,23 @@ class Settings(BaseSettings):
     @property
     def anthropic_configured(self) -> bool:
         return bool(self.ANTHROPIC_API_KEY)
+
+    @property
+    def openrouter_configured(self) -> bool:
+        return bool(self.OPENROUTER_API_KEY)
+
+    @property
+    def llm_route(self) -> Literal["anthropic", "openrouter"] | None:
+        """How Claude is reached: Anthropic directly first, else OpenRouter, else not at all (template)."""
+        if self.anthropic_configured:
+            return "anthropic"
+        if self.openrouter_configured:
+            return "openrouter"
+        return None
+
+    @property
+    def llm_configured(self) -> bool:
+        return self.llm_route is not None
 
     def ensure_dirs(self) -> None:
         self.STORAGE_DIR.mkdir(parents=True, exist_ok=True)

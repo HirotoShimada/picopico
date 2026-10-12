@@ -8,6 +8,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { isRunway, PoweredByRunway } from "@/components/ui/powered-by-runway";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { formatDateTime, formatDuration, formatResolution, formatUsd } from "@/lib/format";
+import { isOpenRouter, openRouterVendor } from "@/lib/llm";
 import { isClipActive } from "@/lib/status";
 import type { ClipOut } from "@/lib/types";
 
@@ -77,6 +78,9 @@ export function ClipPreviewDialog({ clip, onOpenChange, onDelete }: ClipPreviewD
                 <Row label="提供元">
                   {clipSourceLabel(clip)}
                   {clip.model ? <span className="ml-1 text-muted-foreground">（{clip.model}）</span> : null}
+                  {isOpenRouter(clip.source) && openRouterVendor(clip.model) ? (
+                    <span className="block text-xs text-muted-foreground">OpenRouter 経由・モデルの提供元 {openRouterVendor(clip.model)}</span>
+                  ) : null}
                   {isRunway(clip.source) ? <PoweredByRunway className="ml-2 align-middle" /> : null}
                 </Row>
                 {clip.source !== "upload" ? <Row label="費用">{formatUsd(clip.cost_usd)}</Row> : null}

@@ -74,6 +74,7 @@ if os.environ.get("MVF_TEST_KEEP_KEYS") != "1":
         "KLING_SECRET_KEY",
         "RUNWAY_API_KEY",
         "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
     ):
@@ -86,8 +87,10 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 def _clear_caches() -> None:
     from app.config import get_settings
+    from app.services.providers.openrouter import reset_model_cache
     from app.storage import get_storage
 
+    reset_model_cache()  # OpenRouter's /videos/models listing (memory + WORK_DIR file); reads settings
     get_settings.cache_clear()
     get_storage.cache_clear()
 

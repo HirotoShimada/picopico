@@ -83,6 +83,7 @@ from app.services.errors import (
     RenderError,
     ServiceError,
 )
+from app.services.llm import configured_model as llm_configured_model
 from app.services.media import make_thumbnail, sanitize_filename
 from app.services.presets import COLOR_GRADES
 from app.services.providers import ClipRequest, ProviderCancelled, ProviderTaskError, VideoProvider, get_provider
@@ -142,8 +143,10 @@ LLM_ESTIMATE_INPUT_TOKENS = 6000
 LLM_ESTIMATE_OUTPUT_TOKENS_PER_SCENE = 700
 LLM_ESTIMATE_OUTPUT_TOKENS_BASE = 1500
 ANTHROPIC_PROVIDER = "anthropic"
+OPENROUTER_PROVIDER = "openrouter"  # LLM cost records of the OpenRouter Claude route (and its video provider id)
 RIGHTS_UNCONFIRMED_MESSAGE = "権利確認チェックリストのすべての項目を確認してから生成してください。"
 BUDGET_REFUSED_MESSAGE = "予算上限に達したため生成しませんでした。"
+RESUME_FAILED_NOTE = "。中断前に作成した生成ジョブを再開できなかったため、推定額を課金済みとして計上しました。"
 
 _TERMINAL_REOPENABLE = frozenset(
     {BatchStatus.COMPLETED, BatchStatus.PARTIAL, BatchStatus.FAILED, BatchStatus.CANCELLED, BatchStatus.BUDGET_EXCEEDED}
@@ -530,19 +533,24 @@ def build_storyboard(project: Project, settings: Mapping[str, Any], *, use_claud
         seed=None,  # stable per song/preset, so later batches hit the clip cache
         use_claude=use_claude,
         artist_aliases=list(project.artist_aliases or []),
+        end_user=project.owner_id,
     )
 
 
 def llm_estimate_usd(settings: Mapping[str, Any], n_scenes: int = DEFAULT_SCENES) -> float:
-    """Expected cost of the Claude storyboard call (0 without a key or in library mode)."""
+    """Expected cost of the Claude storyboard call (0 without a Claude route or in library mode).
+
+    Priced at the Anthropic list price of the route's model on both routes (OpenRouter's
+    ``usage.cost`` replaces it once the call is made).
+    """
     app_settings = get_settings()
-    if not app_settings.anthropic_configured or settings.get("provider") == "library":
+    if not app_settings.llm_configured or settings.get("provider") == "library":
         return 0.0
     usage = {
         "input_tokens": LLM_ESTIMATE_INPUT_TOKENS,
         "output_tokens": LLM_ESTIMATE_OUTPUT_TOKENS_BASE + LLM_ESTIMATE_OUTPUT_TOKENS_PER_SCENE * max(1, n_scenes),
     }
-    return claude_cost_usd(app_settings.ANTHROPIC_MODEL, usage)
+    return claude_cost_usd(llm_configured_model(), usage)
 
 
 def _plan(
@@ -1177,25 +1185,37 @@ def analyze_project_audio(project_id: str) -> None:
 
 
 def llm_cost_record(project_id: str, batch_id: str | None, storyboard: Mapping[str, Any]) -> CostRecord | None:
+    """LLM CostRecord of a storyboard's Claude call (``None`` when it cost nothing).
+
+    ``provider`` is the route the call took: ``"anthropic"`` (direct) or ``"openrouter"``
+    (amount = OpenRouter's reported ``usage.cost`` when present).
+    """
     amount = float(storyboard.get("cost_usd") or 0.0)
     if amount <= 0:
         return None
     usage = storyboard.get("usage") or {}
     tokens = sum(int(v or 0) for v in usage.values()) if isinstance(usage, Mapping) else 0
+    via_openrouter = storyboard.get("route") == OPENROUTER_PROVIDER
     return CostRecord(
         project_id=project_id,
         batch_id=batch_id,
         kind=CostKind.LLM,
-        provider=ANTHROPIC_PROVIDER,
+        provider=OPENROUTER_PROVIDER if via_openrouter else ANTHROPIC_PROVIDER,
         model=storyboard.get("model"),
         units=float(tokens),
         unit=CostUnit.TOKEN,
         unit_price_usd=round(amount / tokens, 10) if tokens else 0.0,
         amount_usd=round(amount, 6),
         cached=False,
-        note="絵コンテ生成（Claude）"
+        note=llm_cost_label(storyboard, "絵コンテ生成")
         + ("" if storyboard.get("source") == "claude" else "・テンプレートにフォールバック"),
     )
+
+
+def llm_cost_label(storyboard: Mapping[str, Any], what: str) -> str:
+    """``絵コンテ生成（Claude）`` / ``…（Claude・OpenRouter 経由）`` for cost-record notes."""
+    via = "・OpenRouter 経由" if storyboard.get("route") == OPENROUTER_PROVIDER else ""
+    return f"{what}（Claude{via}）"
 
 
 def _create_plan_rows(
@@ -1286,7 +1306,7 @@ def _plan_batch_rows(db: Session, batch: Batch, token: datetime) -> bool:
     project = batch.project
     data, provider = resolve_generation_settings(project, dict(batch.settings or {}))
     stored = stored_storyboard(db, project, data)
-    storyboard = stored or build_storyboard(project, data, use_claude=get_settings().anthropic_configured)
+    storyboard = stored or build_storyboard(project, data, use_claude=get_settings().llm_configured)
     if storyboard is not None and stored is None:
         storyboard["world_key"] = storyboard_world_key(project, data)
     llm_record = llm_cost_record(project.id, batch.id, storyboard) if storyboard and stored is None else None
@@ -1412,19 +1432,25 @@ def _accepts_keyword(fn: Callable[..., Any], name: str) -> bool:
 _ENDED_WITH_ERROR = frozenset({"provider_failed", "provider_content_filtered"})
 
 
-def _billed_usd(provider: VideoProvider, exc: BaseException, estimate: float) -> float:
+def _billed_usd(provider: VideoProvider, exc: BaseException, estimate: float, *, resumed: bool = False) -> float:
     """What a failed attempt is known or presumed to have cost (0 when nothing was billed).
 
     * Known: the provider reports it — ``exc.cost_usd`` is authoritative even
       when it is 0 (e.g. Runway's ``cost.credits`` of a FAILED task, or the
       price of a finished job whose video could not be fetched) — or
-      ``exc.billed`` is set (then the estimate is booked).
+      ``exc.billed`` is set (then the estimate is booked), e.g. a submission
+      whose outcome is unknown (``ProviderSubmitAmbiguous``: a job may exist,
+      so it is not sent again).
     * Not billed: nothing was submitted, or the remote job ended with an
       error of its own (:data:`_ENDED_WITH_ERROR`), so it may be retried.
     * Presumed billed (table price): the job finished but its output was
       unusable (``provider_bad_output``), or it was **abandoned** while it may
       still run — a timeout, lost polling or a cancel — on a provider without a
       remote cancel (Veo, Kling). Runway's abandoned tasks are DELETEd.
+    * ``resumed``: the attempt picked up a job submitted before a restart. If it
+      failed before the job could be followed (no :class:`ProviderTaskError`
+      for the job: e.g. credentials gone, a bad token), the job still runs and
+      is billed — presumed billed at ``estimate`` (the submit-time estimate).
     """
     if getattr(provider, "kind", "") != "api":
         return 0.0
@@ -1434,7 +1460,7 @@ def _billed_usd(provider: VideoProvider, exc: BaseException, estimate: float) ->
     if getattr(exc, "billed", False):
         return estimate
     if not isinstance(exc, ProviderTaskError) or not exc.external_job_id:
-        return 0.0
+        return estimate if resumed else 0.0
     if exc.code == "provider_bad_output":
         return estimate
     if exc.code in _ENDED_WITH_ERROR:
@@ -1498,18 +1524,25 @@ def _without(params: Mapping[str, Any] | None, *keys: str) -> dict[str, Any]:
 def _refuse_for_budget(db: Session, clip: Clip) -> ClipRun:
     clip.status = ClipStatus.CANCELLED
     clip.error = BUDGET_REFUSED_MESSAGE
-    clip.params = {**_without(clip.params, "reserved_usd", "open_job"), "budget_refused": True}
+    clip.params = {**_without(clip.params, "reserved_usd", "open_job", "submitted_usd"), "budget_refused": True}
     db.commit()
     return ClipRun(ClipStatus.CANCELLED, budget_refused=True)
 
 
-def _record_submitted(db: Session, clip: Clip, job_id: Any, token: Any = None) -> None:
+def _record_submitted(db: Session, clip: Clip, job_id: Any, token: Any = None, *, estimate: float = 0.0) -> None:
     """``on_submitted(job_id, resume_token)`` hook: persist the remote job at once, so a restart can
-    resume (or book) it. ``params.open_job`` holds the token :meth:`resume` takes."""
+    resume (or book) it. ``params.open_job`` holds the token :meth:`resume` takes; ``params.submitted_usd``
+    the attempt's estimate, which prices the job after a restart even if the provider's catalogue no
+    longer lists or prices its model (and is booked when the job cannot be resumed at all)."""
     try:
         clip.external_job_id = str(job_id)[:200]
         open_job = str(token if token else job_id)
-        clip.params = {**dict(clip.params or {}), "open_job": open_job, "submitted_at": utcnow().isoformat()}
+        clip.params = {
+            **dict(clip.params or {}),
+            "open_job": open_job,
+            "submitted_at": utcnow().isoformat(),
+            "submitted_usd": round(float(estimate), 6),
+        }
         db.commit()
     except Exception:
         logger.warning("clip %s: could not record submitted job %s", clip.id, job_id, exc_info=True)
@@ -1521,7 +1554,7 @@ def _book_failed_attempt(
 ) -> None:
     """Settle an attempt that did not produce a clip: release its reservation, book what it cost (no commit)."""
     _add_batch_cost(db, batch_id, billed - reserved)
-    clip.params = _without(clip.params, "reserved_usd", "open_job")
+    clip.params = _without(clip.params, "reserved_usd", "open_job", "submitted_usd")
     if billed <= 0:
         return
     clip.cost_usd = round(float(clip.cost_usd or 0.0) + billed, 6)
@@ -1566,7 +1599,9 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
     * Providers whose ``generate`` takes ``on_submitted`` report the job id right after submission
       (persisted as ``external_job_id`` / ``params.open_job``); a clip with an open job and a provider
       with ``resume(job_id, req, out_path, *, timeout, cancel_check)`` resumes polling it instead of
-      submitting again.
+      submitting again. The job is priced with the estimate stored at submission (``params.submitted_usd``,
+      passed on as ``resume(..., submitted_usd=)`` when accepted), whatever the provider's catalogue says
+      now; when the job cannot be followed at all, that estimate is booked as presumed billed.
     * The rights checklist must still be confirmed; cancellation → ``cancelled``; anything else →
       ``failed`` with a Japanese error.
     """
@@ -1589,28 +1624,48 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
             return ClipRun(clip.status)
         params = dict(clip.params or {})
         batch_id = params.get("batch_id")
+        duration = float(params.get("duration") or cost_service.TARGET_CLIP_SEC)
+        submitted_usd: float | None = None
         try:
             provider = get_provider(clip.provider)
             model_id = clip.model or provider.default_model()
-            pps = cost_service.get_pricing(provider.id, model_id).price_per_second_usd
+            resume = getattr(provider, "resume", None)
+            resume_job = params.get("open_job") if callable(resume) else None
+            if resume_job:
+                # The job exists and was priced when it was submitted: the provider's current catalogue
+                # (which may have dropped or stopped pricing the model since) must not stop us following it.
+                submitted_usd = _num(params.get("submitted_usd"))
+            try:
+                pricing = cost_service.get_pricing(provider.id, model_id)
+            except ServiceError:
+                if not resume_job:
+                    raise
+                pricing = None
         except ServiceError as exc:
             clip.status = ClipStatus.FAILED
             clip.error = exc.message or "動画素材の生成に失敗しました。"
             db.commit()
             return ClipRun(clip.status)
+        if submitted_usd is not None:
+            estimate = max(0.0, submitted_usd)
+            pps = round(estimate / duration, 6) if duration > 0 else 0.0
+        else:
+            estimate = pricing.clip_cost_usd(duration) if pricing is not None else 0.0
+            pps = pricing.price_per_second_usd if pricing is not None else 0.0
         request = ClipRequest(
             prompt=clip.prompt or "",
             negative_prompt=clip.negative_prompt or "",
-            duration=float(params.get("duration") or cost_service.TARGET_CLIP_SEC),
+            duration=duration,
             model=model_id,
             aspect_ratio=str(params.get("aspect_ratio") or "9:16"),
             seed=params.get("seed"),
             scene=params.get("hints"),
         )
-        estimate = _clip_cost_estimate(clip)
         cancel = _ClipHeartbeat(clip_id, cancel_check)
-        resume_job = params.get("open_job") if callable(getattr(provider, "resume", None)) else None
         report_submit = _accepts_keyword(provider.generate, "on_submitted")
+        resume_extra: dict[str, Any] = {}
+        if resume_job and submitted_usd is not None and _accepts_keyword(resume, "submitted_usd"):
+            resume_extra["submitted_usd"] = submitted_usd  # prices the job if the catalogue no longer can
 
         for attempt in range(1, MAX_CLIP_ATTEMPTS + 1):
             if cancel():
@@ -1626,17 +1681,18 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
             out_dir = _work_dir("clips", clip.id)
             out_path = str(out_dir / "clip.mp4")
             result = None
+            resuming = bool(resume_job)
             try:
                 if resume_job:
                     logger.info("clip %s: resuming remote job %s", clip.id, resume_job)
                     result = provider.resume(  # type: ignore[attr-defined]
-                        resume_job, request, out_path, timeout=CLIP_TIMEOUT_SEC, cancel_check=cancel
+                        resume_job, request, out_path, timeout=CLIP_TIMEOUT_SEC, cancel_check=cancel, **resume_extra
                     )
                 else:
                     extra: dict[str, Any] = {}
                     if report_submit:
                         extra["on_submitted"] = lambda job_id, token=None, *_args, **_kw: _record_submitted(
-                            db, clip, job_id, token
+                            db, clip, job_id, token, estimate=estimate
                         )
                     result = provider.generate(
                         request, out_path, timeout=CLIP_TIMEOUT_SEC, cancel_check=cancel, **extra
@@ -1651,7 +1707,7 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
                 clip.cost_usd = round(float(clip.cost_usd or 0.0) + amount, 6)
                 clip.external_job_id = result.external_job_id
                 clip.error = None
-                clip.params = _without(clip.params, "reserved_usd", "open_job", "budget_refused")
+                clip.params = _without(clip.params, "reserved_usd", "open_job", "submitted_usd", "budget_refused")
                 db.add(
                     CostRecord(
                         project_id=clip.project_id,
@@ -1665,7 +1721,8 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
                         unit_price_usd=pps,
                         amount_usd=round(amount, 6),
                         cached=False,
-                        note=None,
+                        # e.g. OpenRouter: whether the amount is its reported usage.cost or an estimate
+                        note=(result.raw or {}).get("cost_note"),
                     )
                 )
                 _add_batch_cost(db, batch_id, amount - estimate)
@@ -1673,7 +1730,7 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
                 return ClipRun(clip.status)
             except ProviderCancelled as exc:
                 db.rollback()
-                billed = _billed_usd(provider, exc, estimate)
+                billed = _billed_usd(provider, exc, estimate, resumed=resuming)
                 known = _num(getattr(exc, "cost_usd", None)) is not None
                 _book_failed_attempt(
                     db, clip, batch_id=batch_id, reserved=estimate, billed=billed, presumed=not known,
@@ -1685,10 +1742,11 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
                 return ClipRun(clip.status)
             except ProviderNotConfigured as exc:
                 db.rollback()
-                _book_failed_attempt(db, clip, batch_id=batch_id, reserved=estimate, billed=0.0, presumed=False,
+                billed = _billed_usd(provider, exc, estimate, resumed=resuming)  # a resumed job runs anyway
+                _book_failed_attempt(db, clip, batch_id=batch_id, reserved=estimate, billed=billed, presumed=True,
                                      units=request.duration)  # fmt: skip
                 clip.status = ClipStatus.FAILED
-                clip.error = exc.message
+                clip.error = exc.message.rstrip("。") + RESUME_FAILED_NOTE if billed > 0 else exc.message
                 db.commit()
                 return ClipRun(clip.status)
             except ProviderError as exc:
@@ -1696,13 +1754,15 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
                 if isinstance(exc, ProviderTaskError):
                     clip.external_job_id = exc.external_job_id or clip.external_job_id
                     clip.params = {**dict(clip.params or {}), "failure_code": exc.failure_code}
-                billed = _billed_usd(provider, exc, estimate)
+                billed = _billed_usd(provider, exc, estimate, resumed=resuming)
                 known = _num(getattr(exc, "cost_usd", None)) is not None
                 _book_failed_attempt(
                     db, clip, batch_id=batch_id, reserved=estimate, billed=billed, presumed=not known,
                     units=request.duration,
                 )  # fmt: skip
                 clip.error = exc.message or "動画素材の生成に失敗しました。"
+                if resuming and billed > 0 and not known and not isinstance(exc, ProviderTaskError):
+                    clip.error = clip.error.rstrip("。") + RESUME_FAILED_NOTE
                 if exc.retryable and attempt < MAX_CLIP_ATTEMPTS and billed <= 0:
                     db.commit()  # stays ``generating`` (owned by this task) during the backoff
                     delay = RETRY_BACKOFF_SEC[min(attempt - 1, len(RETRY_BACKOFF_SEC) - 1)]
@@ -1725,13 +1785,18 @@ def _generate_clip(clip_id: str, *, cancel_check: Callable[[], bool] | None = No
                 db.rollback()
                 # A paid result that could not be stored (storage/thumbnail error) is still billed.
                 billed = float(result.cost_usd or 0.0) if result is not None and provider.kind == "api" else 0.0
+                presumed = False
+                if result is None and resuming and provider.kind == "api":
+                    billed, presumed = estimate, True  # the resumed job runs (and is billed) anyway
                 if result is not None and result.external_job_id:
                     clip.external_job_id = result.external_job_id
-                _book_failed_attempt(db, clip, batch_id=batch_id, reserved=estimate, billed=billed, presumed=False,
+                _book_failed_attempt(db, clip, batch_id=batch_id, reserved=estimate, billed=billed, presumed=presumed,
                                      units=request.duration)  # fmt: skip
                 clip.status = ClipStatus.FAILED
                 clip.error = "動画素材の生成中に予期しないエラーが発生しました。"
-                if billed > 0:
+                if presumed:
+                    clip.error = clip.error.rstrip("。") + RESUME_FAILED_NOTE
+                elif billed > 0:
                     clip.error = "生成した動画素材を保存できませんでした（生成は完了・課金済みです）。"
                 db.commit()
                 return ClipRun(clip.status)
@@ -2709,6 +2774,7 @@ def _reset_orphaned_clips(db: Session, cutoff: datetime) -> int:
         presumed_billed = api and not resumable and reserved > 0 and (bool(open_job) or not reports_submit)
         if not resumable:
             params.pop("open_job", None)
+            params.pop("submitted_usd", None)
         result = db.execute(
             update(Clip)
             .where(Clip.id == clip.id, Clip.status == ClipStatus.GENERATING, Clip.updated_at <= cutoff)

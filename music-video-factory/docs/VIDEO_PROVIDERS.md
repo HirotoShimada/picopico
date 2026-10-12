@@ -3,6 +3,7 @@
 - 調査日: **2026-10-11**（以下、特記なき「as of」はこの日付）
 - 目的: AI Music Video Factory で 9:16（Instagram ストーリーズ）向けのフォトリアル素材クリップを生成するための公式 API の比較と、アダプタ実装（`app/services/providers/{kling,runway,veo}.py`）・料金表（`app/services/cost.py` の `PRICING`）の根拠をまとめる。
 - 対象: 公式（ファーストパーティ）API のみ。非公式ラッパー、再販業者（piapi / kie.ai / useapi.net / klingapi.com 等）、ブラウザ自動操作は対象外。
+  - 例外: 利用者の判断で、複数社のモデルを 1 本のキーで呼べる集約 API の **OpenRouter** を、動画生成と Claude（絵コンテ・翻訳）の両方に使う。OpenRouter には公式 SDK があるため、その SDK を一次情報として §8 にまとめた（2026-10-12 調査）。
 
 ## 調査方法と信頼度ラベル
 
@@ -39,6 +40,10 @@
    - `config.py` への `KLING_API_KEY` の追加と `KLING_API_BASE` の既定値変更は対応済み（§2.4）。
 4. **OpenAI Sora API は 2026-09-24 に提供終了済み**のため対象外 [A]。Luma、MiniMax Hailuo、ByteDance Seedance（BytePlus）、Alibaba Wan には公式 API がある。ただし今回の 3 社で足り、かつ Seedance、Hailuo、Wan の一部は Runway 経由でも呼べるため、MVP では実装しない。
 5. 30 本 × 15 秒の場合、クリップを再利用（`balanced`、60 クリップ）すると、Veo 3.1 Lite 720p で **$18**（再利用なしなら $54）、Runway gen4.5 で **$36**（同 $108）になる。詳しくは §3。
+6. **OpenRouter**（§8）を使うと、1 本のキーで Veo 3.1 / Kling / Hailuo / Seedance / Wan などの動画モデルと Claude を呼べる。ただし次の制約がある。
+   - このサンドボックスからは `openrouter.ai` に接続できず、実リクエストは一度も通していない。すべて未検証（`verified: false`）。
+   - 動画生成はゼロデータ保持（ZDR）の対象外。
+   - Claude 経由の絵コンテでは、歌詞が OpenRouter とその先の提供元（Anthropic / Amazon Bedrock / Google Vertex / Azure / Claude Platform on AWS のいずれか）を通る。
 
 ---
 
@@ -664,3 +669,514 @@ GET https://api-singapore.klingai.com/tasks?external_task_ids=<id>    // 公式�
 - フォーラム（参考。公式の記述ではない）:
   - https://discuss.ai.google.dev/t/veo-3-1-lite-fast-429-resource-exhausted-for-48h-daily-quota-not-resetting-on-tier-1/172205
   - https://discuss.ai.google.dev/t/veo-3-1-image-to-video-rejects-documented-persongeneration-allow-adult/181139
+
+---
+
+## 8. OpenRouter（動画・Claude）
+
+- 調査日: **2026-10-12**
+- 位置づけ: OpenRouter は、複数社の AI モデルを 1 本の API キーと 1 つの請求先で呼べる集約（ルーター）API。動画生成（`/videos`）と LLM（`/chat/completions`）の両方がある。モデルそのものは各提供元（Google、Kuaishou、MiniMax、ByteDance、Alibaba、Anthropic など）が動かし、OpenRouter はリクエストを中継する。
+- 本アプリでの使い方（利用者の決定）: 動画生成と Claude（絵コンテ・翻訳）の両方に使う。LLM は次の順で選ぶ。
+  1. `ANTHROPIC_API_KEY` がある: Anthropic に直接送る（既存のコード。挙動は変えない）。
+  2. なく、`OPENROUTER_API_KEY` がある: OpenRouter 経由で Claude に送る。
+  3. どちらもない: テンプレートで作る（外部に送らない）。
+- **このサンドボックスからは `openrouter.ai` に接続できない**（WebFetch は DNS 解決失敗、curl はプロキシの 403）。実リクエストは一度も送っていない。以下の形状は公式 SDK のソースと Web 検索の抜粋から組み立てたもので、実装のテストも respx のモックだけになる。OpenRouter 関連のモデル・料金はすべて `verified: false` として扱う。
+
+### 8.0 情報源と信頼度
+
+§0 冒頭のラベルを次の意味で使う。
+
+| ラベル | この節での意味 |
+|---|---|
+| **[A]** | 公式 SDK のソースを本セッションで読んだ。主に npm `@openrouter/sdk@1.4.25`（2026-10-06 公開、作者 OpenRouter、Apache-2.0）の zod スキーマと `esm/funcs/*.js`。補助として PyPI `openrouter==1.3.43`（2026-10-11 公開、sha256 `1e549644…25ce` を確認）の `video_generation.py` と `components/*.py`。SDK はどちらも Speakeasy で同じ OpenAPI から生成されていて、内容は一致している。 |
+| **[B]** | `openrouter.ai` のページを検索エンジンの抜粋で読んだ。ページ本体は開けていない。 |
+| **[C]** | ミラーサイト・第三者の記事・推定。**未検証**。 |
+
+SDK のファイルパスは `esm/` を起点にする（例: `esm/models/videogenerationrequest.js`）。
+
+### 8.1 共通（認証・ヘッダ・エラー）
+
+- ベース URL: `https://openrouter.ai/api/v1` [A]（`esm/lib/config.js` の `ServerList`。SDK では環境変数 `OPENROUTER_BASE_URL` で上書きできる）。
+- 認証: `Authorization: Bearer <OPENROUTER_API_KEY>` [A]（`esm/lib/security.js`）。
+- 任意のヘッダ [A]（`esm/funcs/*.js`）。いずれもアプリの識別とランキング用で、動作には影響しない。
+  - `HTTP-Referer`: アプリの URL
+  - `X-OpenRouter-Title`: 表示名
+  - `X-OpenRouter-Categories`: カンマ区切りのカテゴリ
+  - 本アプリでは `X-OpenRouter-Title: AI Music Video Factory` だけを送れば足りる [C]。
+- エラーの本文 [A]（`esm/models/errors/*.js`、`esm/models/*responseerrordata.js`）:
+
+  ```json
+  {"error": {"code": 402, "message": "…", "metadata": {"…": "…"}},
+   "user_id": "…",
+   "openrouter_metadata": {"…": "…"}}
+  ```
+
+  `error.metadata`、`user_id`、`openrouter_metadata` は省略または null のことがある。
+
+- SDK が型を持つエラーステータス [A]:
+
+  | ステータス | SDK の説明 | 本アプリでの扱い [C] |
+  |---|---|---|
+  | 400 | 不正なパラメータ | 再試行不可 |
+  | 401 | 認証なし・無効なキー | `ProviderNotConfigured` 相当 |
+  | 402 | クレジット・クォータ不足 | 再試行不可。「OpenRouter のクレジットが不足しています」と表示 |
+  | 403 | 権限不足（ガードレール・モデレーションでの拒否を含む [B]） | 再試行不可 |
+  | 404 | リソースなし | 再試行不可 |
+  | 408 | タイムアウト | 再試行可 |
+  | 409 / 410 | 競合 / 削除済み（動画のダウンロードのみ） | §8.2 を参照 |
+  | 413 | ペイロードが大きすぎる | 再試行不可 |
+  | 422 | 意味的な検証エラー | 再試行不可 |
+  | 429 | レート制限 | 再試行可。`Retry-After` に従う |
+  | 500 / 502 / 503 | サーバー・上流の障害。503 は「ルーティング条件を満たす提供元がない」場合も含む [B] | Claude: 再試行可（503 で条件不一致の場合を除く）。**`POST /videos` は 503 だけ再試行可**、500 / 502 は再送しない（下の注） |
+  | 524 / 529 | エッジのタイムアウト / 提供元の過負荷 | Claude: 再試行可。**`POST /videos` は 529 だけ再試行可**、524 は再送しない（下の注） |
+
+  注（実装、2026-10-12）: `POST /videos` には冪等キーがないため、ジョブが作られていないと言える失敗だけを再試行する。
+  再試行するのは、接続前のエラー（接続できない・接続のタイムアウト・プロキシ）と 408 / 425 / 429 / 503 / 529。
+  読み取り・書き込みのタイムアウト、途中で切れた接続、それ以外の 5xx（500 / 502 / 504 / 524 など）、読み取れない 2xx の応答は
+  「ジョブが作られた可能性がある」として再送せず、見積もり額を課金済み（推定）として記録する（§8.10）。
+
+- SDK 既定の再試行 [A]（`esm/lib/retries.js`、各 `funcs`）:
+  - 5XX と接続エラーを指数バックオフで再試行する（初期 0.5 秒、指数 1.5、最大間隔 60 秒、合計 1 時間まで）。
+  - `retry-after-ms` と `Retry-After` を尊重する。
+  - **`POST /videos` も再試行の対象になっている**。API に冪等キーはないため、ジョブ作成後の 5xx やタイムアウトで再送すると二重に課金されうる。本アプリは SDK を使わず、既存アダプタと同じ方針（作成前の失敗だけ再試行可、作成後はジョブ ID で再開）をとる [C]。
+
+### 8.2 動画 API（`/videos`）
+
+**エンドポイント** [A]（`esm/funcs/videoGeneration*.js`）:
+
+| 操作 | メソッドとパス | 成功時 | SDK が型を持つエラー |
+|---|---|---|---|
+| 作成 | `POST /videos`（`Content-Type: application/json`） | **202** と `VideoGenerationResponse` | 400 401 402 403 404 413 429 500 |
+| 状態取得 | `GET /videos/{jobId}` | 200 と `VideoGenerationResponse` | 401 403 404 500 |
+| ダウンロード | `GET /videos/{jobId}/content?index=0`（`Accept: video/mp4`） | 200、`video/mp4` のストリーム（説明は「上流の提供元から動画をストリームする」） | 400 401 403 404 409 410 500 502 |
+| モデル一覧 | `GET /videos/models` | 200 `{"data": [VideoModel, …]}` | 400 500 |
+
+- **キャンセル API はない**（SDK に `DELETE` などの操作がない）[A]。`supports_remote_cancel = False` とし、Veo / Kling と同じく、放棄したジョブは課金されたものとして表の単価で計上する。
+
+**作成リクエスト** [A]（`esm/models/videogenerationrequest.js` の outbound スキーマ。Python 版の `components/videogenerationrequest.py` も同じ）。ワイヤ上の名前はスネークケース。
+
+| フィールド | 型・値 | 説明 |
+|---|---|---|
+| `model` | string（必須） | 例 `google/veo-3.1-lite` |
+| `prompt` | string | 画像だけで生成できるモデル以外では必須 |
+| `duration` | **整数**（秒） | |
+| `aspect_ratio` | `16:9` `9:16` `1:1` `4:3` `3:4` `3:2` `2:3` `21:9` `9:21` | |
+| `resolution` | `360p` `480p` `720p` `768p` `1080p` `1K` `2K` `4K` | |
+| `size` | `"WIDTHxHEIGHT"`（例 `720x1280`） | `resolution` と `aspect_ratio` の組の代わりに使える |
+| `generate_audio` | bool | 省略時はモデルの `generate_audio` フラグに従う（フラグがなければ false） |
+| `seed` | 整数 | 決定性はすべての提供元で保証されるわけではない |
+| `frame_images` | `[{"type":"image_url","image_url":{"url":"…"},"frame_type":"first_frame"\|"last_frame"}]` | 画像→動画 |
+| `input_references` | `image_url` / 音声 / 動画のコンテンツパーツの配列 | 参照素材。音声・動画は対応する提供元だけが使う |
+| `callback_url` | HTTPS URL | 完了時の Webhook。ワークスペース既定の URL を上書きする |
+| `provider` | `{"options": {"<提供元スラッグ>": {…}}}` | **提供元ごとのパススルーだけ**。一致した提供元の分だけが転送され、未知のキーは黙って捨てられる |
+| `user` / `session_id` / `trace` | string / string（256 文字以下）/ object | 観測用。提供元には送られない |
+| `previous_job_id` | string | 完了済みジョブの編集・延長（対応モデルのみ） |
+| `creativity` / `upscale_factor` | 整数 / 数値 | アップスケーラー専用。生成モデルでは使えない |
+
+本アプリの推奨形 [C]:
+
+```http
+POST https://openrouter.ai/api/v1/videos
+Authorization: Bearer $OPENROUTER_API_KEY
+Content-Type: application/json
+X-OpenRouter-Title: AI Music Video Factory
+
+{"model": "google/veo-3.1-lite",
+ "prompt": "…sanitize_prompt 済みの英語プロンプト… Avoid: text, captions, watermark, …",
+ "duration": 6,
+ "aspect_ratio": "9:16",
+ "resolution": "720p",
+ "generate_audio": false}
+→ 202 {"id": "gen-vid-<timestamp>-<英数字 20 文字>", "polling_url": "…", "status": "pending"}
+```
+
+- ネガティブプロンプトの欄はない。Kling の新 API と同様に、本文の末尾に `Avoid: …` として足す [C]。
+- `seed` は、モデル一覧で `seed: true` のモデルにだけ送る [C]。
+- 生成音声は使わないため `generate_audio: false` を明示する。モデルによっては無音の単価のほうが安い（§8.3）[C]。
+- `size` と `resolution` + `aspect_ratio` の両方を送らない [C]。
+- `callback_url` は使わない（本アプリには公開 URL がなく、ポーリングで足りる）。Webhook の署名方式も未確認。
+
+**応答 `VideoGenerationResponse`** [A]（`esm/models/videogenerationresponse.js`、Python 版の `components/videogenerationresponse.py`）:
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `id` | string | ジョブ ID（`gen-vid-<timestamp>-<20 alphanumerics>`） |
+| `polling_url` | string | 状態取得の URL |
+| `status` | `pending` `in_progress` `completed` `failed` `cancelled` `expired` | 未知の値も来うる（open enum） |
+| `error` | string? | 失敗理由（文字列） |
+| `unsigned_urls` | string[]? | 完了後の取得先 |
+| `usage` | `{"cost": number\|null, "is_byok": bool}`? | **USD の実費**。完了後に入る |
+| `generation_id` | string? | 処理後に入る生成 ID |
+| `expires_at` | 整数?（Unix 秒） | OpenRouter が保存した出力のコピーが消える時刻。Python SDK 1.3.43 にだけある（TS 1.4.25 にはない） |
+
+**ポーリングと状態の扱い** [C]（既存アダプタの方針に合わせた設計判断）:
+
+- `GET {ベース URL}/videos/{id}` を、id から自分で組み立てて呼ぶ。`polling_url` は、API と同じオリジンのときだけ使う（キーを他のホストに送らないため）。
+- 間隔は既存と同じ（5 秒から始めて最大 30 秒、ジッタ ±20%、`timeout=900`）。
+- 状態ごとの扱い:
+
+  | status | 扱い |
+  |---|---|
+  | `pending` / `in_progress` | 待機を続ける |
+  | `completed` | ダウンロードへ進む |
+  | `failed` | `ProviderTaskError`（`error` の文字列を付ける）。課金されたかどうかは不明（§8.6）。`usage.cost` があればそれを計上する |
+  | `cancelled` / `expired` | 再試行不可の `ProviderTaskError` |
+
+- `resume_token` はジョブ ID そのものでよい。
+
+**ダウンロード**:
+
+- 第一候補は `GET /videos/{id}/content?index=0`（`Authorization` 付き、`Accept: video/mp4`）[A]。
+  - 409 は「まだ取得できない」と解釈し、タイムアウトの範囲内で取り直す [C]。
+  - 410 は「出力が消えた」と解釈し、再試行不可にする [C]。
+- 代替は `unsigned_urls[0]`。
+  - 公式の例には、`openrouter.ai` 上の URL（認証が要る）と外部ストレージの URL（認証不要）の両方がある [B]。
+  - **キーは URL のオリジンが API と同じときだけ付ける**。リダイレクト先には付けない（既存の `ApiVideoProvider` と同じ）[C]。
+- 成功したジョブは課金済みなので再送信しない。取得だけを `OUTPUT_FETCH_ATTEMPTS` 回までやり直す（§2.2）。
+
+**費用**: 完了時の `usage.cost`（USD）を実額として `ClipResult.cost_usd` に使う [A]。null の場合は、モデル一覧の単価または表の単価 × 秒数で計上する [C]。
+
+### 8.3 モデル一覧（`GET /videos/models`）と料金
+
+**`VideoModel` の形** [A]（`esm/models/videomodel.js`）:
+
+```json
+{"id": "google/veo-3.1-lite", "name": "…", "canonical_slug": "…", "created": 1776902400,
+ "description": "…", "hugging_face_id": null,
+ "supported_durations": [4, 6, 8],
+ "supported_aspect_ratios": ["16:9", "9:16"],
+ "supported_resolutions": ["720p", "1080p"],
+ "supported_sizes": ["720x1280", "…"],
+ "supported_frame_images": ["first_frame", "last_frame"],
+ "generate_audio": true, "seed": false,
+ "allowed_passthrough_parameters": ["…"],
+ "pricing_skus": {"per-video-second": "0.05", "…": "…"},
+ "creativity": null, "upscale_factor": null}
+```
+
+- 上の値は形の例で、実際の値ではない。
+- `supported_*`、`generate_audio`、`seed`、`creativity`、`upscale_factor` は null がありうる。
+- 認証が必要かどうかは不明。SDK はキーが設定されていれば付けて送る [A]。本アプリでも付けて送る [C]。
+
+**`pricing_skus` の形**:
+
+- 型は「SKU 名 → 価格の文字列」の辞書で、SDK の説明は「Pricing SKUs with provider prefix stripped, values as strings」[A]。
+- 公式ドキュメントの Veo 3.1 の例では、キーが `per-video-second`（0.50）と `per-video-second-1080p`（0.75）になっている [B]。ただしモデルページの Veo 3.1 は「$0.40/s から」と表示しており、例の数値は説明用とみられる。
+- モデルページでは、音声あり・なし（例: Kling v3.0 std が $0.126/s と $0.084/s）や解像度ごと（例: Seedance 2.5 は 480p から 4K まで）に単価が分かれている [B][C]。**それぞれの SKU キー名は確認できていない** [C]。
+
+**USD/秒の求め方**（本アプリの方針。[C]）:
+
+1. `resolution` が 720p 以外なら `per-video-second-<resolution>` を探し、なければ `per-video-second` を使う。
+2. 音声の有無で分かれたキー（名前は未確認）が複数ある場合は、高いほうを採用し、見積もりを過小にしない。
+3. どのキーにも当たらない、または値が数値として読めない場合は、下表の静的な単価を使う。どちらの場合も `verified: false`。
+4. 実際の請求額は、完了時の `usage.cost` で置き換える。
+
+**既知のモデル**（**検索による。未検証**。秒数と単価はモデルページの抜粋で、「from」付きの最低価格を含む）:
+
+| モデル ID | 秒数 | USD/秒 | 根拠・備考 |
+|---|---|---|---|
+| `google/veo-3.1-lite` | 4 / 6 / 8 | 0.05〜 | [B] 2026-04-23 公開。Veo 3.1 Fast の半額未満 |
+| `google/veo-3.1-fast` | 4 / 6 / 8 | 0.10〜 | [B] 2026-04-24 公開 |
+| `google/veo-3.1` | 4 / 6 / 8 | 0.40〜 | [B]（ドキュメントの例は 0.50 / 1080p 0.75） |
+| `kwaivgi/kling-v3.0-std` | 3〜15 | 0.126（音声あり）/ 0.084（無音） | [B] モデルページは「$0.126/s から」。音声の内訳はミラーによる [C]。9:16 対応 |
+| `kwaivgi/kling-v3.0-pro` | 3〜15 | 0.168〜 | [C] ミラーのみ。同じページに $0.112 という値もあり、意味は不明 |
+| `kwaivgi/kling-video-o1` | 5 / 10 | 0.112 | [B] 2026-04-20 公開。提供元は 1 社。16:9 / 9:16 / 1:1 |
+| `minimax/hailuo-2.3` | 6 / 10 | 0.0817 | [B] 2026-04-20 公開。画像入力は最初のフレームのみ |
+| `minimax/hailuo-3` / `minimax/hailuo-3-max` | 未確認 | 未確認 | [C] |
+| `bytedance/seedance-2.0`（`-fast` / `-mini`、`seedance-2.5`、`seedance-1-5-pro`） | mini は 4〜15 | 2.0 は 480p で 0.06726〜（音声あり）。mini は 0.01345〜 | [C] 2.0 はミラー、mini は [B]。720p の単価は未確認 |
+| `alibaba/wan-2.7` | 2〜10 | 0.10 | [C] ミラー（2026-04-15 公開）。`alibaba/wan-2.6` は未確認 |
+| `runway/gen-4.5` | 未確認 | 0.12 | [B] 比較ページ。Runway の帰属表示（§4.3）が OpenRouter 経由でも必要かは未確認 |
+
+- モデル ID には日付付きの別名もある（例 `google/veo-3.1-fast-20260320`、`kwaivgi/kling-v3.0-std-20260429`）[B]。
+- 9:16 で出せるか、何秒にできるかは、実装時に `/videos/models` の `supported_aspect_ratios` と `supported_durations` で確かめる。静的な表は、一覧を取得できないときの代わりとしてだけ使う。
+
+**`cost.py` の `PRICING` に入れる推奨値**（すべて `verified: false`、`as_of` は 2026-10-12、`source_url` は各モデルのページ `https://openrouter.ai/<model id>`）:
+
+| model | clip_durations | default_duration | resolution | price_per_second_usd |
+|---|---|---|---|---|
+| `google/veo-3.1-lite`（既定） | [4, 6, 8] | 6 | 720x1280 | 0.05 |
+| `google/veo-3.1-fast` | [4, 6, 8] | 6 | 720x1280 | 0.10 |
+| `kwaivgi/kling-v3.0-std` | [3, 4, …, 15] | 5 | 720x1280 | 0.084（`generate_audio:false` の前提。音声ありなら 0.126） |
+| `kwaivgi/kling-video-o1` | [5, 10] | 5 | 720x1280 | 0.112 |
+| `minimax/hailuo-2.3` | [6, 10] | 6 | 未確認 | 0.0817 |
+| `alibaba/wan-2.7` | [2, 3, …, 10] | 5 | 720x1280 | 0.10 |
+
+**費用試算**（§3 と同じ前提: 30 本 balanced、60 クリップ）[C]:
+
+| モデル | 計算 | 費用 |
+|---|---|---|
+| `google/veo-3.1-lite` | 60 × 6 秒 × $0.05 | $18.00（Gemini API 直接と同額） |
+| `kwaivgi/kling-v3.0-std`（無音） | 60 × 5 秒 × $0.084 | $25.20 |
+| `minimax/hailuo-2.3` | 60 × 6 秒 × $0.0817 | 約 $29.41 |
+
+OpenRouter は提供元の価格に上乗せしない、とする第三者の記事がある [C]。
+
+### 8.4 Claude（`/chat/completions`）
+
+**エンドポイント** [A]（`esm/funcs/chatSend.js`）:
+
+- `POST /chat/completions`。成功時は 200 の JSON（`stream: true` のときは SSE）。
+- SDK が型を持つエラー: 400 401 402 403 404 408 413 422 429 500 502 503 524 529。
+
+**モデル ID** [B]:
+
+- `anthropic/claude-opus-5.5`（2026-09-22 公開。日付付きは `anthropic/claude-opus-5.5-20260921`。バッチ用の `:batch` 版もある）。
+- `anthropic/claude-sonnet-5.5`（2026-09-28 公開。日付付きは `anthropic/claude-sonnet-5.5-20260928`）。
+- 補足:
+  - SDK 1.4.25 の `ModelId` 型（`esm/types/models.d.ts`）は古く、Claude は `anthropic/claude-opus-4.5` までしか載っていない [A]。
+  - 「常に最新」を指す別名 `~anthropic/claude-opus-latest` が SDK の説明文にある [A]。黙って中身が変わるため、本アプリでは使わない。
+  - 推奨: 設定 `OPENROUTER_CLAUDE_MODEL` の既定値を `anthropic/claude-opus-5.5` にする [C]。Anthropic 直接のときの `ANTHROPIC_MODEL=claude-opus-5-5` とは表記が違う（ドット区切りで、前に `anthropic/` が付く）。
+
+**価格（USD / 100 万トークン）**:
+
+| モデル | 入力 | 出力 | キャッシュ読み | キャッシュ書き | 根拠 |
+|---|---|---|---|---|---|
+| Opus 5.5 | 4.00 | 20.00 | 0.20 | 5.00（1 時間保持は 8.00） | [B] Anthropic 直接と同額 |
+| Sonnet 5.5 | 2.00 | 10.00 | 0.20 | — | Anthropic 直接の価格。OpenRouter のページの抜粋は $1 / $5 と食い違っていて未確認 [C] |
+
+- 文脈長は 100 万トークン、最大出力は 12.8 万トークン [B]。
+- 提供元は Anthropic、Amazon Bedrock、Google Vertex、Azure、Claude Platform on AWS の 5 つで、自動でフェイルオーバーする [B]。
+
+**リクエスト（絵コンテ）** [A]（`esm/models/chatrequest.js`、`chatformatjsonschemaconfig.js`、`chatjsonschemaconfig.js`、`chatcontenttext.js`、`providerpreferences.js`）:
+
+```http
+POST https://openrouter.ai/api/v1/chat/completions
+Authorization: Bearer $OPENROUTER_API_KEY
+Content-Type: application/json
+X-OpenRouter-Title: AI Music Video Factory
+
+{"model": "anthropic/claude-opus-5.5",
+ "messages": [
+   {"role": "system",
+    "content": [{"type": "text", "text": "<SYSTEM_PROMPT>", "cache_control": {"type": "ephemeral"}}]},
+   {"role": "user", "content": "<既存と同じ user_message の JSON 文字列>"}],
+ "max_completion_tokens": 16000,
+ "response_format": {"type": "json_schema",
+                     "json_schema": {"name": "storyboard", "strict": true, "schema": {"…": "STORYBOARD_SCHEMA"}}},
+ "reasoning": {"effort": "low"},
+ "provider": {"data_collection": "deny", "zdr": true, "require_parameters": true},
+ "stream": false}
+```
+
+- `max_tokens` は SDK で「非推奨。`max_completion_tokens` を使う」とされている [A]。
+- `reasoning.effort` が取る値は `max` `xhigh` `high` `medium` `low` `minimal` `none` [A]。同じ意味の省略形としてトップレベルの `reasoning_effort` もある。
+  - Opus 5.5 は思考を無効にできない（Anthropic 直接では無効化が 400 になる）ため、`none` と `minimal` は送らない [C]。
+  - Anthropic の `output_config.effort` にどう変換されるかは未確認 [C]。
+- `cache_control` には、トップレベル（自動キャッシュ）とコンテンツブロック単位の 2 つの付け方がある [A]。
+- `usage: {"include": true}` は SDK のスキーマにない [A]。ドキュメントでも非推奨で、効果がない（使用量は常に返る）とされている [B]。送らない。
+- Anthropic 直接で使っている `betas` / `fallbacks: "default"`（サーバー側フォールバック）は、OpenRouter のスキーマにない [A]。拒否されたときはテンプレートに切り替える既存の処理で対応する。
+  - OpenRouter 独自の `models: [...]`（候補モデルのフォールバック）はあるが [A]、モデルが黙って変わるため使わない [C]。
+- `user` には、エンドユーザーを表す安定した仮名 ID を入れる [A]。
+  - 省略すると、アカウント単位の ID として扱われ、提供元のポリシーによるブロックがアカウント全体に及びうる [A]。
+  - 生の値は上流に転送されないとされている [A]。
+  - 本アプリでは所有者 ID を `SECRET_KEY` で HMAC したものを推奨する [C]。
+- 翻訳（`translate_to_english`）は同じ形で送る。`response_format` を付けず、`max_completion_tokens` は 4000 にする。
+
+**応答 `ChatResult`** [A]（`chatresult.js`、`chatchoice.js`、`chatassistantmessage.js`、`chatusage.js`、`costdetails.js`）:
+
+```json
+{"id": "gen-…", "object": "chat.completion", "created": 1791763200, "model": "anthropic/claude-opus-5.5",
+ "system_fingerprint": null,
+ "choices": [{"index": 0,
+              "finish_reason": "stop",
+              "message": {"role": "assistant",
+                          "content": "{…JSON…}",
+                          "refusal": null,
+                          "reasoning": null}}],
+ "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+           "cost": 0.0123, "is_byok": false,
+           "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+           "completion_tokens_details": {"reasoning_tokens": 0},
+           "cost_details": {"upstream_inference_prompt_cost": 0, "upstream_inference_completions_cost": 0,
+                            "upstream_inference_cost": null}}}
+```
+
+数値は形の例で、実際の値ではない。
+
+- `finish_reason` が取る値は `stop` `length` `content_filter` `tool_calls` `error`、または null [A]。
+- `message.content` は文字列か `[{type:"text", text}, …]` の配列、または null [A]。配列のときはテキスト部分を連結する。
+- `usage.cost` は USD の請求額 [A][B]。`cost_details.upstream_inference_cost` は BYOK のときだけ意味がある [B]。
+
+**応答の扱い**（既存の `_call_claude` / `_claude_translate` に合わせる。[C]）:
+
+| 応答 | 扱い |
+|---|---|
+| `message.refusal` が null 以外、または `finish_reason == "content_filter"` | 拒否とみなし、テンプレートに切り替える。費用は計上する |
+| `finish_reason == "length"` | JSON が途中で切れるため、解析エラーとしてテンプレートに切り替える |
+| `finish_reason == "error"` | 上流のエラーとしてテンプレートに切り替える |
+| 402 | 「OpenRouter のクレジットが不足しているため、テンプレートで絵コンテを作成しました」 |
+| 403 | モデレーション・ガードレールでの拒否 |
+| 404 / 503（ZDR などの条件を満たす提供元がない） | 「データを保持しない提供元が見つからなかったため、テンプレートで絵コンテを作成しました」 |
+
+**費用の記録**:
+
+- `usage.cost` があればそれを使う。
+- ない場合は、トークン数から Opus 5.5 の単価で計算する。
+  - 計算式: (prompt_tokens − cached_tokens − cache_write_tokens) × $4 + cached_tokens × $0.20 + cache_write_tokens × $5 + completion_tokens × $20（いずれも 100 万トークンあたり）
+  - `prompt_tokens` がキャッシュ分を含むという前提は未確認 [C]。
+- CostRecord の `model` には、応答の `model`（例 `anthropic/claude-opus-5.5`）を記録する。
+
+### 8.5 データの扱い（ZDR・データ収集）
+
+**Claude（`/chat/completions`）** — 歌詞を送る経路:
+
+- `provider.zdr: true`: ZDR（ゼロデータ保持）のエンドポイントにだけ送る [A]（`providerpreferences.d.ts`）。
+- `provider.data_collection: "deny"`: ユーザーデータを収集しない提供元にだけ送る。既定は `"allow"` [A]。
+- **どちらも常に送る**（利用者の決定）。`require_parameters: true` も付け、`response_format` などに対応しない提供元を除く [A][B]。
+- 補足:
+  - リクエスト単位の `zdr` は ZDR を追加するだけで、アカウントやガードレールで有効にした ZDR を外すことはできない [B]。
+  - メモリ上のプロンプトキャッシュは「保持」とみなさないため、ZDR でもキャッシュは使える [B]。
+  - OpenRouter が提供元のポリシーを確認できない場合は、「保持し、学習にも使う」とみなす [B]。
+  - ZDR はプラグインやツール（Web 検索など）には適用されない [B]。本アプリはどちらも使わない。
+  - **Opus 5.5 に ZDR を満たすエンドポイントがあるかは未確認** [C]。1 つもない場合はリクエストが失敗し、テンプレートに切り替わる（上の表）。
+
+**動画（`/videos`）** — 送るのは英語のシーン説明だけで、歌詞は含まない:
+
+- **リクエストのスキーマに `zdr` と `data_collection` がない**。`provider` に入れられるのは `options`（パススルー）だけ [A]（`videogenerationrequest.js`、Python 版も同じ）。
+  - これに対し、TTS や STT（`speechrequest`、`sttrequest`）の `provider` には両方ある [A]。
+- 公式ドキュメントには「動画生成はゼロデータ保持（ZDR）の対象外」とある [B]。
+- ミラーサイトには、非同期のため提供元が出力をしばらく保持すること、ZDR を強制しているとルーティングされないことも書かれている [C]。
+- 方針:
+  - 動画のリクエストに `zdr` と `data_collection` は送らない。スキーマにないため、無視されるのか 400 になるのかは不明。
+  - **アカウント全体の ZDR 強制は有効にしない**（動画生成が使えなくなるおそれがある）。Claude だけに ZDR を強制したい場合は、ガードレールの提供元別の項目（`enforce_zdr_anthropic` など。[A] `guardrail.d.ts`）を使う。動画にどう効くかは未確認。
+
+**OpenRouter 自身の保持**:
+
+- プロンプトのログ記録を自分で有効にしない限り、プロンプトを保持しない [B]。
+- ログ記録を有効にすると、OpenRouter に広い利用許諾（匿名化した内容の商用利用を含む）を与えることになる [C]（利用規約の要約サイトによる）。**アカウント設定でプロンプトのログ記録をオフのままにする**。
+
+**利用者への開示**（README と RIGHTS_AND_SECURITY §5 に反映する事項。[C]）:
+
+- `ANTHROPIC_API_KEY` がなく `OPENROUTER_API_KEY` がある場合、絵コンテの生成で **歌詞の本文を含む同じ内容が、OpenRouter と、その先の Claude の提供元（Anthropic / Amazon Bedrock / Google Vertex / Azure / Claude Platform on AWS のいずれか）を通る**。
+- ZDR とデータ収集拒否は毎回指定するが、実際にどの提供元が使われたかは応答からは分からない（`openrouter_metadata` は `X-OpenRouter-Metadata` ヘッダーで要求した場合だけ返る [A]）。
+
+### 8.6 商用利用・権利
+
+- OpenRouter の利用規約では、出力の権利は **モデルごとの規約（Model Terms）** に従うとされる [C]（規約の要約サイトによる。本文は取得できていない）。
+  - 出力が特定の用途に適することは保証しない [C]。
+  - 企業向け規約では、入力と出力も「顧客データ」に含めている [B]。
+- そのため、`model_terms_checked` では OpenRouter の規約と、実際に使うモデルの規約の **両方** を確認する必要がある。
+  - Veo: §4.1 の Gemini API 追加規約。ただし OpenRouter 経由で Google のどのエンドポイント（Gemini API か Vertex か）に送られるかは未確認。
+  - Kling: §4.4 のとおり規約本文は未確認。
+  - MiniMax、ByteDance、Alibaba: 未確認。
+  - Runway: OpenRouter 経由でも "Powered by Runway" の表示が必要かは未確認。
+- 実在人物を禁止するプロンプト規則（`sanitize_prompt`）と、公開前の目視確認は、ほかのプロバイダと同じく必須。
+- 透かし（SynthID や C2PA など）は、各モデル側の仕様に従う [C]。OpenRouter が透かしを追加するかどうかは未確認。
+
+### 8.7 Python SDK を使うか
+
+- PyPI の `openrouter` は公式（ファーストパーティ）の SDK である [A]。
+  - パッケージ情報: 最新は 1.3.43（2026-10-11 公開）。作者は OpenRouter、リポジトリは https://github.com/OpenRouterTeam/python-sdk 、ライセンスは Apache-2.0。説明文は "Official Python Client SDK for OpenRouter."。
+  - 中身: TS SDK と同じ生成器（Speakeasy 2.914.0）で作られている。`video_generation.py` に `/videos` の 4 操作がある。
+- **ただし本アプリでは使わず、httpx で直接呼ぶ。** 理由は次のとおり。
+  - 依存が衝突する。`openrouter` は `pydantic<2.13,>=2.11.2` を要求するが、バックエンドは `pydantic>=2.14,<3`（ロックは 2.14.0）。
+  - リリースが頻繁（3 日で 1.3.39〜1.3.43 の 5 版）で、既定で `POST /videos` も再試行してしまう（§8.1）。
+  - 既存のアダプタ（Veo / Runway / Kling）は httpx と respx のテストで揃っている。
+- ワイヤ上の形式は、上の SDK のスキーマに合わせる。
+
+### 8.8 未確認事項（OpenRouter）
+
+1. **実リクエスト全般**（このサンドボックスからは接続できない）。キーを得たら、まず `GET /videos/models` と、短い 1 本の生成で、形状・費用・所要時間を確認する。
+2. **動画の作成**:
+   - `POST /videos` の成功ステータス（SDK は 202 だけを成功として扱う）。
+   - 各モデルが 9:16 と 720p を受け付けるか。
+   - ネガティブプロンプトを `provider.options` で渡せるか（`allowed_passthrough_parameters` の内容）。
+   - `frame_images[].image_url.url` が data URI を受け付けるか。
+3. **動画の課金**:
+   - `failed` / `cancelled` / `expired` のジョブが課金されるか、そのとき `usage.cost` が返るか。
+   - アカウント単位の同時実行数とレート制限。
+4. **ダウンロード**:
+   - `/content` の 409 / 410 の正確な意味。
+   - `unsigned_urls` の保持期間と `expires_at`。
+   - `/content` がリダイレクトを返すか。
+5. **`pricing_skus` のキー名**（音声の有無・解像度の表し方）と、`/videos/models` が認証を要するか。
+6. **データ保持**:
+   - 動画のリクエストに `zdr` / `data_collection` を入れたときの挙動（無視か 400 か）。
+   - アカウントで ZDR を強制したとき、動画が拒否されるか。
+7. **Opus 5.5 の提供元**: `zdr: true` と `data_collection: "deny"` を両方満たす提供元があるか。ないときのエラー（404 か 503 か）。
+8. **Claude のパラメータ変換**:
+   - `reasoning.effort` が Anthropic の `output_config.effort` にどう対応するか。`none` で 400 になるか。
+   - `response_format`（json_schema、strict）が Anthropic の構造化出力にどう変換されるか。
+9. **Claude の応答**:
+   - 拒否の表し方（`finish_reason: "content_filter"` か、`message.refusal` か、その両方か）。
+   - `usage.prompt_tokens` にキャッシュ分が含まれるか。`usage.cost` が常に返るか。
+10. **価格**: Sonnet 5.5 の OpenRouter 価格（$2 / $10 か $1 / $5 か）。Kling v3.0 pro・Seedance 2.0・Wan 2.6 の正確な単価。
+11. **規約**: OpenRouter の利用規約本文、各モデルの規約（出力の所有権・商用利用・実在人物）、OpenRouter 経由の Runway モデルの帰属表示。
+12. **Webhook**（`callback_url`）の署名方式と再送の仕様（本アプリでは使わない）。
+
+### 8.9 出典（取得・確認日 2026-10-12）
+
+**[A] 直接取得**
+
+- npm `@openrouter/sdk@1.4.25`（2026-10-06）。主に読んだファイル:
+  - `esm/lib/config.js`、`esm/lib/security.js`、`esm/lib/retries.js`
+  - `esm/funcs/videoGenerationGenerate.js`、`videoGenerationGetGeneration.js`、`videoGenerationGetVideoContent.js`、`videoGenerationListVideosModels.js`、`chatSend.js`、`generationsGetGeneration.js`
+  - `esm/models/videogenerationrequest.*`、`videogenerationresponse.*`、`videogenerationusage.*`、`videomodel.*`、`frameimage.*`
+  - `esm/models/chatrequest.*`、`chatresult.*`、`chatchoice.*`、`chatassistantmessage.*`、`chatusage.*`、`costdetails.*`、`chatfinishreasonenum.*`
+  - `esm/models/chatformatjsonschemaconfig.*`、`chatjsonschemaconfig.*`、`chatcontenttext.*`、`anthropiccachecontroldirective.*`
+  - `esm/models/providerpreferences.*`、`speechrequest.*`、`guardrail.*`、`errors/*`、`*responseerrordata.*`
+  - `esm/types/models.d.ts`、`esm/models/fusionplugin.d.ts`、`README.md`
+- PyPI `openrouter==1.3.43`（2026-10-11）: https://pypi.org/project/openrouter/1.3.43/ 。`METADATA`、`video_generation.py`、`sdk.py`、`components/videogenerationrequest.py`、`components/videogenerationresponse.py`、`components/videomodel.py`、`components/chatusage.py`、`components/frameimage.py`
+- バックエンドの依存: `backend/requirements.txt`、`backend/requirements.lock.txt`
+
+**[B] 公式ページ（検索抜粋）**
+
+- https://openrouter.ai/docs/guides/overview/multimodal/video-generation 、https://openrouter.ai/docs/features/multimodal/video-generation
+- https://openrouter.ai/docs/cookbook/video-generation/text-to-video 、https://openrouter.ai/docs/cookbook/video-generation/choose-video-model
+- https://openrouter.ai/docs/api/api-reference/video-generation/poll-video-generation-status
+- https://openrouter.ai/docs/guides/features/zdr 、https://openrouter.ai/blog/insights/zero-data-retention/
+- https://openrouter.ai/docs/features/provider-routing 、https://openrouter.ai/docs/guides/routing/provider-selection.md
+- https://openrouter.ai/docs/guides/features/structured-outputs
+- https://openrouter.ai/docs/guides/administration/usage-accounting
+- https://openrouter.ai/docs/api_reference/errors-and-debugging.md
+- https://openrouter.ai/terms-of-service-enterprise
+- モデルページ:
+  - Claude: https://openrouter.ai/anthropic/claude-opus-5.5-20260921 、https://openrouter.ai/models/anthropic/claude-sonnet-5.5
+  - Veo: https://openrouter.ai/google/veo-3.1 、https://openrouter.ai/google/veo-3.1-fast-20260320
+  - Kling: https://openrouter.ai/kwaivgi/kling-video-o1 、https://openrouter.ai/kwaivgi/kling-v3.0-std-20260429
+  - その他: https://openrouter.ai/minimax/hailuo-2.3-20260420 、https://openrouter.ai/alibaba/wan-2.7 、https://openrouter.ai/bytedance/seedance-2.0-mini
+  - 比較ページ: https://openrouter.ai/compare/kwaivgi/kling-v3.0-std/runway/gen-4.5
+
+**[C] 第三者・ミラー（参考）**
+
+- https://vorplabs.com/models/openrouter-provider-controls
+- https://conductatlas.com/platform/openrouter/openrouter-terms-of-service/provision/CA-P-064062/output-ownership-governed-by-model-terms/
+- https://api.ifq.ai/docs/guides/overview/multimodal/video-generation （公式ドキュメントのミラー。ZDR 強制時に動画がルーティングされないという記述）
+- https://praison.ai/docs/video/openrouter 、https://mer.vin/2026/09/which-ai-video-models-actually-take-a-first-and-last-frame/
+- https://note.com/lucky_allium8251/n/n87f100b52a20 （上乗せなしという記述）
+
+### 8.10 実装メモ（2026-10-12、`app/services/providers/openrouter.py`・`app/services/openrouter.py`・`app/services/llm.py`）
+
+§8.1〜8.5 の推奨形からの変更点と、実装で決めたことをまとめる。どれも respx のモックでのみテストしており、実 API では未検証（`verified: false`）。
+
+- **動画の送信（`POST /videos`）**: 冪等キーがないため、`ApiVideoProvider._submit_request` で送る。
+  - 再試行するのは、ジョブが作られていないと言える失敗だけ（接続前のエラーと 408 / 425 / 429 / 503 / 529）。
+  - それ以外（読み取り・書き込みのタイムアウト、途中で切れた接続、500 / 502 / 504 / 524 などの 5xx、ID を読み取れない 2xx）は
+    `ProviderSubmitAmbiguous`（`code: provider_submit_ambiguous`、再試行不可）とし、見積もり額を課金済み（推定）として記録する。再送はしない。
+  - 400 / 401 / 402 / 403 / 413 などの 4xx は再試行不可の拒否として扱う（402 はクレジット不足と表示）。
+- **ジョブの再開**: 投入時に見積もり額を `clip.params.submitted_usd` に保存する。再起動後は、モデルがモデル一覧から消えた・料金を
+  読み取れなくなった・9:16 に対応しなくなった場合でも、保存したジョブ ID のポーリングを続ける（`_prepare_resume`）。費用は
+  `usage.cost`、なければ `submitted_usd`。再開できない場合（キーが消えたなど）は `submitted_usd` を課金済み（推定）として記録する。
+- **モデル一覧**: キーがあるときだけ `GET /videos/models` を取得し、メモリと `WORK_DIR/cache/openrouter_video_models.json` に
+  `OPENROUTER_MODELS_CACHE_TTL` 秒（既定 3600、最小 60）保持する。
+  - 取得に失敗したとき、または 200 でも使えるモデルが 1 つもない（空・ID が不正・9:16 非対応だけ）ときは、前回の一覧（なければ
+    組み込みの 6 モデル）を使い続け、キャッシュファイルは上書きせず、5 分後まで再取得しない。
+  - 9:16 を明示的に含まないモデル、アップスケーラー、ID が不正または 90 文字を超えるモデルは表示しない。アスペクト比の記載が
+    ないモデルは `supports_vertical: false` と注記付きで表示する。
+  - 料金を読み取れず調査値もないモデルは `price_known: false`（`price_per_second_usd: null`）で表示し、選択できない（予算を確保できないため）。
+  - 1080p の料金が別にあるときだけ `<id>@1080p` を追加する。
+- **ダウンロード**: `/content?index=0`（キー付き）を先に、だめなら `unsigned_urls` を試す。どの URL もリダイレクト先も、API と同じ
+  オリジンか、https の公開ホストだけを許可する（`localhost`・`.local`・グローバルでない IP。`2130706433` や `0x7f000001`、`127.1`
+  のような数値表記の IP も含めて拒否）。DNS で内部アドレスに解決される名前は防げない。キーは API のオリジンにしか送らない。
+- **費用**: 完了時の `usage.cost` を記録し、なければ表の単価 × 秒数（再開時は `submitted_usd`）。ダウンロードのやり直しで
+  `usage` のない応答を読み直しても、報告済みの金額として扱う。**BYOK**（`is_byok: true`）のときは `usage.cost` が OpenRouter の
+  手数料だけの可能性がある [B] ため、見積もり額を下回る分は見積もり額で記録する（注記「BYOK のため推定額」）。
+- **Claude（`/chat/completions`）**: 毎回 `provider: {data_collection: "deny", zdr: true, require_parameters: true}` を送る。
+  `user` には所有者 ID を `SECRET_KEY` で HMAC した仮名（`mvf-<32 桁>`）を入れる。
+  - 再試行: 408 / 429 / 500 / 502 / 503 / 524 / 529 と接続エラーを最大 2 回（`Retry-After` / `retry-after-ms` に従う、最大 20 秒）。
+    条件を満たす提供元がない 503 と、読み取りのタイムアウト（処理中で課金されうる）は再試行しない。
+  - 費用は `usage.cost`、なければトークン数 × Anthropic の定価。BYOK のときは `cost_details.upstream_inference_cost` を足し、
+    なければトークン数 × 定価を下限にする。
+  - 拒否（`message.refusal` か `finish_reason: content_filter`）、`length`、`error`、JSON の解析失敗、HTTP エラーはテンプレートに
+    切り替える（日本語の警告付き。応答があった場合は費用を記録）。
+- **送らないもの**: 動画のリクエストに `provider`（`zdr` / `data_collection` を含む）、`size`、`callback_url`、`user` は送らない。

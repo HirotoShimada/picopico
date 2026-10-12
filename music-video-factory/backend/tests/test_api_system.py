@@ -15,13 +15,16 @@ def test_capabilities_shape(client: TestClient) -> None:
     body = response.json()
     CapabilitiesOut.model_validate(body)
     providers = {p["id"]: p for p in body["providers"]}
-    assert list(providers) == ["mock", "library", "veo", "runway", "kling"]
+    assert list(providers) == ["mock", "library", "veo", "runway", "kling", "openrouter"]
     assert providers["mock"]["configured"] and providers["mock"]["available"] and providers["mock"]["kind"] == "mock"
     assert providers["library"]["kind"] == "library"
-    for api in ("veo", "runway", "kling"):
+    for api in ("veo", "runway", "kling", "openrouter"):
         assert providers[api]["kind"] == "api" and providers[api]["configured"] is False and providers[api]["reason"]
         assert all(m["verified"] is False and m["price_per_second_usd"] > 0 for m in providers[api]["models"])
     assert body["claude_configured"] is False
+    assert body["llm"] == {"route": None, "model": None, "data_policy_note": body["llm"]["data_policy_note"],
+                           "verified": False}  # fmt: skip
+    assert "テンプレート" in body["llm"]["data_policy_note"]
     assert body["whisper"]["available"] in (True, False)
     if not body["whisper"]["available"]:
         assert body["whisper"]["reason"]

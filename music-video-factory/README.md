@@ -1,8 +1,8 @@
 # AI Music Video Factory
 
 アーティストの楽曲と歌詞から、Instagram ストーリーズ向けの縦型（9:16・1080×1920）ミュージックビデオを
-**まとめて何本も**作る Web アプリです。映像素材は AI 動画生成（Veo / Runway / Kling の公式 API）、
-アップロード済みの素材、または動作確認用のモック映像から選べます。歌詞は楽曲に合わせてタイミングを取り、
+**まとめて何本も**作る Web アプリです。映像素材は AI 動画生成（Veo / Runway / Kling の公式 API、または OpenRouter 経由の
+各社の動画モデル）、アップロード済みの素材、または動作確認用のモック映像から選べます。歌詞は楽曲に合わせてタイミングを取り、
 映像に焼き込みます。
 
 - 楽曲解析: BPM・拍・小節頭・セクション（イントロ／A メロ／サビ…）・サビ候補・おすすめ区間（15/30/60 秒）
@@ -13,7 +13,7 @@
   同じ時刻の行（対訳・デュエットの LRC）は上下に並べて表示。`[サビ]`・`Verse 1:` のような見出し行は歌詞の行に含めない。
   歌詞を保存し直しても、変わっていない行の ID（動画ごとのタイミング調整の対応先）とタイミングは保たれる
 - 権利確認: 5 項目のチェックリスト（自己申告）。音源を差し替える・歌詞の本文を変えると、該当する項目が未確認に戻る
-- 生成: 世界観プリセット → 絵コンテ（Claude またはテンプレート）→ 素材プール → 動画ごとに
+- 生成: 世界観プリセット → 絵コンテ（Claude — Anthropic 直接または OpenRouter 経由 — またはテンプレート）→ 素材プール → 動画ごとに
   カット割り・開始位置・ズーム／パン・カラーグレード・歌詞スタイル（「自動」で動画ごとに変える）を変えたバリエーション。
   左右反転は素材内の文字が鏡文字になるため、生成設定の「左右反転を使う」をオンにしたときだけ使う
 - 肖像の保護: アーティスト名・別表記（ローマ字など）・「〜似」「lookalike」などの表現と、自由入力に書かれた
@@ -46,8 +46,9 @@
                                           │（同じタスク本体: app/pipeline.py）
                                           ▼
    analyze      : services/audio_analysis.py（librosa）
-   run_batch    : storyboard.py（Claude / テンプレート）→ variation.py（素材プール・動画プラン）
-                  → providers/（mock / library / veo / runway / kling）で素材生成
+   run_batch    : storyboard.py（Claude / テンプレート。llm.py: Anthropic 直接 または OpenRouter 経由）
+                  → variation.py（素材プール・動画プラン）
+                  → providers/（mock / library / veo / runway / kling / openrouter）で素材生成
                     （試行ごとの予算予約・リトライ・キャンセル・キャッシュ再利用・ジョブ ID の保存と再開）
    render_video : subtitles.py（ASS）→ render.py（FFmpeg）→ quality.py（ffprobe 検証）
    │
@@ -116,6 +117,12 @@ cp .env.example .env.local    # NEXT_PUBLIC_API_BASE_URL（既定 http://localho
 | `MAX_AUDIO_MB` / `MAX_VIDEO_MB` | `100` / `500` | アップロード上限 |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | – / `claude-opus-5-5` | 絵コンテ生成・翻訳に Claude を使う |
 | `GOOGLE_API_KEY` | – | Veo（Gemini API） |
+| `OPENROUTER_API_KEY` | – | OpenRouter。動画生成プロバイダー `openrouter` を有効にし、`ANTHROPIC_API_KEY` がないときは Claude（絵コンテ）も OpenRouter 経由で呼ぶ（下の「Claude と OpenRouter」）。**未検証** |
+| `OPENROUTER_API_BASE` | `https://openrouter.ai/api/v1` | OpenRouter の API の URL（キーはこのオリジンにだけ送る） |
+| `OPENROUTER_CLAUDE_MODEL` | `anthropic/claude-opus-5.5` | OpenRouter 経由で使う Claude のモデル ID（`ANTHROPIC_MODEL` とは表記が違う） |
+| `OPENROUTER_VIDEO_DEFAULT_MODEL` | `google/veo-3.1-lite` | OpenRouter の既定の動画モデル（モデル一覧に料金付きであるとき） |
+| `OPENROUTER_MODELS_CACHE_TTL` | `3600` | OpenRouter の動画モデル一覧（`GET /videos/models`）を使い回す秒数（60 以上。メモリと `WORK_DIR/cache/`） |
+| `OPENROUTER_APP_URL` / `OPENROUTER_APP_TITLE` | – / `AI Music Video Factory` | OpenRouter に送るアプリの識別ヘッダー（`HTTP-Referer` / `X-OpenRouter-Title`）。空なら送らない |
 | `RUNWAY_API_KEY` / `RUNWAY_API_BASE` | – / `https://api.dev.runwayml.com` | Runway |
 | `KLING_API_KEY` / `KLING_ACCESS_KEY` / `KLING_SECRET_KEY` / `KLING_API_BASE` | – / – / – / `https://api-singapore.klingai.com` | Kling（AK/SK は旧 API 用） |
 | `DEFAULT_BUDGET_USD` | `50` | バッチの既定予算上限 |
@@ -123,6 +130,29 @@ cp .env.example .env.local    # NEXT_PUBLIC_API_BASE_URL（既定 http://localho
 | `FONTS_DIR` | – | libass に追加で渡すフォントディレクトリ |
 
 API キーはサーバー側でのみ読み込み、どの API レスポンスにも含めません（`configured` の真偽値のみ）。
+
+## Claude と OpenRouter
+
+絵コンテを作る Claude は、次の順で経路を選びます（`GET /api/system/capabilities` の `llm` と設定画面に表示）。
+
+1. `ANTHROPIC_API_KEY` がある → Anthropic に直接送る
+2. `ANTHROPIC_API_KEY` がなく `OPENROUTER_API_KEY` がある → OpenRouter 経由で Claude（`OPENROUTER_CLAUDE_MODEL`）に送る
+3. どちらもない → テンプレートで作る（外部に送らない）
+
+OpenRouter を使う手順（**実際のキーでは未検証**。この開発コンテナからは openrouter.ai に接続できず、HTTP モックでのみテストしています）:
+
+1. OpenRouter でキーを作り、`backend/.env` に `OPENROUTER_API_KEY=...` を設定する。Celery 構成では API とワーカーの両方に渡す。
+2. API とワーカーのホストから `https://openrouter.ai`（`OPENROUTER_API_BASE`）へ HTTPS で接続できるようにする
+   （プロキシ・ファイアウォールの許可リスト）。
+3. API とワーカーを再起動し、設定画面で OpenRouter が「設定済み」、モデル一覧が「OpenRouter から取得」になっていることを確認する。
+   取得できないときは組み込みの 6 モデル（検索による調査値）を表示します。
+4. OpenRouter のアカウント設定で **プロンプトのログ記録はオフのまま** にする。アカウント全体の ZDR 強制は有効にしない
+   （動画生成は ZDR の対象外とされ、使えなくなるおそれがあるため）。
+5. 生成設定でプロバイダー「OpenRouter」とモデルを選ぶ。見積もりはモデル一覧の料金（なければ調査値）による概算で、実際の
+   費用は完了時に OpenRouter が返す金額（`usage.cost`）で記録します。料金を読み取れないモデルは選べません。
+
+`OPENROUTER_API_KEY` だけを設定すると、動画生成に加えて絵コンテ（**歌詞の本文を含む**）も OpenRouter 経由で Claude に送られます。
+歌詞を外部に送りたくない場合は、`ANTHROPIC_API_KEY` と `OPENROUTER_API_KEY` のどちらも設定しないでください（下の「外部 API に送るデータ」）。
 
 ## 起動
 
@@ -161,7 +191,9 @@ TEST_DATABASE_URL=sqlite:////tmp/mvf.sqlite3 .venv/bin/python -m pytest tests/ -
 .venv/bin/python -m pytest tests/test_pipeline.py tests/test_api_*.py -q            # 統合部分のみ
 ```
 
-テストは有料 API を呼びません（API キーは空に上書きされ、外部 API は HTTP モックのみ）。
+テストは有料 API を呼びません（API キーは空に上書きされ、外部 API は HTTP モックのみ）。OpenRouter（動画と Claude の経路）の
+テストは `tests/test_providers_openrouter.py`・`tests/test_llm_openrouter.py`・`tests/test_pipeline_openrouter.py` です
+（respx のモックのみ。実際の OpenRouter との通信は確認していません）。
 
 ## E2E デモ（受け入れテスト）
 
@@ -190,23 +222,25 @@ cd backend && .venv/bin/python scripts/e2e_demo.py --api http://localhost:8000
 
 失敗が 1 つでもあると終了コード 1 になります。
 
-2026-10-11 にこの開発コンテナで、2 回目のレビュー指摘の修正後に実行した結果を示します。inline モードと Celery モード
-（`celery -A app.worker.celery_app worker -c 2`、API とワーカーに同じ `SECRET_KEY`）の両方で成功しました（inline: 合計 193.3 秒）。
-以下は Celery モードの出力です。
+2026-10-12 にこの開発コンテナで、OpenRouter の追加後に実行した結果を示します。inline モードと Celery モード
+（`celery -A app.worker.celery_app worker -c 2`、API とワーカーに同じ `SECRET_KEY`）の両方で成功しました（inline: 合計 226.7 秒）。
+どちらもキーなしのため、OpenRouter は「未設定」で、見積もりのプロバイダー比較に `openrouter`（`google/veo-3.1-lite`、組み込みの候補の料金）
+の行が入ることだけを確認しています。以下は Celery モードの出力です（ワーカーが `mvf.analyze` 1 件・`mvf.run_batch` 2 件・
+`mvf.render_video` 7 件を処理）。
 
 ```
-+----------+-----------+------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
-| video    | style     | grade      | start | shots | MB   | resolution | vcodec | fps  | acodec | dur(s) | lag(ms) | corr  | quality | result |
-+----------+-----------+------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
-| A#1      | cinematic | warm_film  | 24.03 | 6     | 8.6  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| A#2      | simple    | cool_night | 24.03 | 7     | 6.3  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| A#3      | fade      | natural    | 24.03 | 5     | 7.6  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| B#1      | karaoke   | warm_film  | 24.03 | 7     | 14.6 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| B#2      | karaoke   | cool_night | 22.04 | 6     | 9.9  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-| B#3      | karaoke   | natural    | 8.03  | 6     | 10.6 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.999 | pass    | OK     |
-| A-edit#1 | karaoke   | warm_film  | 24.03 | 6     | 11.8 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
-+----------+-----------+------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
-timings: analysis 4.4s, batch_a 87.9s, batch_b 66.5s, edit_rerender 34.4s, total 198.8s
++----------+-----------+-------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
+| video    | style     | grade       | start | shots | MB   | resolution | vcodec | fps  | acodec | dur(s) | lag(ms) | corr  | quality | result |
++----------+-----------+-------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
+| A#1      | cinematic | cool_night  | 24.03 | 5     | 6.1  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| A#2      | simple    | natural     | 24.03 | 5     | 7.5  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| A#3      | fade      | teal_orange | 24.03 | 5     | 6.9  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| B#1      | karaoke   | warm_film   | 24.03 | 5     | 13.4 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| B#2      | karaoke   | cool_night  | 22.04 | 6     | 12.3 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
+| B#3      | karaoke   | natural     | 8.03  | 6     | 12.3 | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.999 | pass    | OK     |
+| A-edit#1 | karaoke   | cool_night  | 24.03 | 5     | 9.9  | 1080x1920  | h264   | 30/1 | aac    | 15.000 | 0.0     | 0.998 | pass    | OK     |
++----------+-----------+-------------+-------+-------+------+------------+--------+------+--------+--------+---------+-------+---------+--------+
+timings: analysis 6.6s, batch_a 97.2s, batch_b 75.8s, edit_rerender 34.5s, total 220.4s
 E2E PASSED: 7/7 videos verified
 ```
 
@@ -224,9 +258,11 @@ npm run build
 npx playwright test          # 起動済みのサーバーを使い、なければ playwright.config.ts が起動する
 ```
 
+テストは 14 件（`full-flow.spec.ts` 2 件、`review-fixes.spec.ts` 6 件、`openrouter.spec.ts` 6 件）で、4 CPU で約 8.5 分です。
+OpenRouter の「設定済み」の画面は、キーがないためバックエンドの実際の応答を書き換えて確認しています。
 詳細（H.264 非対応の Chromium での扱い、スクリーンショットの一覧）は `frontend/e2e/README.md` を参照してください。
 
-## 動画生成プロバイダの状況（2026-10-11 時点）
+## 動画生成プロバイダの状況（2026-10-12 時点）
 
 | プロバイダ | 状態 | 備考 |
 |---|---|---|
@@ -235,32 +271,35 @@ npx playwright test          # 起動済みのサーバーを使い、なけれ�
 | Veo（Gemini API） | 未検証（キーなし） | 実装・HTTP モックテスト済み。無効キーで公式エンドポイントの 400 応答のみ確認 |
 | Runway | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
 | Kling | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
+| OpenRouter（`openrouter`） | **未検証**（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み。モデル・料金は `GET /videos/models` から取得（取得できなければ組み込みの 6 モデル）。形状は公式 SDK（`@openrouter/sdk` 1.4.25）のソースによる。Claude の経路（絵コンテ）も同じく未検証 |
 
-API モデルの料金は公式料金表の調査値（`verified: false`）です。実キーでの検証が済むまでは概算として扱ってください。
+API モデルの料金は公式料金表・モデルページの調査値（`verified: false`）です。実キーでの検証が済むまでは概算として扱ってください。
 Runway の利用規約に従い、UI には runwayml.com へのリンク付きで「Powered by Runway」を表示します（Runway の
 プロバイダーカード、Runway 選択時の詳細、Runway を使ったジョブの設定欄・動画一覧・プレビュー、Runway の素材、
 設定画面のプロバイダー一覧）。表示が必須かどうかの最終確認は `docs/VIDEO_PROVIDERS.md` §6 の未確定事項です。
 
 ## 検証済み / 未検証
 
-この開発コンテナ（4 CPU、API キーなし、huggingface.co・api.klingai.com・api.dev.runwayml.com へ接続不可）で
-2026-10-11 に確認した範囲です。
+この開発コンテナ（4 CPU、API キーなし、huggingface.co・api.klingai.com・api.dev.runwayml.com・openrouter.ai へ接続不可）で
+確認した範囲です（特記がなければ 2026-10-12、OpenRouter の追加後）。
 
 **検証済み（実際に動かして確認）**
 
-- バックエンドの全テスト 1122 件（PostgreSQL 16 の `mvf_test`。SQLite でも全件成功）。外部 API は HTTP モック（respx）と SDK モックのみ。
+- バックエンドの全テスト 1268 件（PostgreSQL 16 の `mvf_test`、約 8 分）。外部 API は HTTP モック（respx）と SDK モックのみ。
+  うち OpenRouter 関連は 3 ファイルの 144 件（動画プロバイダー、Claude の経路、パイプライン）。
 - `scripts/e2e_demo.py`: inline モードと Celery モード（実ワーカー、API とワーカーで同じ `SECRET_KEY`）の両方で、
   解析 → 歌詞（同じ歌詞の保存し直しで行 ID・タイミング・権利確認が保たれること）→ 生成ガード → mock / library のバッチ →
   編集・再レンダリング → MP4・ZIP のダウンロード（署名付き ZIP リンクを含む）→ ffprobe と元曲との相互相関による検証まで
-  （上の「E2E デモ」）。
+  （上の「E2E デモ」）。キーなしの OpenRouter が「未設定」と表示され、見積もりの比較に入ることも確認。
 - 既存のデータベース（開発用の `mvf`）の起動時の自動更新: `cost_records.project_id` の NULL 可・`ON DELETE SET NULL` 化、
-  `cost_records.owner_id` の追加と補完（134 件）。
-- Playwright のブラウザ E2E（本番ビルド `next start` と inline モードの API、8 件）: 画面操作による一連の流れ、
+  `cost_records.owner_id` の追加と補完（134 件。2026-10-11）。
+- Playwright のブラウザ E2E（本番ビルド `next start` :3000 と inline モードの API :8000、14 件）: 画面操作による一連の流れ、
   library での生成、歌詞スタイル「自動」、Runway 表記（Runway は設定済みと見せかけた応答で確認）、署名付きリンクでの ZIP、
   キャンセル済みの非表示、「左右反転を使う」、権利確認のやり直しの表示、歌詞の見出し行・間奏前の表示終了の注意、
-  絵コンテのプレビューの権利の案内と回数制限（Claude は設定済みと見せかけた応答、429 はテスト側で用意）。
-  `review-fixes.spec.ts`（6 件）はトークン認証（`AUTH_MODE=token`）の API でも成功（ZIP は認証ヘッダーなしで取得）。
-- フロントエンドの `npm run typecheck` / `npm run lint` / `npm run build`。
+  絵コンテのプレビューの権利の案内と回数制限（Claude は設定済みと見せかけた応答、429 はテスト側で用意）、
+  OpenRouter の表示（設定画面・生成設定・絵コンテの経路・利用額。設定済みの状態は応答の書き換えで確認）。
+  `review-fixes.spec.ts`（6 件）は 2026-10-11 にトークン認証（`AUTH_MODE=token`）の API でも成功（ZIP は認証ヘッダーなしで取得）。
+- フロントエンドの `npm run check`（`tsc --noEmit` と ESLint）/ `npm run build`。
 - FFmpeg による 1080×1920 / H.264 / AAC / 30fps の出力、歌詞の焼き込み、品質チェック、Range 対応の署名付き URL。
   ゆっくりした Ken Burns のパン・ズームの連続フレームを目視し、テクスチャ画像で動きを計測（縦長素材のパンはフレーム間の
   移動量の揺れが 0.04〜0.05 px）。暗部の階調（輝度 48 未満に 27〜40 段階）も確認。
@@ -268,26 +307,49 @@ Runway の利用規約に従い、UI には runwayml.com へのリンク付き�
 
 **未検証（キー・接続先がないため）**
 
-- Veo / Runway / Kling への実際の生成リクエスト、料金、課金の挙動（失敗したジョブが課金されるか、出力 URL の有効期限など）。
+- Veo / Runway / Kling / OpenRouter への実際の生成リクエスト、料金、課金の挙動（失敗したジョブが課金されるか、出力 URL の有効期限など）。
   ジョブ ID の保存と再開（`on_submitted` / `resume`）も HTTP モックでのみ確認しています。
-- Claude による絵コンテ生成・翻訳（Anthropic SDK を偽の HTTP 応答で呼ぶテストのみ）。
+- OpenRouter のモデル一覧（`GET /videos/models`）の実際の内容と料金のキー名、`POST /videos` の成功ステータス（202 か 200 か）、
+  `/content` の 409 / 410 の意味、BYOK の費用の内訳。OpenRouter の利用規約と各モデルの商用利用条件。
+- Claude による絵コンテ生成・翻訳（Anthropic SDK を偽の HTTP 応答で呼ぶテストのみ）。OpenRouter 経由の Claude（`zdr: true` と
+  `data_collection: "deny"` を満たす提供元があるか、`reasoning.effort` と json_schema の変換、拒否の表し方、`usage.cost` の有無）。
 - Whisper による歌詞整列（モデルを取得できないため 503。整列ロジックは偽の文字起こしでのみテスト）。
 - 実 S3 / MinIO / R2（moto のみ）。H.264 を再生できる Chrome での動画再生（同梱の Chromium は H.264 非対応のため、
   E2E では VP9 に変換したコピーで再生を確認）。
 
 ## 外部 API に送るデータ
 
-- 動画生成 API（Veo / Runway / Kling）には、英語のプロンプト（世界観・シーンの説明）と、画像→動画のときは入力画像を送ります。
-  楽曲・歌詞の本文は送りません。
-- `ANTHROPIC_API_KEY` を設定すると、絵コンテの生成に **楽曲名・ムード・目的・カスタム世界観・歌詞の本文・楽曲解析の要約**
-  を Anthropic（Claude）に送ります。アーティスト名と別表記は「描写してはいけない名前」としてのみ送り、
-  他の項目からは取り除きます。送信したくない場合はキーを設定しないでください（テンプレートで絵コンテを作ります）。
+- 動画生成 API（Veo / Runway / Kling / OpenRouter）には、英語のプロンプト（世界観・シーンの説明）と、画像→動画のときは入力画像を送ります。
+  楽曲・歌詞の本文は送りません。OpenRouter はプロンプトを各モデルの提供元（Google・Kuaishou・MiniMax・Alibaba など）に中継します。
+  動画生成は OpenRouter のゼロデータ保持（ZDR）の対象外とされ、動画のリクエストにはデータ保持の指定を付けられません。
+- Claude の経路が設定されていると（`ANTHROPIC_API_KEY`、またはそれがなく `OPENROUTER_API_KEY`）、絵コンテの生成に
+  **楽曲名・ムード・目的・カスタム世界観・歌詞の本文・楽曲解析の要約** を Claude に送ります。アーティスト名と別表記は
+  「描写してはいけない名前」としてのみ送り、他の項目からは取り除きます。送信したくない場合はどちらのキーも設定しないでください
+  （テンプレートで絵コンテを作ります）。
+- OpenRouter 経由の場合、上の内容（歌詞を含む）は OpenRouter と、その先の Claude の提供元（Anthropic / Amazon Bedrock /
+  Google Vertex / Azure など。どれが使われたかは応答から分かりません）を通ります。毎回、データを収集しない提供元
+  （`data_collection: "deny"`）・データを保持しないエンドポイント（`zdr: true`）だけを指定しますが、実際の扱いは未検証です。
+  条件を満たす提供元がない場合はテンプレートで絵コンテを作ります。OpenRouter のアカウント設定でプロンプトのログ記録はオフのままにしてください。
+  OpenRouter に送るユーザー ID は、内部の ID を `SECRET_KEY` で HMAC した仮名です。
   権利確認の「歌詞の権利」が未確認のあいだ、絵コンテのプレビューは歌詞を送らずテンプレートで作ります（バッチの作成は
   権利確認の全項目が必要です）。詳しくは `docs/RIGHTS_AND_SECURITY.md` §5 を参照してください。
 
 ## 制限事項・既知の問題
 
-- 実際の AI 動画生成（Veo / Runway / Kling）と Claude による絵コンテ生成は、上記のとおり未検証です。
+- 実際の AI 動画生成（Veo / Runway / Kling / OpenRouter）と Claude による絵コンテ生成（Anthropic 直接・OpenRouter 経由とも）は、
+  上記のとおり未検証です。
+- OpenRouter（実キーでの確認が必要な点。詳しくは `docs/VIDEO_PROVIDERS.md` §8.8・§8.10）:
+  - モデル一覧の料金（`pricing_skus`）のキー名は未確認のため、料金を読み取れないモデルは調査値を使うか、選べなくなります。
+    各モデルが 9:16・720p・`generate_audio: false`・画像の data URI を受け付けるかも未確認です。
+  - キャンセル API がないため、中断・タイムアウトしたジョブは課金されたものとして記録します（推定）。生成リクエストの結果が
+    分からなかった場合（応答のタイムアウト、500 / 502 / 504 / 524 など）も、二重課金を避けて再送せず、推定額を課金済みとして記録します。
+  - BYOK（OpenRouter に自分の提供元キーを登録）の場合、OpenRouter が返す費用が手数料だけの可能性があるため、見積もり額
+    （Claude はトークン数 × 定価）を下回らないように記録します。実際の請求は提供元のアカウントで確認してください。
+  - Claude の経路では、`zdr: true` と `data_collection: "deny"` を満たす Opus 5.5 の提供元があるかが未確認です。ない場合、
+    OpenRouter 経由の絵コンテは毎回テンプレートになります（警告が出ます）。
+  - 動画のダウンロード先は https の公開ホストに限りますが、DNS で内部アドレスに解決されるホスト名までは防げません。
+  - Veo / Runway / Kling の送信は従来どおり、タイムアウトや 5xx で再送されることがあります（OpenRouter だけが「結果不明なら再送しない」）。
+  - OpenRouter 経由の Runway のモデルに「Powered by Runway」の表示が必要かは未確認です（OpenRouter のジョブには表示しません）。
 - Whisper による歌詞整列は、この環境ではモデルを取得できないため 503 になります。
 - 楽曲解析・自動タイミングの精度は、合成したデモ曲でのみ確認しています。実際の楽曲（特に 4/4 拍子以外）では精度が下がります。
   拍の位置は約 30 ms 遅れて検出される傾向があります。
@@ -329,7 +391,7 @@ Runway の利用規約に従い、UI には runwayml.com へのリンク付き�
 
 ## ロードマップ
 
-- **Phase 2（実生成の本番化）**: Veo / Runway / Kling の実キーでの検証と料金の確定、画像→動画（キャラクター一貫性のための参照画像）、
+- **Phase 2（実生成の本番化）**: Veo / Runway / Kling / OpenRouter（動画と Claude の経路）の実キーでの検証と料金の確定、画像→動画（キャラクター一貫性のための参照画像）、
   Whisper モデルの配布と整列精度の評価、Alembic マイグレーション、S3 互換ストレージでの運用検証、生成ジョブの優先度とレート制限。
 - **Phase 3（制作体験）**: タイムライン上でのショット編集・トリミング、歌詞のフレーズ単位アニメーション、複数アスペクト比（4:5・1:1・16:9）同時出力、
   BGM のみ区間の自動演出、テンプレート共有、チーム・権限管理。

@@ -13,7 +13,7 @@ export type LyricsFormatInput = "auto" | LyricsFormat;
 export type LyricsExportFormat = "lrc" | "srt";
 export type LyricSource = "manual" | "lrc" | "srt" | "txt" | "heuristic" | "whisper";
 export type AssetKind = "audio" | "lyrics" | "material" | "clip" | "render" | "thumbnail" | "zip";
-export type ClipSource = "upload" | "mock" | "kling" | "runway" | "veo";
+export type ClipSource = "upload" | "mock" | "kling" | "runway" | "veo" | "openrouter";
 export type ClipStatus = "pending" | "generating" | "ready" | "failed" | "cancelled";
 export type BatchStatus =
   | "queued"
@@ -36,8 +36,12 @@ export type PresetId =
   | "dreamy"
   | "documentary"
   | "custom";
-export type ProviderId = "mock" | "library" | "kling" | "runway" | "veo";
+export type ProviderId = "mock" | "library" | "kling" | "runway" | "veo" | "openrouter";
 export type ProviderKind = "mock" | "library" | "api";
+/** How Claude is reached for storyboards / translation: Anthropic directly or via OpenRouter. */
+export type LlmRoute = "anthropic" | "openrouter";
+/** Where the OpenRouter model list came from: fetched now, the cached listing, or the built-in candidates. */
+export type ModelsSource = "live" | "cache" | "fallback";
 export type LyricStyleId = "simple" | "cinematic" | "minimal" | "karaoke" | "fade";
 /** Batch setting only: a style id, or `auto` = the planner rotates the preset's `lyric_styles` per video. */
 export type LyricStyleChoice = LyricStyleId | "auto";
@@ -385,6 +389,11 @@ export interface StoryboardScene {
 
 export interface Storyboard {
   source: "claude" | "template";
+  /**
+   * Additive: the route of the Claude call — also set on a template fallback after a call
+   * (then `model` / `cost_usd` are those of the failed attempt). Null when Claude was not called.
+   */
+  route?: LlmRoute | null;
   model: string | null;
   usage: { input_tokens: number; output_tokens: number } | null;
   cost_usd: number;
@@ -661,9 +670,12 @@ export interface ProviderModelInfo {
   max_clip_duration: number;
   resolution: string;
   supports_vertical: boolean;
-  price_per_second_usd: number;
+  /** Null when the price is unknown (`price_known: false`, e.g. an OpenRouter listing entry without a readable price). */
+  price_per_second_usd: number | null;
   price_note: string;
   verified: boolean;
+  /** Additive: `false` = no readable price; the model cannot be used (the budget cannot be reserved). */
+  price_known?: boolean;
   /** Additive (§6.7 "As implemented"): clip length used for a 5 s request. */
   default_duration?: number;
   /** `false` marks image-only models (e.g. Runway gen4_turbo). */
@@ -684,6 +696,12 @@ export interface ProviderInfo {
   models: ProviderModelInfo[];
   /** Additive (§6.7): model used when `GenerationSettings.model` is null. */
   default_model?: string;
+  /** Additive, providers with a fetched model list (OpenRouter): where `models` came from. */
+  models_source?: ModelsSource;
+  /** When the listing was fetched (ISO), null for the built-in candidates. */
+  models_fetched_at?: ISODateString | null;
+  /** Japanese note on the listing (source, staleness, models left out). */
+  models_note?: string;
 }
 
 export interface WhisperInfo {
@@ -750,9 +768,23 @@ export interface GenerationOptionInfo {
   default: boolean;
 }
 
+/** Additive (`CapabilitiesOut.llm`): how Claude is reached; never contains secrets. */
+export interface LlmInfo {
+  /** `anthropic` = ANTHROPIC_API_KEY (direct), `openrouter` = OPENROUTER_API_KEY only, null = template / glossary. */
+  route: LlmRoute | null;
+  /** e.g. `claude-opus-5-5` (direct) or `anthropic/claude-opus-5.5` (OpenRouter). */
+  model: string | null;
+  /** Japanese: what is sent where on this route. */
+  data_policy_note: string;
+  /** False until the route has been exercised with a real key. */
+  verified: boolean;
+}
+
 export interface CapabilitiesOut {
   providers: ProviderInfo[];
+  /** True for either Claude route (Anthropic direct or OpenRouter); `llm` says which. */
   claude_configured: boolean;
+  llm?: LlmInfo;
   whisper: WhisperInfo;
   presets: WorldPresetInfo[];
   lyric_styles: LyricStyleInfo[];

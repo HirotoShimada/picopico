@@ -52,7 +52,8 @@ src/
     types.ts              API 型（backend/app/schemas.py と対応）
     format.ts             表示用フォーマッター（ja-JP）
     status.ts             ジョブ／動画／クリップ／解析ステータスのラベルと判定
-    constants.ts          権利確認項目、世界観プリセット（フォールバック）、既定値
+    constants.ts          権利確認項目、世界観プリセット（フォールバック）、既定値、プロバイダー名
+    llm.ts                Claude の経路（Anthropic 直接 / OpenRouter 経由 / テンプレート）と OpenRouter のモデル一覧の表示用ヘルパー
     utils.ts              cn() など
 ```
 
@@ -112,6 +113,29 @@ API トークンを変更すると、SWR のキャッシュをすべて破棄し
   再生成・編集・再試行の 422（`rights_unconfirmed` / `budget_exceeded`）には次にすべきことを添えて表示します。
 - 動画プレーヤー: 読み込みに失敗したとき、ブラウザが H.264 を再生できない場合はその旨を、そうでなければ署名付き URL の
   期限切れとして再読み込みを案内します。サムネイルは期限切れで読み込めないと API データを取り直します（30 秒に 1 回まで）。
+- OpenRouter（動画生成プロバイダー `openrouter` と Claude の経路。実際の API キーでは未検証）:
+  - 生成設定: プロバイダーカードに「未検証」。モデルの選択肢は `GET /api/system/capabilities` の一覧（OpenRouter のモデル一覧、
+    取得できないときは組み込みの候補）で、提供元（`google/…` → Google など、モデル ID の先頭から）・解像度・秒数・1 秒あたりの
+    料金を表示します。料金を読み取れないモデル（`price_known: false`、`price_per_second_usd: null`）は「料金未取得」として
+    選べません（予算を確保できないため）。選択中は「OpenRouter での生成について」に、音声の生成はオフ（`generate_audio: false`）、
+    プロンプトが OpenRouter を経由してモデルの提供元に送られること、OpenRouter の規約に加えてモデルの提供元の規約が適用されること、
+    モデル一覧の出どころ（`models_note`）を表示します。9:16 への対応が不明なモデルには「9:16 未確認」。確認ダイアログと見積もりの
+    「未検証」には、料金が OpenRouter のモデル一覧（または調査値）に基づく概算で、実費は完了時に OpenRouter が返す金額で
+    記録する旨を表示します。前回のジョブが OpenRouter なら OpenRouter とそのモデルを引き継ぎ、そのモデルがモデル一覧から
+    消えていた場合は既定のモデルを表示して `model: null`（プロバイダーの既定）で見積もり・作成します。見積もりはプロバイダー一覧の
+    取得（またはその失敗）を待ってから要求します。
+  - 設定画面: 「AI 機能」に Claude の経路（`capabilities.llm.route`: Anthropic 直接 / OpenRouter 経由 / テンプレート）、モデル、
+    「未検証」、経路の優先順（ANTHROPIC_API_KEY → OPENROUTER_API_KEY → テンプレート）と `data_policy_note`（送信するデータ）。
+    プロバイダー一覧の OpenRouter には、モデル一覧の出どころ（OpenRouter から取得 / キャッシュ / 組み込みの候補）・モデル数・
+    料金未取得の数・取得からの経過時間（`models_fetched_at`）と `models_note`。料金表の料金未取得のモデルは「料金未取得」。
+    `llm` のない古いバックエンドでは `claude_configured` を Anthropic 直接として扱います（`resolveLlm`）。
+  - 絵コンテ: プレビューと生成ジョブの絵コンテに、作成した経路とモデル（例: 「Claude（OpenRouter 経由）」と
+    `anthropic/claude-opus-5.5`、`Storyboard.route` / `model`）を表示します。OpenRouter 経由で呼び出したあとテンプレートに
+    切り替わった場合は「Claude（OpenRouter 経由）の応答を使えなかったため、テンプレートで作成しました」（理由は警告に表示）。
+    Claude 設定時のプレビューの説明に経路とモデル、OpenRouter 経由なら歌詞の本文が OpenRouter を通ることを表示します。
+  - 費用: ダッシュボードの API 利用状況はプロバイダー `openrouter` を「OpenRouter」、Claude の直接呼び出し `anthropic` を
+    「Claude（Anthropic 直接）」と表示し、OpenRouter の金額には OpenRouter 経由の Claude の費用も含む旨を添えます。
+    素材のプレビューには OpenRouter 経由で生成した素材のモデルの提供元を表示します。
 
 ### プロジェクト配下のページ
 

@@ -6,8 +6,10 @@ look-alike phrasing (English and Japanese), and always appends the
 likeness-safety and no-text clauses. Negative prompts are not passed through it
 (they legitimately contain words such as "celebrity likeness").
 
-``translate_to_english`` uses Claude when ``ANTHROPIC_API_KEY`` is configured
-and otherwise a built-in glossary of common scene/mood words (best effort).
+``translate_to_english`` uses Claude when it is configured — Anthropic directly
+(``ANTHROPIC_API_KEY``) or else via OpenRouter (``OPENROUTER_API_KEY``), see
+:mod:`app.services.llm` — and otherwise a built-in glossary of common
+scene/mood words (best effort).
 """
 
 from __future__ import annotations
@@ -20,7 +22,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from app.config import get_settings
+# FALLBACK_BETA / first_text_block are re-exported (they moved to app.services.llm).
+from app.services.llm import (
+    FALLBACK_BETA,
+    LlmCallError,
+    complete,
+    first_text_block,
+    make_llm_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +63,6 @@ _SAFETY_SUFFIX = f"{LIKENESS_SAFETY_CLAUSE}, {NO_TEXT_CLAUSE}."
 # Runway's promptText is limited to 1000 characters (docs/VIDEO_PROVIDERS.md);
 # Kling allows 2500 and Veo more, so 1000 is the common ceiling.
 MAX_PROMPT_CHARS = 1000
-
-# Server-side refusal fallback ("default" routing) for claude-opus-5-5 requests.
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 # --- forbidden names & real-person phrasing --------------------------------------------
 
@@ -784,13 +790,12 @@ def mood_keywords(text: str, limit: int | None = None) -> list[str]:
 
 
 def make_claude_client() -> Any | None:
-    """An ``anthropic.Anthropic`` client when ``ANTHROPIC_API_KEY`` is configured, else ``None``."""
-    settings = get_settings()
-    if not settings.anthropic_configured:
-        return None
-    import anthropic
+    """The Claude client of the configured route (:func:`app.services.llm.make_llm_client`).
 
-    return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=300.0, max_retries=2)
+    ``anthropic.Anthropic`` with ``ANTHROPIC_API_KEY``, else an OpenRouter chat
+    client with ``OPENROUTER_API_KEY``, else ``None`` (template / glossary).
+    """
+    return make_llm_client()
 
 
 _TRANSLATE_SYSTEM = (
@@ -801,44 +806,16 @@ _TRANSLATE_SYSTEM = (
 )
 
 
-def first_text_block(response: Any) -> str | None:
-    """Text of the first ``text`` content block of a Messages API response (thinking blocks are skipped)."""
-    for block in getattr(response, "content", None) or []:
-        if getattr(block, "type", None) == "text":
-            return str(getattr(block, "text", ""))
-    return None
-
-
 def _claude_translate(text: str, client: Any) -> str | None:
-    import anthropic
-
-    settings = get_settings()
     try:
-        response = client.beta.messages.create(
-            model=settings.ANTHROPIC_MODEL,
-            max_tokens=4000,
-            betas=[FALLBACK_BETA],
-            fallbacks="default",
-            output_config={"effort": "low"},
-            system=_TRANSLATE_SYSTEM,
-            messages=[{"role": "user", "content": text}],
-        )
-    except anthropic.BadRequestError as exc:
-        logger.warning("Claude translation rejected (400): %s", exc.message)
+        reply = complete(client, system=_TRANSLATE_SYSTEM, user=text, max_tokens=4000, purpose="translation")
+    except LlmCallError:
+        logger.warning("Claude translation failed; using glossary")
         return None
-    except anthropic.RateLimitError:
-        logger.warning("Claude translation rate limited; using glossary")
+    if reply.finish != "ok":
+        logger.warning("Claude translation ended with %s; using glossary", reply.finish)
         return None
-    except anthropic.APIStatusError as exc:
-        logger.warning("Claude translation failed with HTTP %s; using glossary", exc.status_code)
-        return None
-    except anthropic.APIConnectionError:
-        logger.warning("Claude translation: connection error; using glossary")
-        return None
-    if getattr(response, "stop_reason", None) == "refusal":
-        logger.warning("Claude declined the translation request; using glossary")
-        return None
-    translated = (first_text_block(response) or "").strip().strip("\"'“”")
+    translated = (reply.text or "").strip().strip("\"'“”")
     return translated or None
 
 
@@ -847,8 +824,9 @@ def translate_to_english(text: str, *, use_claude: bool = True, client: Any | No
 
     ``source`` is ``"passthrough"`` (empty or already ASCII), ``"claude"`` or
     ``"glossary"`` (best-effort keyword translation; unknown words are dropped,
-    so the result can be empty). ``client`` overrides the Anthropic client
-    (tests); Claude is only used when ``use_claude`` is true and a client is
+    so the result can be empty). ``client`` overrides the Claude client of the
+    configured route (an ``anthropic.Anthropic`` or an OpenRouter chat client;
+    tests); Claude is only used when ``use_claude`` is true and a client is
     available.
     """
     stripped = (text or "").strip()
