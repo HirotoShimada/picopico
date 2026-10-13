@@ -528,3 +528,12 @@ def test_claude_receives_audio_mood_and_estimate() -> None:
     assert song["audio_mood"] == _MELANCHOLIC
     assert song["world_estimate"]["recommended_presets"] == board["world_estimate"]["recommended_presets"]
     schemas.Storyboard.model_validate(board)
+
+
+def test_base_negative_and_instructions_cover_live_artifacts() -> None:
+    # Live Veo run 2026-10-13: a lens-frame ring appeared and one clip dropped the trousers.
+    from app.services.storyboard import BASE_NEGATIVE_EN, MAX_NEGATIVE_CHARS, _merge_negative
+
+    merged = _merge_negative("x" * 10, BASE_NEGATIVE_EN)
+    assert len(merged) <= MAX_NEGATIVE_CHARS and "circular vignette" in merged and "black borders" in merged
+    assert "every garment of the protagonist" in SYSTEM_PROMPT

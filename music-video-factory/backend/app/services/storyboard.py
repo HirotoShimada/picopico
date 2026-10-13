@@ -103,7 +103,7 @@ REALISM_EN = (
 )
 BASE_NEGATIVE_EN = (
     "deformed hands, extra fingers, fused fingers, missing fingers, extra limbs, warped face, "
-    "distorted facial features, asymmetrical eyes, morphing, melting, flicker, jitter, frame stutter, "
+    "black borders, circular vignette, visible lens edge, fisheye distortion, distorted facial features, asymmetrical eyes, morphing, melting, flicker, jitter, frame stutter, "
     "sudden cuts, text, letters, subtitles, captions, watermark, logo, signature, cartoon, anime, "
     "illustration, painting, CGI, 3D render, video game look, plastic skin, waxy skin, oversaturated, "
     "overexposed, blurry, low resolution, compression artifacts, duplicated subjects, "
@@ -660,7 +660,8 @@ film look and atmosphere. Describe the film look in generic words (grain, halati
 never name a film stock, camera, lens or any other product brand (e.g. no "CineStill", "Kodak", "ARRI"): \
 video models render such names as visible text in the frame.
 - consistency_tokens_en: at most 200 characters of shared style descriptors (wardrobe, palette, film look) \
-to repeat in every prompt.
+to repeat in every prompt. The wardrobe part must name every garment of the protagonist (outerwear, top, \
+bottoms, shoes) so no clip changes or drops a piece of clothing.
 - summary_ja: 2-3 Japanese sentences describing the world for the artist.
 
 Scenes:
