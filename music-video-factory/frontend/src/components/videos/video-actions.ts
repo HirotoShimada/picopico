@@ -21,13 +21,17 @@ type VideoRef = Pick<VideoOut, "id" | "project_id" | "batch_id">;
 
 /**
  * Error text for a failed re-render request, with what to do next for the coded refusals
- * (`regenerate` / `edit` / `retry` re-check the rights checklist; `retry` and `regenerate` the budget).
+ * (`regenerate` / `edit` / `retry` re-check the rights checklist; `retry` and `regenerate` the budget; a free
+ * `regenerate` finds no ready clip of the batch: `no_clips`).
  */
 export function rerenderErrorMessage(error: unknown): string {
   const message = errorMessage(error);
   if (!isApiError(error)) return message;
   if (error.code === "rights_unconfirmed") return `${message} プロジェクトの「権利確認」タブで全項目を確認すると再開できます。`;
   if (error.code === "budget_exceeded") return `${message} 生成ジョブの画面で予算を引き上げると再試行できます。`;
+  if (error.code === "no_clips") {
+    return `${message} この動画で使える生成済みの素材が見つかりません。「新しい素材も生成する」をオンにして再生成してください（費用が発生します）。`;
+  }
   return message;
 }
 

@@ -19,17 +19,21 @@ export function shotSourceSeconds(shot: ShotPlan): number {
   return shot.src_in + shot.duration * (shot.speed || 1);
 }
 
+const NO_SHOTS: readonly ShotPlan[] = [];
+
 export interface ClipPickerDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   shotIndex: number | null;
   shot: ShotPlan | null;
+  /** Every shot of the video (draft applied), to mark clips the other shots already use. */
+  shots?: readonly ShotPlan[];
   clips: readonly ClipOut[];
   onPick: (clipId: string) => void;
 }
 
 /** Choose a replacement clip for one shot from the video's `available_clips`. */
-export function ClipPickerDialog({ open, onOpenChange, shotIndex, shot, clips, onPick }: ClipPickerDialogProps) {
+export function ClipPickerDialog({ open, onOpenChange, shotIndex, shot, shots = NO_SHOTS, clips, onPick }: ClipPickerDialogProps) {
   const [candidateId, setCandidateId] = React.useState<string | null>(null);
   // Start from the shot's current clip each time the dialog opens for a shot.
   const openKey = open ? shotIndex : null;
@@ -45,6 +49,11 @@ export function ClipPickerDialog({ open, onOpenChange, shotIndex, shot, clips, o
     return [...usable].sort((a, b) => Number(b.scene_id === shot.scene_id) - Number(a.scene_id === shot.scene_id));
   }, [clips, shot]);
   const candidate = ready.find((clip) => clip.id === candidateId) ?? null;
+  // Picking one of these would show the same footage twice in this video.
+  const usedByOtherShots = React.useMemo(
+    () => new Set(shots.flatMap((other, index) => (index !== shotIndex && other.clip_id ? [other.clip_id] : []))),
+    [shots, shotIndex],
+  );
   const needed = shot ? shotSourceSeconds({ ...shot, src_in: 0 }) : 0;
 
   return (
@@ -56,7 +65,7 @@ export function ClipPickerDialog({ open, onOpenChange, shotIndex, shot, clips, o
             {shot
               ? `ショットの長さは ${formatDuration(shot.duration)}（素材から ${formatDuration(needed)} 分を使用）です。`
               : null}
-            素材が短い場合はスロー再生またはループで補われます。
+            素材が短い場合はスロー再生で補われます（極端に短い場合はループします）。
           </DialogDescription>
         </DialogHeader>
 
@@ -103,6 +112,11 @@ export function ClipPickerDialog({ open, onOpenChange, shotIndex, shot, clips, o
                         {clip.scene_id ?? clipSourceLabel(clip)} ・ {formatDuration(clip.duration)}
                       </span>
                       {short ? <span className="text-2xs text-warning-foreground">短い素材</span> : null}
+                      {usedByOtherShots.has(clip.id) ? (
+                        <Badge tone="warning" className="max-w-full overflow-hidden">
+                          この動画で使用中
+                        </Badge>
+                      ) : null}
                       {shot?.scene_id && clip.scene_id === shot.scene_id && !current ? (
                         <span className="text-2xs text-subtle-foreground">同じシーン</span>
                       ) : null}

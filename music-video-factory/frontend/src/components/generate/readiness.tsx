@@ -177,10 +177,24 @@ export function computeReadiness(input: ReadinessInput): ReadinessItem[] {
         id: "estimate",
         level: "blocked",
         title: "見積もりが予算上限を超えています",
-        description: "本数・長さ・再利用方針を見直すか、予算上限を引き上げてください。",
+        description:
+          "新規生成の上限・本数・長さを見直すか、予算上限を引き上げてください（上限を下げると、同じ素材を繰り返さないようショットが長めになります）。",
       });
     } else if (input.estimate) {
       items.push({ id: "estimate", level: "ok", title: "見積もりは予算内です" });
+    }
+    // Not blocking: the planner fits shots to the clips first; what is left is a last resort (§6.4).
+    const repeats = input.estimate?.repeat_shots;
+    if (!input.estimateStale && !input.estimateError && input.estimate && typeof repeats === "number" && repeats > 0) {
+      items.push({
+        id: "repeats",
+        level: "warning",
+        title: `動画内で同じ素材が ${formatCount(repeats)} ショット再登場します`,
+        description:
+          input.estimate.provider === "library"
+            ? "素材を追加でアップロードすると解消します。"
+            : "新規生成の上限を上げるか、動画を短くすると解消します。",
+      });
     }
   }
   return items;

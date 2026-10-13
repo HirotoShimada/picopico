@@ -137,8 +137,16 @@ def check_plan(
         assert abs(math.fsum(durations) - duration) < 1e-6, "shots sum exactly to the duration"
         assert sum(round(d * 1000) for d in durations) == round(duration * 1000)
         assert video["start"] >= 0 and video["start"] + duration <= song + 1e-6
-        if duration >= 2 * MIN_SHOT_SEC or duration > MAX_SHOT_SEC:
-            assert all(MIN_SHOT_SEC - 1e-9 <= d <= MAX_SHOT_SEC + 1e-9 for d in durations), durations
+        # A video fitted to a small pool has fewer, longer shots (≤ MAX_FIT_SHOT_SEC) than its beat cuts.
+        fit = video.get("fit") or {}
+        upper = variation.MAX_FIT_SHOT_SEC if fit.get("fitted") else MAX_SHOT_SEC
+        assert fit["shots"] == len(durations) and fit["beat_shots"] >= len(durations)
+        if fit.get("fitted"):
+            assert not library and len(durations) < fit["beat_shots"]
+        else:
+            assert fit["beat_shots"] == len(durations)
+        if duration >= 2 * MIN_SHOT_SEC or duration > upper:
+            assert all(MIN_SHOT_SEC - 1e-9 <= d <= upper + 1e-9 for d in durations), durations
         else:
             assert durations == [duration]
         t = video["start"]
@@ -176,6 +184,44 @@ def check_plan(
         pool = len(specs) if not library else len({c["id"] for c in existing if c["source"] == "upload"})
         if pool > 1:
             assert all(a != b for a, b in itertools.pairwise(refs)), "same clip twice in a row"
+        assert fit["min_speed"] == min(s["speed"] for s in video["shots"])
+        assert fit["max_shot_sec"] == max(durations)
+        if library:
+            # Uploads repeat only when a source window overlaps an earlier one of the same clip.
+            windows: dict[str, list[tuple[float, float]]] = {}
+            overlapping = 0
+            for shot in video["shots"]:
+                a, b = shot["src_in"], shot["src_in"] + shot["duration"] * shot["speed"]
+                earlier = windows.setdefault(_ref(shot), [])
+                gap = variation.REPEAT_GAP_SEC
+                overlapping += any(a < y + gap and x - gap < b for x, y in earlier)
+                earlier.append((a, b))
+            assert fit["repeat_shots"] == fit["overlap_repeat_shots"] == overlapping
+        else:
+            repeats = len(refs) - len(set(refs))
+            assert fit["repeat_shots"] == repeats, (refs, fit)
+            assert 0 <= fit["overlap_repeat_shots"] <= repeats
+            scene_refs: dict[str, set[str]] = {}
+            scene_repeats = 0  # another clip of a storyboard scene already shown in the video
+            for shot in video["shots"]:
+                if shot["scene_id"]:
+                    earlier_refs = scene_refs.setdefault(shot["scene_id"], set())
+                    scene_repeats += bool(earlier_refs) and _ref(shot) not in earlier_refs
+                    earlier_refs.add(_ref(shot))
+            assert fit["scene_repeat_shots"] == scene_repeats
+            lengths = {
+                key: existing_by_id[s["existing_clip_id"]]["duration"] if s["existing_clip_id"] else s["duration"]
+                for key, s in specs.items()
+            }
+            # The pool covers the video when its longest clips can play its longest shots at 0.6x.
+            clip_lengths = sorted(lengths.values(), reverse=True)
+            shot_lengths = sorted(durations, reverse=True)
+            covered = all(c >= 0.6 * s for c, s in zip(clip_lengths, shot_lengths, strict=False))
+            if len(durations) <= len(specs) and covered:
+                assert repeats == 0, ("the pool covers every shot: no clip may come back", refs, durations)
+            if fit.get("fitted") and repeats == 0 and min(lengths[r] for r in refs) >= 4.0:
+                speeds = [s["speed"] for s in video["shots"]]
+                assert all(v >= variation.FIT_MIN_SPEED - 1e-9 for v in speeds), speeds
 
     if not library:
         assert set(used) == set(specs), "every planned clip is used (no paid clip is wasted)"
@@ -205,6 +251,16 @@ def check_plan(
         assert stats["new_clips"] == sum(1 for s in specs.values() if s["existing_clip_id"] is None)
     assert 0 < stats["variety_score"] <= 1
     assert (stats["variety_warning"] is not None) == (stats["variety_score"] < 0.35)
+    fits = [v["fit"] for v in result["videos"]]
+    assert stats["shots_per_video"] == [f["shots"] for f in fits]
+    assert stats["beat_shots_per_video"] == [f["beat_shots"] for f in fits]
+    assert stats["fitted_videos"] == sum(f["fitted"] for f in fits)
+    for key in ("repeat_shots", "overlap_repeat_shots", "scene_repeat_shots"):
+        assert stats[key] == sum(f[key] for f in fits), key
+    assert stats["videos_with_repeats"] == sum(f["repeat_shots"] > 0 for f in fits)
+    assert (stats["repeat_warning"] is not None) == (stats["repeat_shots"] > 0)
+    assert stats["min_speed"] == min(s["speed"] for v in result["videos"] for s in v["shots"])
+    assert stats["max_shot_sec"] == max(s["duration"] for v in result["videos"] for s in v["shots"])
 
     if conf["count"] >= 2:
         full = [json.dumps(v["shots"], sort_keys=True) for v in result["videos"]]
@@ -251,8 +307,12 @@ def test_invariants_over_random_settings(case: int) -> None:
     )  # fmt: skip
     check_plan(result, analysis=analysis, conf=conf, clip_duration=clip_duration, existing=existing)
     if provider != "library":
-        target = pool_target_size(conf["reuse"], result["stats"]["shots_total"],
-                                  max(result["stats"]["shots_per_video"]), len(board["scenes"]))  # fmt: skip
+        # The pool is sized from the beat (pre-fit) cuts plus the floor that lets a video be fitted.
+        beat = result["stats"]["beat_shots_per_video"]
+        dur_ms = min(round(conf["duration_sec"] * 1000), math.floor(song * 1000 + 1e-6))
+        target = pool_target_size(conf["reuse"], sum(beat), max(beat), len(board["scenes"]),
+                                  variation.fit_clip_floor(dur_ms, clip_duration))  # fmt: skip
+        assert result["stats"]["pool_target"] == target
         expected = target if conf["max_new_clips"] is None else min(target, conf["max_new_clips"])
         assert result["stats"]["new_clips"] == expected
 
@@ -420,7 +480,7 @@ def test_variety_warning_names_the_actual_cause() -> None:
     assert "再利用設定" not in capped and "アップロード" not in capped
 
     economy = _advice(settings=settings(count=30, reuse="economy"), provider_clip_duration=2.0)
-    assert economy == "再利用設定が「節約」です。「バランス」か「バリエーション重視」にすると改善します。"
+    assert economy == "再利用設定が「節約」です。「バランス」か「バリエーション最大」にすると改善します。"
 
     crowded = _advice(
         settings=settings(count=50, reuse="max_variety", duration_sec=90), analysis=make_analysis(duration=180),

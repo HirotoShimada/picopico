@@ -15,7 +15,10 @@ storyboard LLM call; the minimum is OpenRouter's ``minimum_cents_per_generation`
 charges (image-to-video) are not part of these estimates.
 ``naive_total_usd`` prices the same batch with one freshly generated clip per
 shot (no reuse inside the batch, no cache), so ``savings_usd`` is what reuse
-and the clip cache save. Both totals include ``llm_usd``.
+and the clip cache save. Both totals include ``llm_usd``. Shots are counted
+after the planner fitted videos to their clip pool (fewer, longer shots), so a
+fitted single video saves nothing. The plan's shots per video, slowest speed
+and in-video repeats are copied into the estimate.
 """
 
 from __future__ import annotations
@@ -205,6 +208,8 @@ def estimate(
     within_budget = limit is None or total_usd <= limit + 1e-9
     variety_score = _float(plan_stats.get("variety_score"))
     variety_warning = plan_stats.get("variety_warning") or None
+    fit = _fit_fields(plan_stats)
+    repeat_warning = fit.get("repeat_warning")
 
     comparison = _comparison(
         selected=pricing, selected_generation_usd=generation_usd, clip_duration=clip_duration,
@@ -229,18 +234,23 @@ def estimate(
             notes.append(f"生成済みの素材 {cached} 本を再利用するため、その分の費用はかかりません")
         if savings_usd >= 0.005:
             percent = round(savings_usd / naive_total_usd * 100) if naive_total_usd > 0 else 0
+            # "Between videos" only when that is all the reuse is (no clip comes back inside a video).
+            across = videos >= 2 and not fit.get("repeat_shots")
             notes.append(
-                f"素材を動画間で使い回すため、全 {shots_total} ショットを新規生成する場合（{_money(naive_total_usd)}）"
-                f"より {_money(savings_usd)}（{percent}%）安くなります"
+                f"素材を{'動画間で' if across else ''}使い回すため、全 {shots_total} ショットを新規生成する場合"
+                f"（{_money(naive_total_usd)}）より {_money(savings_usd)}（{percent}%）安くなります"
             )
     if llm_usd > 0:
         notes.append(f"絵コンテ生成（Claude）の概算 {_money(llm_usd)} を含みます")
     if variety_warning:
         notes.append(str(variety_warning))
+    if repeat_warning:
+        notes.append(str(repeat_warning))
     if not within_budget and limit is not None:
         notes.append(
             f"予算上限 {_money(limit)} を {_money(total_usd - limit)} 超えています。"
-            "再利用設定を「節約」にする、本数や新規生成数の上限を減らす、または安いモデルを選んでください"
+            "新規生成数の上限を下げる（素材が少ない分はショットを長めにまとめます）、本数や動画の長さを減らす、"
+            "または安いモデルを選んでください"
         )
     if not usable:
         notes.append(f"{source.name} はこのままでは生成を開始できません: {unusable_reason}")
@@ -282,7 +292,38 @@ def estimate(
         "as_of": pricing.as_of,
         "pricing_verified": pricing.verified,
         "pricing_source_url": pricing.source_url,
+        **fit,
     }
+
+
+_FIT_COUNTS = ("fitted_videos", "repeat_shots", "overlap_repeat_shots", "scene_repeat_shots", "videos_with_repeats")
+
+
+def _fit_fields(plan_stats: Mapping[str, Any]) -> dict[str, Any]:
+    """Shots per video, fitting and in-video repeats from the plan stats (§6.4), for the estimate.
+
+    Each field is written only when the stats have it, so estimates of older plans keep their shape.
+    """
+
+    def counts(key: str) -> list[int]:
+        values = plan_stats.get(key)
+        return [_int(v) for v in values] if isinstance(values, Sequence) and not isinstance(values, str) else []
+
+    fields: dict[str, Any] = {}
+    if shots := counts("shots_per_video"):
+        fields["shots_per_video_min"], fields["shots_per_video_max"] = min(shots), max(shots)
+    if beat_shots := counts("beat_shots_per_video"):
+        fields["beat_shots_per_video_max"] = max(beat_shots)
+    for key in _FIT_COUNTS:
+        if key in plan_stats:
+            fields[key] = _int(plan_stats.get(key))
+    for key in ("max_shot_sec", "min_speed"):
+        value = _float(plan_stats.get(key))
+        if value is not None:
+            fields[key] = value
+    if "repeat_warning" in plan_stats:
+        fields["repeat_warning"] = plan_stats.get("repeat_warning") or None
+    return fields
 
 
 def _comparison(

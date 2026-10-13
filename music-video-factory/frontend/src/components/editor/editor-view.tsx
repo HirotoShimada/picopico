@@ -395,6 +395,7 @@ function VideoEditor({ video }: { video: VideoDetailOut }) {
         onOpenChange={(open) => !open && setPickerShot(null)}
         shotIndex={pickerShot}
         shot={pickerShot !== null ? (effective.shots[pickerShot] ?? null) : null}
+        shots={effective.shots}
         clips={video.available_clips}
         onPick={(clipId) => pickerShot !== null && setShotClip(pickerShot, clipId)}
       />

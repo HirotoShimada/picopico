@@ -27,6 +27,7 @@ import { DEFAULT_COUNTS, DEFAULT_DURATIONS, providerLabel } from "@/lib/constant
 import { formatCount, formatDuration, formatUsd } from "@/lib/format";
 import { claudeLabel, isOpenRouter, resolveLlm } from "@/lib/llm";
 import type {
+  Estimate,
   EstimateComparison,
   GenerationSettings,
   PresetId,
@@ -39,7 +40,7 @@ import { emotionLabel } from "@/components/audio/world-estimate-card";
 import { rightsResetName, useRightsResets } from "@/components/rights/rights-reset";
 
 import { ColorGradeSelect, useColorGrades } from "./color-grade-select";
-import { EstimatePanel, ProviderComparison } from "./estimate-panel";
+import { EstimatePanel, isNaturalSpeed, ProviderComparison, repeatShots, shotsPerVideoRange } from "./estimate-panel";
 import { FormSection } from "./form-section";
 import {
   CUSTOM,
@@ -71,12 +72,12 @@ const REUSE_OPTIONS: { value: ReuseMode; title: string; description: string }[] 
   {
     value: "balanced",
     title: "バランス",
-    description: "ショット数の約 1/3 の素材を生成し、動画間で使い回します。",
+    description: "ショット数の約 1/3 の素材を生成し、動画間で使い回します。1本の動画の中では同じ素材を繰り返さないよう構成します。",
   },
   {
     value: "economy",
     title: "節約",
-    description: "素材を積極的に使い回して費用を抑えます。動画間で同じ映像が増えます。",
+    description: "素材を積極的に使い回して費用を抑えます。動画間で同じ映像が増えますが、1本の動画の中では同じ素材を繰り返さないよう構成します。",
   },
 ];
 
@@ -92,6 +93,33 @@ function SummaryRow({ label, value }: { label: string; value: React.ReactNode })
       <dt className="shrink-0 text-xs text-muted-foreground">{label}</dt>
       <dd className="min-w-0 truncate text-right text-xs text-foreground">{value}</dd>
     </div>
+  );
+}
+
+/**
+ * First lines of the 生成開始 confirmation: shots per video, the longest / slowest shot, and whether a clip
+ * repeats inside a video (§6.4). Nothing for an estimate without these fields.
+ */
+function PlanShotsNote({ estimate }: { estimate: Estimate }) {
+  const range = shotsPerVideoRange(estimate);
+  const repeats = repeatShots(estimate);
+  const longest = estimate.max_shot_sec;
+  const slowest = estimate.min_speed;
+  const pace =
+    typeof longest === "number" && typeof slowest === "number"
+      ? `（最長${longest.toFixed(1)}秒・${isNaturalSpeed(slowest) ? "等速" : `最も遅いショット${slowest.toFixed(2)}倍速`}）`
+      : "";
+  return (
+    <>
+      {range !== null ? (
+        <p className="text-sm leading-6 text-muted-foreground">
+          1本あたり{range}ショット{pace}。{repeats === 0 ? "動画内で同じ素材は繰り返しません。" : null}
+        </p>
+      ) : null}
+      {repeats !== null && repeats > 0 ? (
+        <Alert tone="warning">素材が足りないため、動画内で同じ素材が{formatCount(repeats)}ショット再登場します。</Alert>
+      ) : null}
+    </>
   );
 }
 
@@ -506,7 +534,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
             <Field
               label="新規生成する素材の上限"
               error={errors.maxNewClips}
-              description="上限を超える分は生成済み素材の使い回しで補います。"
+              description="素材が1本の動画のショット数より少ないときは、同じ映像を繰り返さないようショットを少なく・長めにまとめます（最長8秒・0.75倍速まで）。それでも足りない場合だけ、同じ素材が別の区間・別の構図で再登場します。"
             >
               <div className="flex items-center gap-3">
                 <Switch
@@ -636,7 +664,13 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
           </CardContent>
         </Card>
 
-        <EstimatePanel state={estimate} unavailableReason={estimateReason} budgetSource={budgetSource} />
+        {/* budget_fit: the same seed, so the re-estimate with this cap is exactly the plan it priced. */}
+        <EstimatePanel
+          state={estimate}
+          unavailableReason={estimateReason}
+          budgetSource={budgetSource}
+          onApplyMaxNewClips={(maxNewClips) => update({ limitNewClips: true, maxNewClips })}
+        />
         <ProviderComparison estimate={estimate.data} stale={estimate.stale} onSelect={selectComparison} />
       </aside>
 
@@ -652,6 +686,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
             : undefined
         }
       >
+        {estimate.data ? <PlanShotsNote estimate={estimate.data} /> : null}
         {estimate.data?.pricing_verified === false && isOpenRouter(estimate.data.provider) ? (
           <Alert tone="warning">
             この価格は {estimate.data.as_of ? `${estimate.data.as_of} 時点の ` : ""}OpenRouter のモデル一覧（最新の一覧を取得できないときは組み込みの写し）の料金に基づく概算で、実際の API キーでは未検証です。実際の請求額は生成の完了時に

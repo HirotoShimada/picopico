@@ -535,6 +535,21 @@ class EstimateComparison(LooseModel):
     configured: bool
 
 
+class EstimateBudgetFit(LooseModel):
+    """Extension: the ``max_new_clips`` cap that brings an over-budget batch within the budget,
+    priced from a real re-plan with the same seed (applying it reproduces this estimate)."""
+
+    max_new_clips: int
+    new_clips: int
+    total_usd: float
+    shots_per_video: int
+    beat_shots_per_video: int | None = None
+    max_shot_sec: float | None = None
+    min_speed: float | None = None
+    repeat_shots: int = 0
+    note: str
+
+
 class Estimate(LooseModel):
     """§6.5 Estimate document."""
 
@@ -558,6 +573,19 @@ class Estimate(LooseModel):
     variety_warning: str | None = None
     comparison: list[EstimateComparison] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    # Extension (§6.4 plan stats): shots per video after fitting cuts to the clip pool, and in-video repeats.
+    shots_per_video_min: int | None = None
+    shots_per_video_max: int | None = None
+    beat_shots_per_video_max: int | None = None
+    fitted_videos: int | None = None
+    max_shot_sec: float | None = None
+    min_speed: float | None = None
+    repeat_shots: int | None = None
+    overlap_repeat_shots: int | None = None
+    scene_repeat_shots: int | None = None
+    videos_with_repeats: int | None = None
+    repeat_warning: str | None = None
+    budget_fit: EstimateBudgetFit | None = None
 
 
 # --- batches & videos ------------------------------------------------------------------------------------

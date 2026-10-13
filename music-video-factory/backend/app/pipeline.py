@@ -560,17 +560,24 @@ def _plan(
     provider: VideoProvider,
     existing: Sequence[Mapping[str, Any]],
     seed: int,
+    *,
+    clip_duration: float | None = None,
 ) -> dict[str, Any]:
+    """``plan_batch`` for a project. ``clip_duration`` pins the clip length (a re-plan of an
+    existing batch keeps its recorded length, so its ready clips stay cache hits); else the
+    model's length for TARGET_CLIP_SEC."""
     segment = None
     if project.segment_start is not None and project.segment_end is not None:
         segment = (float(project.segment_start), float(project.segment_end))
+    if clip_duration is None:
+        clip_duration = provider.clip_duration_for(str(settings["model"]), cost_service.TARGET_CLIP_SEC)
     return plan_batch(
         analysis=project.analysis or {},
         lyric_lines=list(project.lyric_lines or []),
         settings=settings,
         storyboard=storyboard or {"scenes": []},
         segment=segment,
-        provider_clip_duration=provider.clip_duration_for(str(settings["model"]), cost_service.TARGET_CLIP_SEC),
+        provider_clip_duration=clip_duration,
         existing_clips=existing,
         seed=seed,
     )
@@ -626,29 +633,98 @@ def preview_batch(db: Session, project: Project, settings: GenerationSettings | 
     when one exists (the batch will reuse it), else the deterministic template
     (no paid Claude call); the expected Claude cost is then added as
     ``llm_usd`` when a key is set. Clips other batches are still generating
-    count as cached (the batch will reuse them).
+    count as cached (the batch will reuse them). An over-budget generated batch
+    gets ``estimate.budget_fit``: the ``max_new_clips`` cap that fits, from a
+    real re-plan (see :func:`_budget_fit`).
     """
     _require_analysis(project)
     data, provider = resolve_generation_settings(project, settings)
     stored = stored_storyboard(db, project, data)
     storyboard = stored or build_storyboard(project, data, use_claude=False)
     seed = int(data["seed"]) if data.get("seed") is not None else 0
-    plan = _plan(project, data, storyboard, provider, existing_clip_refs(db, project.id, include_in_flight=True), seed)
+    existing = existing_clip_refs(db, project.id, include_in_flight=True)
+    plan = _plan(project, data, storyboard, provider, existing, seed)
     stats = plan["stats"]
     n_scenes = len((storyboard or {}).get("scenes") or []) or DEFAULT_SCENES
     limit = resolve_budget_limit(data, project)
-    estimate = cost_service.estimate(
-        data,
-        stats,
-        provider.id,
-        str(data["model"]),
-        cached_clips=0 if provider.kind == "library" else int(stats.get("reused_clips") or 0),
-        llm_estimate_usd=0.0 if stored is not None else llm_estimate_usd(data, n_scenes),
-        budget_limit_usd=limit,
-    )
+    llm_usd = 0.0 if stored is not None else llm_estimate_usd(data, n_scenes)
+
+    def price(settings_: Mapping[str, Any], stats_: Mapping[str, Any]) -> dict[str, Any]:
+        return cost_service.estimate(
+            settings_,
+            stats_,
+            provider.id,
+            str(data["model"]),
+            cached_clips=0 if provider.kind == "library" else int(stats_.get("reused_clips") or 0),
+            llm_estimate_usd=llm_usd,
+            budget_limit_usd=limit,
+        )
+
+    estimate = price(data, stats)
     reuse_note = ["前回 Claude で作成した絵コンテを再利用します（同じ世界観・新たな LLM 費用なし）。"] if stored else []
     estimate["notes"] = list(dict.fromkeys([*plan.get("warnings", []), *reuse_note, *estimate.get("notes", [])]))
+    if provider.kind != "library" and limit is not None and not estimate.get("within_budget", True):
+
+        def replan(cap: int) -> dict[str, Any]:
+            capped = {**data, "max_new_clips": cap}
+            return price(capped, _plan(project, capped, storyboard, provider, existing, seed)["stats"])
+
+        budget_fit = _budget_fit(estimate, stats, limit=limit, replan=replan)
+        if budget_fit is not None:
+            estimate["budget_fit"] = budget_fit
+            estimate["notes"].append(budget_fit["note"])
     return BatchPreview(settings=data, storyboard=storyboard, plan=plan, estimate=estimate, budget_limit_usd=limit)
+
+
+def _budget_fit(
+    estimate: Mapping[str, Any],
+    stats: Mapping[str, Any],
+    *,
+    limit: float,
+    replan: Callable[[int], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The ``max_new_clips`` cap that brings an over-budget estimate within ``limit`` (§6.5).
+
+    ``k`` = the new clips the budget pays for after the LLM call. ``replan(k)`` plans
+    the batch with that cap (same storyboard, clips and seed) and prices it, so
+    applying the cap reproduces exactly that estimate; the planner fits the videos to
+    the smaller pool (fewer, longer shots), and the note says how that looks. None when
+    no cap helps (0 new clips and nothing cached cannot plan; the re-plan still over).
+    """
+    new_clips = int(estimate.get("new_clips") or 0)
+    per_clip = float(estimate.get("video_generation_usd") or 0.0) / new_clips if new_clips > 0 else 0.0
+    if per_clip <= 0:
+        return None
+    cap = math.floor((limit - float(estimate.get("llm_usd") or 0.0) + 1e-9) / per_clip)
+    if not 0 <= cap < new_clips or (cap == 0 and not int(stats.get("reused_clips") or 0)):
+        return None
+    try:
+        capped = replan(cap)
+    except ServiceError:
+        return None
+    if not capped.get("within_budget"):
+        return None
+    shots = int(capped.get("shots_per_video_max") or 0)
+    longest = float(capped.get("max_shot_sec") or 0.0)
+    slowest = float(capped.get("min_speed") or 1.0)
+    repeats = int(capped.get("repeat_shots") or 0)
+    pace = "等速" if slowest >= 0.995 else f"最も遅いショット{slowest:.2f}倍速"
+    reuse = f"動画内で同じ素材が{repeats}ショット再登場" if repeats else "同じ素材の繰り返しなし"
+    total = float(capped.get("total_usd") or 0.0)
+    return {
+        "max_new_clips": cap,
+        "new_clips": int(capped.get("new_clips") or 0),
+        "total_usd": total,
+        "shots_per_video": shots,
+        "beat_shots_per_video": capped.get("beat_shots_per_video_max"),
+        "max_shot_sec": capped.get("max_shot_sec"),
+        "min_speed": capped.get("min_speed"),
+        "repeat_shots": repeats,
+        "note": (
+            f"新規生成の上限を{cap}本にすると {_money(total)} で予算内に収まります"
+            f"（1本あたり{shots}ショット・最長{longest:.1f}秒・{pace}・{reuse}）"
+        ),
+    }
 
 
 def create_batch(db: Session, project: Project, settings: GenerationSettings) -> Batch:
@@ -675,9 +751,14 @@ def create_batch(db: Session, project: Project, settings: GenerationSettings) ->
     if not estimate.get("within_budget", True):
         limit = preview.budget_limit_usd or 0.0
         total = float(estimate.get("total_usd") or 0.0)
+        budget_fit = estimate.get("budget_fit")
+        advice = (
+            f"{budget_fit['note']}。"
+            if isinstance(budget_fit, Mapping) and budget_fit.get("note")
+            else "本数・新規生成数・再利用設定を見直すか、予算上限を引き上げてください。"
+        )
         raise BudgetExceeded(
-            f"見積もり {_money(total)} が予算上限 {_money(limit)} を超えています。"
-            "本数・新規生成数・再利用設定を見直すか、予算上限を引き上げてください。",
+            f"見積もり {_money(total)} が予算上限 {_money(limit)} を超えています。{advice}",
             estimate_usd=total,
             limit_usd=limit,
         )
@@ -1937,7 +2018,8 @@ def resolve_plan_clips(
     ``model``: never mock clips in an API batch, uploads only in a library
     batch, see :func:`_substitute_allowed`). The batch's own pool
     (``preferred``) always wins over other project clips; then avoiding the
-    neighbouring shot's clip, the same storyboard scene, least used.
+    neighbouring shot's clip, a clip already in this video, the same storyboard
+    scene, least used.
     ``src_in`` is clamped into the new clip. Returns ``(ok, substitutions)``;
     ``ok`` is False when a shot cannot be filled at all.
     """
@@ -1974,6 +2056,7 @@ def resolve_plan_clips(
             return (
                 candidate not in own_set,
                 candidate in neighbours and len(candidates) > 1,
+                usage[candidate] > 0,  # already in this video: a repeat
                 clip.scene_id != shot.get("scene_id"),
                 usage[candidate],
                 order.index(candidate),
@@ -2649,7 +2732,9 @@ def regenerate_video_plan(db: Session, video: Video, *, new_clips: bool) -> None
     The video keeps its own start, lyric style, per-line lyric timing and (when
     edited, or fixed by the batch) colour grade and text overrides — only the
     shots change. Without ``new_clips`` only
-    ready (or in-flight) clips are used (no spend). With it, fresh clips are
+    ready (or in-flight) clips are used (no spend), at the batch's recorded clip
+    length; with fewer clips than beat shots the video is re-cut into fewer,
+    longer shots instead of repeating one. With it, fresh clips are
     planned (pending Clip rows, generated by the render task within the batch
     budget); the admission check counts every clip the batch still has to
     generate. The finished render stays the fallback until the new one succeeds.
@@ -2685,7 +2770,21 @@ def regenerate_video_plan(db: Session, video: Video, *, new_clips: bool) -> None
     storyboard = batch.storyboard
     if provider.kind != "library" and not (storyboard or {}).get("scenes"):
         storyboard = build_storyboard(project, data, use_claude=False)
-    plan = _plan(project, data, storyboard, provider, existing_clip_refs(db, project.id, include_in_flight=True), seed)
+    clip_duration = None
+    if not new_clips and provider.kind != "library":
+        # The batch's own clip length: its ready clips stay cache hits even if the model's
+        # length (snapping, the OpenRouter listing) changed since, so the free re-edit works.
+        recorded = _num(((batch.plan or {}).get("stats") or {}).get("clip_duration"))
+        clip_duration = recorded if recorded is not None and recorded > 0 else None
+    plan = _plan(
+        project,
+        data,
+        storyboard,
+        provider,
+        existing_clip_refs(db, project.id, include_in_flight=True),
+        seed,
+        clip_duration=clip_duration,
+    )
     video_plan = plan["videos"][0]
     new_ids = _create_plan_rows(
         db,

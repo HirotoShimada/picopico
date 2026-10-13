@@ -12,6 +12,12 @@
 * **Shots** — cut points land on beats (1–2 bars per shot, clamped to
   1.5–6 s, pattern varies per video and with section energy) and sum exactly
   to the video duration (millisecond grid).
+* **Fit to the pool** — a generated video never shows the same clip twice
+  while the pool can cover its shots: when its beat cuts outnumber the pool,
+  it is re-cut on beats into fewer, longer shots (≤ 8 s, played at ≥ 0.75x,
+  reserving the renderer's crossfade frames). Only when even that cannot
+  fill the video does a clip come back (never adjacent, another source
+  window, a punch-in framing); such repeats are counted and warned about.
 * **Variation** — videos differ by start time, clip order, in-points,
   Ken Burns zoom/pan, speed, colour grade and transition (horizontal flips
   only with ``settings["allow_mirror"]``: mirroring turns any text in the
@@ -26,6 +32,7 @@ Everything is deterministic for a given ``seed``; the budget is not an input
 from __future__ import annotations
 
 import bisect
+import functools
 import hashlib
 import itertools
 import math
@@ -41,11 +48,21 @@ from app.services.prompting import sanitize_prompt
 
 __all__ = [
     "ASPECT_RATIO",
+    "FIT_MIN_SPEED",
+    "FIT_SLOW_WEIGHT",
+    "FRAME_SLACK_SEC",
+    "MAX_FIT_SHOT_SEC",
     "MAX_POOL",
     "MAX_SHOT_SEC",
     "MIN_SHOT_SEC",
+    "NEAR_NATURAL_SPEED",
+    "REPEAT_GAP_SEC",
+    "SCENE_ADJACENT_COST",
+    "SCENE_REPEAT_COST",
     "SRC_IN_BUCKET_SEC",
     "VARIETY_WARNING_THRESHOLD",
+    "XFADE_PAD_SEC",
+    "fit_clip_floor",
     "make_cache_key",
     "plan_batch",
     "pool_target_size",
@@ -63,9 +80,20 @@ FEW_SCENES = 3  # storyboards with at most this many scenes repeat the same scen
 MIN_NATURAL_SPEED = 0.6  # slower than this looks like obvious slow motion
 GENERATED_EDGE_MARGIN = 0.1  # generated clips often have weak first/last frames
 UPLOAD_EDGE_MARGIN = 0.05
+# Fitting a video's cuts to a small pool (fewer, longer shots instead of repeated clips):
+FIT_MIN_SPEED = 0.75  # slowest playback a fitted shot may get
+NEAR_NATURAL_SPEED = 0.9  # pool floor: enough clips to fit a video at about this speed
+MAX_FIT_SHOT_SEC = 8.0  # longest fitted shot (beat shots stay ≤ MAX_SHOT_SEC)
+XFADE_PAD_SEC = 0.3  # must equal render.CROSSFADE_SEC (not imported: the planner does not depend on render)
+FRAME_SLACK_SEC = 0.04  # rounding slack of the renderer's frame grid
+REPEAT_GAP_SEC = 0.5  # source windows of one clip closer than this count as the same footage
+SCENE_REPEAT_COST = 3.0  # per earlier shot of the same storyboard scene in the video
+SCENE_ADJACENT_COST = 3.0  # the previous shot shows the same scene
+FIT_SLOW_WEIGHT = 10.0  # fit DP: weight of slow motion against uneven shot lengths
 
 _MIN_MS = int(MIN_SHOT_SEC * 1000)
 _MAX_MS = int(MAX_SHOT_SEC * 1000)
+_MAX_FIT_MS = int(MAX_FIT_SHOT_SEC * 1000)
 _BAR_PATTERNS: tuple[tuple[int, ...], ...] = ((1,), (2,), (1, 2), (2, 1), (1, 1, 2), (2, 1, 1), (2, 2, 1), (1, 2, 2))
 _VARIANT_HINTS: tuple[str, ...] = (
     "Alternate take with tighter framing.",
@@ -122,12 +150,38 @@ def make_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def pool_target_size(reuse: str, shots_total: int, shots_per_video: int, n_scenes: int) -> int:
-    """Clip pool size K for a reuse policy (before ``max_new_clips`` and cache reuse)."""
+def pool_target_size(reuse: str, shots_total: int, shots_per_video: int, n_scenes: int, fit_clips: int = 0) -> int:
+    """Clip pool size K for a reuse policy (before ``max_new_clips`` and cache reuse).
+
+    At least one clip per scene (or ``fit_clips``, see :func:`fit_clip_floor`) up to the
+    shots of one video, so an uncapped video never has to repeat a clip.
+    """
     divisor = _REUSE_DIVISOR.get(reuse, _REUSE_DIVISOR["balanced"])
     target = math.ceil(shots_total / divisor)
-    target = max(target, min(shots_per_video, max(1, n_scenes)))
+    target = max(target, min(shots_per_video, max(1, n_scenes, fit_clips)))
     return max(1, min(target, MAX_POOL, shots_total))
+
+
+def _shot_pads(n: int, crossfade: bool) -> list[float]:
+    """Extra footage (s) each of ``n`` shots needs for the renderer's crossfades (0 for cuts).
+
+    The renderer plays a shot half a fade longer at each side that blends into a neighbour:
+    an inner shot a whole fade, the first and last shot half of one; plus frame-rounding slack.
+    """
+    if not crossfade or n <= 1:
+        return [0.0] * n
+    inner = XFADE_PAD_SEC + FRAME_SLACK_SEC
+    edge = XFADE_PAD_SEC / 2 + 2 * FRAME_SLACK_SEC
+    return [edge] + [inner] * (n - 2) + [edge]
+
+
+def fit_clip_floor(duration_ms: int, clip_duration: float) -> int:
+    """Clips a generated video of ``duration_ms`` needs to be fitted at about NEAR_NATURAL_SPEED
+    without repeats: ``ceil(D / L)`` with ``L`` the longest padded shot one clip covers."""
+    usable = clip_duration - 2 * GENERATED_EDGE_MARGIN
+    shot_ms = int((usable / NEAR_NATURAL_SPEED - (XFADE_PAD_SEC + FRAME_SLACK_SEC)) * 1000)
+    shot_ms = max(_MIN_MS, min(_MAX_FIT_MS, shot_ms))
+    return math.ceil(duration_ms / shot_ms)
 
 
 def _default_model(provider: str) -> str:
@@ -475,6 +529,141 @@ def _cut_points(song: _Song, start: float, duration_ms: int, rng: random.Random)
     return [b - a for a, b in itertools.pairwise(bounds)]
 
 
+def _fit_cuts(
+    song: _Song,
+    start: float,
+    duration_ms: int,
+    n: int,
+    usable_sec: float,
+    pads: Sequence[float],
+    weights: Sequence[float],
+) -> list[int] | None:
+    """``n`` shot durations (ms) on beats that clips with ``usable_sec`` of footage can play at
+    ≥ FIT_MIN_SPEED (each shot plus its crossfade pad), or None when the beat grid allows none.
+
+    As even as the grid allows: first the smallest "slowest shot" that is feasible (minimax),
+    then the cheapest split under that limit — close to the per-shot ideal (``weights``),
+    little slow motion, and boundaries on section/lyric-line starts or downbeats.
+    """
+    caps = [min(_MAX_FIT_MS, int((usable_sec / FIT_MIN_SPEED - pads[j]) * 1000)) for j in range(n)]
+    if n == 1:
+        return [duration_ms] if duration_ms <= caps[0] else None
+    if sum(caps) < duration_ms:
+        return None
+    # The same rounding as _cut_points, so fitted cuts are on beats exactly like natural ones.
+    beats = sorted({round((b - start) * 1000) for b in song.beats if 0 < (b - start) * 1000 < duration_ms})
+    points = [0, *beats, duration_ms]
+
+    def window(b: int, cap: int) -> list[int]:
+        """Boundaries ``a`` a shot ending at ``b`` may start from (1.5 s ≤ b - a ≤ cap)."""
+        return points[bisect.bisect_left(points, b - cap) : bisect.bisect_right(points, b - _MIN_MS)]
+
+    def feasible(limits: Sequence[int]) -> bool:
+        reach = {0}
+        for j in range(n):
+            ends = [duration_ms] if j == n - 1 else beats
+            reach = {b for b in ends if any(a in reach for a in window(b, limits[j]))}
+            if not reach:
+                return False
+        return True
+
+    if not feasible(caps):
+        return None
+    # Minimax: the smallest footage need S (= 1 / slowest speed) for which a split exists.
+    low, high = 0.0, 1.0 / FIT_MIN_SPEED
+    for _ in range(20):
+        mid = (low + high) / 2
+        limits = [min(c, int((mid * usable_sec - pads[j]) * 1000)) for j, c in enumerate(caps)]
+        if min(limits) >= _MIN_MS and feasible(limits):
+            high = mid
+        else:
+            low = mid
+    caps = [min(c, int((high * 1.01 * usable_sec - pads[j]) * 1000)) for j, c in enumerate(caps)]
+
+    downbeats = {round((d - start) * 1000) for d in song.downbeats}
+    half_beat = song.beat * 500
+    anchors = sorted(
+        [(sec.start - start) * 1000 for sec in song.sections] + [(t - start) * 1000 for t, _, _ in song.lyrics]
+    )
+
+    def boundary_cost(b: int) -> float:
+        if b == duration_ms:
+            return 0.0
+        i = bisect.bisect_left(anchors, b - half_beat)
+        if i < len(anchors) and anchors[i] <= b + half_beat:
+            return 0.0  # a section or lyric-line start
+        return 0.02 if b in downbeats else 0.08
+
+    total_weight = sum(weights)
+    ideals = [duration_ms * w / total_weight for w in weights]
+    best: list[dict[int, tuple[float, int]]] = [{0: (0.0, -1)}]
+    for j in range(n):
+        layer: dict[int, tuple[float, int]] = {}
+        ideal, pad = ideals[j], pads[j]
+        for b in [duration_ms] if j == n - 1 else beats:
+            extra = boundary_cost(b)
+            choice: tuple[float, int] | None = None
+            for a in window(b, caps[j]):  # ascending: ties go to the earliest start
+                previous = best[j].get(a)
+                if previous is None:
+                    continue
+                length = b - a
+                need = (length / 1000 + pad) / usable_sec
+                cost = previous[0] + ((length - ideal) / ideal) ** 2 + FIT_SLOW_WEIGHT * max(0.0, need - 1.0) ** 2
+                if choice is None or cost + extra < choice[0]:
+                    choice = (cost + extra, a)
+            if choice is not None:
+                layer[b] = choice
+        best.append(layer)
+    if duration_ms not in best[n]:
+        return None
+    bounds = [duration_ms]
+    for j in range(n, 0, -1):
+        bounds.append(best[j][bounds[-1]][1])
+    bounds.reverse()
+    return [b - a for a, b in itertools.pairwise(bounds)]
+
+
+def _fit_to_pool(
+    song: _Song,
+    start: float,
+    duration_ms: int,
+    cuts: list[int],
+    pool: Sequence[_PoolClip],
+    crossfade: bool,
+    seed: int,
+    video: int,
+    count: int,
+) -> tuple[list[int], bool, bool]:
+    """(cuts, fitted, crossfade kept): a video with more beat cuts than distinct pool clips is
+    re-cut into the fewest beat shots that need no repeat (generated mode only).
+
+    A crossfade video is fitted with the fade padding first, else without it (its transition
+    then becomes a cut: better than a repeat). When even ``len(pool)`` shots cannot fill the
+    video, more shots are tried — each one beyond the pool is a repeat (last resort). No
+    draw from the video's RNG; for count > 1 per-shot weights give videos that share a start
+    different cuts.
+    """
+    distinct = len(pool)
+    if len(cuts) <= distinct:
+        return cuts, False, crossfade
+    usable = sorted((c.duration - 2 * c.margin for c in pool), reverse=True)
+    for k in range(distinct, len(cuts)):
+        u = usable[min(k, distinct) - 1]
+        if u <= 0:
+            continue
+        if count > 1:
+            weight_rng = random.Random(_stable_int("fit", seed, video, k))
+            weights = [weight_rng.uniform(0.9, 1.1) for _ in range(k)]
+        else:
+            weights = [1.0] * k
+        for padded in (True, False) if crossfade else (False,):
+            fitted = _fit_cuts(song, start, duration_ms, k, u, _shot_pads(k, padded), weights)
+            if fitted is not None:
+                return fitted, True, padded
+    return cuts, False, crossfade
+
+
 # --- clip pool ---------------------------------------------------------------------------------------
 
 
@@ -490,6 +679,7 @@ class _PoolClip:
     spec: dict[str, Any] | None = None
 
 
+@functools.lru_cache(maxsize=4096)
 def _variant_prompt(prompt: str, variant: int) -> str:
     if variant <= 0:
         return prompt
@@ -558,6 +748,19 @@ def _generated_pool(
     extras: list[_PoolClip] = []
     new_count = 0
     wanted = _allocation_order(weights, MAX_POOL)
+    paid_slots = target if max_new is None else min(target, max_new)
+    if paid_slots <= len(scenes):
+        # A small pool shows distinct scenes: an uncached alternate take goes behind every first
+        # take (stable sort); cached takes keep their place, so new clips never go up.
+        def is_cached(entry: tuple[int, int]) -> bool:
+            scene, variant = scenes[entry[0]], entry[1]
+            prompt = _variant_prompt(str(scene.get("prompt_en") or ""), variant)
+            negative = str(scene.get("negative_prompt_en") or "")
+            clip_seed = _stable_int("clip", prompt, negative, variant, batch_seed if fresh else "")
+            key = make_cache_key(provider, model, prompt, negative, clip_duration, ASPECT_RATIO, clip_seed)
+            return key in existing_by_key
+
+        wanted = sorted(wanted, key=lambda entry: entry[1] > 0 and not is_cached(entry))
     # Every other take (round-robin) is still considered for free cache hits.
     round_robin = [(i % len(scenes), i // len(scenes)) for i in range(MAX_POOL)]
     for scene_index, variant in dict.fromkeys([*wanted, *round_robin]):
@@ -636,39 +839,65 @@ class _Usage:
 
 
 def _speed_and_in(
-    clip: _PoolClip, shot_sec: float, energy: str, rng: random.Random, usage: _Usage
+    clip: _PoolClip,
+    shot_sec: float,
+    energy: str,
+    rng: random.Random,
+    usage: _Usage,
+    *,
+    pad: float = 0.0,
+    fitted: bool = False,
+    taken: Sequence[tuple[float, float]] = (),
 ) -> tuple[float, float, int]:
-    """(speed, src_in, position index) with ``src_in + shot_sec * speed <= clip.duration``."""
-    desired = {"high": (1.0,), "mid": (1.0, 1.0, 0.9), "low": (1.0, 0.9, 0.85, 0.8)}[energy]
+    """(speed, src_in, position index) with ``src_in + (shot_sec + pad) * speed <= clip.duration``.
+
+    ``pad`` is the crossfade footage a fitted shot reserves; a fitted shot gets no stylistic
+    slow-down. ``taken`` are the source windows this clip already showed in the video: the
+    in-point that overlaps them least (with REPEAT_GAP_SEC) wins, then the least used one.
+    """
+    # Fitted shots are already as slow as the footage requires: no energy slow-down on top.
+    desired = (1.0,) if fitted else {"high": (1.0,), "mid": (1.0, 1.0, 0.9), "low": (1.0, 0.9, 0.85, 0.8)}[energy]
     speed = rng.choice(desired)
     margin = clip.margin
-    if (clip.duration - 2 * margin) / shot_sec < speed:
-        speed = (clip.duration - 2 * margin) / shot_sec
+    footage = shot_sec + pad
+    if (clip.duration - 2 * margin) / footage < speed:
+        speed = (clip.duration - 2 * margin) / footage
         if speed < MIN_NATURAL_SPEED:
             margin = 0.0
-            speed = min(rng.choice(desired), clip.duration / shot_sec)
+            speed = min(rng.choice(desired), clip.duration / footage)
     speed = max(0.01, _floor3(speed))
-    slack = max(0.0, clip.duration - shot_sec * speed)
+    span = footage * speed
+    slack = max(0.0, clip.duration - span)
     low = min(margin, slack / 2)
     high = max(low, slack - low)
     n_positions = max(1, int((high - low) // 0.5) + 1)
     positions = [low + (high - low) * k / max(1, n_positions - 1) for k in range(n_positions)]
-    best = min(range(n_positions), key=lambda k: (usage.positions.get((clip.ref, k), 0), rng.random()))
-    src_in = _floor3(min(positions[best], max(0.0, clip.duration - shot_sec * speed)))
-    while src_in > 0 and src_in + shot_sec * speed > clip.duration + 1e-9:
+
+    def overlap(k: int) -> float:
+        p = positions[k]
+        return sum(max(0.0, min(b + REPEAT_GAP_SEC, p + span) - max(a - REPEAT_GAP_SEC, p)) for a, b in taken)
+
+    best = min(
+        range(n_positions), key=lambda k: (round(overlap(k), 3), usage.positions.get((clip.ref, k), 0), rng.random())
+    )
+    src_in = _floor3(min(positions[best], max(0.0, clip.duration - span)))
+    while src_in > 0 and src_in + span > clip.duration + 1e-9:
         src_in = max(0.0, round(src_in - 0.001, 3))
     return speed, src_in, best
 
 
 def _ken_burns(
-    energy: str, rng: random.Random, avoid: frozenset[tuple[str, int]] = frozenset()
+    energy: str, rng: random.Random, avoid: frozenset[tuple[str, int]] = frozenset(), punch_in: bool = False
 ) -> tuple[float, float, str]:
     """(zoom_from, zoom_to, pan); a (pan, zoom direction) in ``avoid`` (the moves this footage
-    already had) is re-drawn a few times, so repeated footage looks different."""
+    already had) is re-drawn a few times, so repeated footage looks different. ``punch_in``
+    (a clip shown again in the same video) frames it tighter: zoom 1.12–1.19."""
     for _ in range(6):
         delta = rng.uniform(0.06, 0.12) if energy == "high" else rng.uniform(0.03, 0.07)
         pan = "center" if rng.random() < (0.3 if energy == "high" else 0.45) else rng.choice(_PANS)
         base = 1.0 if pan == "center" else 1.06  # a pan needs headroom at both ends
+        if punch_in:
+            base, delta = 1.12, min(delta, 0.07)
         if rng.random() < 0.65:
             zoom_from, zoom_to = base, base + delta
         else:
@@ -685,18 +914,25 @@ class _ShotContext:
     lyric_ids: set[str]
     previous: str | None
     any_feasible: bool
+    previous_scene: str | None = None
+    scenes_in_video: Mapping[str, int] = field(default_factory=dict)  # earlier shots per scene id
 
 
 def _clip_cost(
     clip: _PoolClip, ctx: _ShotContext, *, pool_size: int, in_video: Mapping[str, int], usage: _Usage
 ) -> float:
-    """Lower is better: avoid repeats (adjacent, in-video, batch-wide), prefer matching section/lyric."""
+    """Lower is better: avoid repeats (adjacent, in-video, batch-wide) and the same scene again
+    in the video (another take of it), prefer matching section/lyric."""
     value = 1000.0 if clip.ref == ctx.previous and pool_size > 1 else 0.0
     value += 50.0 * in_video.get(clip.ref, 0) + 6.0 * usage.global_uses.get(clip.ref, 0)
     if ctx.section is not None and clip.section is not None and clip.section != ctx.section.label:
         value += 4.0
     if clip.lyric_ref is not None and clip.lyric_ref in ctx.lyric_ids:
         value -= 3.0
+    if clip.scene_id is not None:
+        value += SCENE_REPEAT_COST * ctx.scenes_in_video.get(clip.scene_id, 0)
+        if clip.scene_id == ctx.previous_scene:
+            value += SCENE_ADJACENT_COST
     if ctx.any_feasible and clip.duration < ctx.shot_sec * MIN_NATURAL_SPEED:
         value += 200.0
     # Prefer clips long enough to play the shot at (near) normal speed.
@@ -713,12 +949,22 @@ def _plan_video_shots(
     rng: random.Random,
     library: bool,
     allow_mirror: bool = False,
+    pads: Sequence[float] | None = None,
+    fitted: bool = False,
 ) -> list[dict[str, Any]]:
+    """Pick a clip, in-point, speed and camera move per shot. A clip not yet in this video wins
+    whenever one is long enough (fresh-first); a clip that has to come back gets the source
+    window that overlaps its earlier ones least and a tighter framing it has not had."""
     shots: list[dict[str, Any]] = []
     in_video: dict[str, int] = {}
+    scenes_in_video: dict[str, int] = {}
+    windows: dict[str, list[tuple[float, float]]] = {}  # source windows per clip in this video
+    moves: dict[str, set[tuple[str, int]]] = {}  # (pan, zoom direction) per clip in this video
     previous: str | None = None
+    previous_scene: str | None = None
     t_ms = 0
-    for duration_ms in durations_ms:
+    pads = list(pads) if pads is not None else [0.0] * len(durations_ms)
+    for duration_ms, pad in zip(durations_ms, pads, strict=True):
         shot_sec = duration_ms / 1000
         t0, t1 = start + t_ms / 1000, start + (t_ms + duration_ms) / 1000
         section = song.section_at((t0 + t1) / 2)
@@ -729,12 +975,22 @@ def _plan_video_shots(
             lyric_ids=song.lyric_ids(t0, t1),
             previous=previous,
             any_feasible=any(c.duration >= shot_sec * MIN_NATURAL_SPEED for c in pool),
+            previous_scene=previous_scene,
+            scenes_in_video=scenes_in_video,
         )
         costs = [
             _clip_cost(c, ctx, pool_size=len(pool), in_video=in_video, usage=usage) + rng.random() * 2.0 for c in pool
         ]
-        clip = pool[min(range(len(pool)), key=costs.__getitem__)]
-        speed, src_in, position = _speed_and_in(clip, shot_sec, energy, rng, usage)
+        # Fresh-first is a hard rule, not a cost: a repeat only when no unused clip can play the shot.
+        fresh = [
+            i for i, c in enumerate(pool)
+            if not in_video.get(c.ref) and c.duration >= (shot_sec + pad) * MIN_NATURAL_SPEED
+        ]  # fmt: skip
+        clip = pool[min(fresh or range(len(pool)), key=costs.__getitem__)]
+        repeat = bool(in_video.get(clip.ref))
+        speed, src_in, position = _speed_and_in(
+            clip, shot_sec, energy, rng, usage, pad=pad, fitted=fitted, taken=windows.get(clip.ref, ())
+        )
         footage = (clip.ref, int(src_in // SRC_IN_BUCKET_SEC))
         seen = usage.framings.get(footage, set())
         hflip = False
@@ -747,8 +1003,8 @@ def _plan_video_shots(
             else:
                 hflip = rng.random() < 0.5
         # Footage seen before gets a camera move it has not had with this mirroring.
-        avoid = frozenset((f[1], f[2]) for f in seen if f[0] == hflip)
-        zoom_from, zoom_to, pan = _ken_burns(energy, rng, avoid)
+        avoid = frozenset((f[1], f[2]) for f in seen if f[0] == hflip) | frozenset(moves.get(clip.ref, ()))
+        zoom_from, zoom_to, pan = _ken_burns(energy, rng, avoid, punch_in=repeat)
         shots.append(
             {
                 "clip_key": None if library else clip.ref,
@@ -765,6 +1021,11 @@ def _plan_video_shots(
             }
         )
         in_video[clip.ref] = in_video.get(clip.ref, 0) + 1
+        if clip.scene_id is not None:
+            scenes_in_video[clip.scene_id] = scenes_in_video.get(clip.scene_id, 0) + 1
+        windows.setdefault(clip.ref, []).append((src_in, src_in + (shot_sec + pad) * speed))
+        moves.setdefault(clip.ref, set()).add((pan, 1 if zoom_to > zoom_from else -1))
+        previous_scene = clip.scene_id
         usage.global_uses[clip.ref] = usage.global_uses.get(clip.ref, 0) + 1
         usage.positions[(clip.ref, position)] = usage.positions.get((clip.ref, position), 0) + 1
         usage.add(footage, _framing(hflip, pan, zoom_from, zoom_to))
@@ -785,11 +1046,21 @@ def _assign_unused(
     usage: _Usage,
     library: bool,
     rng: random.Random,
+    pads: Sequence[Sequence[float]] | None = None,
+    fitted: Sequence[bool] | None = None,
 ) -> None:
-    """Swap clips that ended up unused (paid generations) into shots of over-used clips."""
+    """Swap clips that ended up unused (paid generations) into shots of over-used clips.
+
+    An unused clip is in no video, so a swap never creates an in-video repeat. A shot of a
+    fitted video (``fitted[v]``, crossfade footage ``pads[v][s]``) only takes a clip that plays
+    it at ≥ FIT_MIN_SPEED.
+    """
 
     def ref_of(shot: Mapping[str, Any]) -> str:
         return str(shot["clip_key"] or shot["clip_id"])
+
+    def pad_of(v: int, s: int) -> float:
+        return pads[v][s] if pads else 0.0
 
     for clip in pool:
         if clip.ref not in must_use or usage.global_uses.get(clip.ref, 0) > 0:
@@ -800,6 +1071,9 @@ def _assign_unused(
             for s, shot in enumerate(shots):
                 current = ref_of(shot)
                 if usage.global_uses.get(current, 0) < 2 or clip.duration < shot["duration"] * MIN_NATURAL_SPEED:
+                    continue
+                footage = shot["duration"] + pad_of(v, s)
+                if fitted and fitted[v] and clip.duration - 2 * clip.margin < footage * FIT_MIN_SPEED:
                     continue
                 neighbours = {ref_of(shots[i]) for i in (s - 1, s + 1) if 0 <= i < len(shots)}
                 if clip.ref in neighbours:
@@ -813,7 +1087,9 @@ def _assign_unused(
         shot = videos[v]["shots"][s]
         old = ref_of(shot)
         usage.global_uses[old] -= 1
-        speed, src_in, position = _speed_and_in(clip, shot["duration"], "mid", rng, usage)
+        speed, src_in, position = _speed_and_in(
+            clip, shot["duration"], "mid", rng, usage, pad=pad_of(v, s), fitted=bool(fitted and fitted[v])
+        )
         shot.update(
             {
                 "clip_key": None if library else clip.ref,
@@ -871,7 +1147,7 @@ def _variety_warning(
                 f"上限を {pool_target} 本程度まで引き上げると改善します"
             )
         if reuse == "economy":
-            advice.append("再利用設定が「節約」です。「バランス」か「バリエーション重視」にすると改善します")
+            advice.append("再利用設定が「節約」です。「バランス」か「バリエーション最大」にすると改善します")
         elif pool_size >= MAX_POOL and math.ceil(shots_total / _REUSE_DIVISOR.get(reuse, 3)) > MAX_POOL:
             advice.append(
                 f"動画の本数が多く、素材数が上限（{MAX_POOL} 本）に達しています。"
@@ -884,11 +1160,44 @@ def _variety_warning(
             )
     if not advice:
         advice.append(
-            "動画の本数を減らすか、再利用設定を「バリエーション重視」にすると改善します"
+            "動画の本数を減らすか、再利用設定を「バリエーション最大」にすると改善します"
             if reuse != "max_variety"
             else "動画の本数を減らすか、動画を短くすると改善します"
         )
     return VARIETY_WARNING_JA + "。".join(advice) + "。"
+
+
+def _repeat_counts(shots: Sequence[Mapping[str, Any]], pads: Sequence[float], *, library: bool) -> tuple[int, int, int]:
+    """(repeat shots, overlapping repeats, scene repeats) of one video's final shots.
+
+    A shot repeats when its clip was shown earlier in the video (generated mode) or, for
+    uploads, only when its source window ``(src_in, src_in + (duration + pad) * speed)``
+    overlaps an earlier one of that clip (within REPEAT_GAP_SEC: a long upload may give
+    disjoint windows). A scene repeat is another clip of a storyboard scene already shown.
+    """
+    windows: dict[str, list[tuple[float, float]]] = {}
+    scene_refs: dict[str, set[str]] = {}
+    repeats = overlaps = scene_repeats = 0
+    for shot, pad in zip(shots, pads, strict=True):
+        ref = str(shot["clip_key"] or shot["clip_id"])
+        window = (shot["src_in"], shot["src_in"] + (shot["duration"] + pad) * shot["speed"])
+        earlier = windows.setdefault(ref, [])
+        overlapping = any(window[0] < b + REPEAT_GAP_SEC and a - REPEAT_GAP_SEC < window[1] for a, b in earlier)
+        if earlier and (overlapping or not library):
+            repeats += 1
+            overlaps += overlapping
+        earlier.append(window)
+        scene_id = shot.get("scene_id")
+        if scene_id:
+            if not library and scene_id in scene_refs and ref not in scene_refs[scene_id]:
+                scene_repeats += 1
+            scene_refs.setdefault(scene_id, set()).add(ref)
+    return repeats, overlaps, scene_repeats
+
+
+def _pace_ja(longest: float, slowest: float) -> str:
+    """How the fitted shots play (Japanese): the longest shot and the slowest speed, or 等速."""
+    return f"最長{longest:.1f}秒・" + ("等速" if slowest >= 0.995 else f"最も遅いショット{slowest:.2f}倍速")
 
 
 # --- public API ------------------------------------------------------------------------------------------
@@ -911,6 +1220,13 @@ def plan_batch(
     ``settings["fresh_clips"]`` (bool) mixes ``seed`` into the clip seeds so
     no cached clip matches (used to force new footage). Raises
     :class:`ServiceError` (422) when no clip can be planned.
+
+    Shots are 1.5–6 s on beats; a generated video whose beat cuts outnumber the
+    pool is re-cut into fewer shots of up to 8 s (``VideoPlan.fit``), so no clip
+    appears twice in a video unless even that cannot fill it (counted in the
+    stats and ``stats.repeat_warning``). The pool is sized from the beat cuts and
+    the fit runs after it, so the spend is the same as without fitting; the budget
+    is still not an input.
     """
     warnings: list[str] = []
     song = _build_song(analysis, lyric_lines)
@@ -936,12 +1252,19 @@ def plan_batch(
     batch_rng = random.Random(_stable_int("batch", seed))
     video_rngs = [random.Random(_stable_int("video", seed, i)) for i in range(count)]
     cut_lists = [_cut_points(song, starts[i], duration_ms, video_rngs[i]) for i in range(count)]
-    shots_total = sum(len(cuts) for cuts in cut_lists)
-    shots_per_video = max(len(cuts) for cuts in cut_lists)
+    beat_counts = [len(cuts) for cuts in cut_lists]
+    beat_total = sum(beat_counts)
+    # Drawn before the pool: a fitted crossfade video reserves the fades' footage.
+    soft = preset["id"] in _SOFT_TRANSITION_PRESETS
+    transitions = [
+        "crossfade" if random.Random(_stable_int("video-look", seed, i)).random() < (0.5 if soft else 0.15) else "cut"
+        for i in range(count)
+    ]
 
     ready = [c for c in existing_clips if c.get("id") is not None and c.get("status", "ready") == "ready"]
     scenes = [s for s in (storyboard or {}).get("scenes") or [] if isinstance(s, Mapping) and s.get("prompt_en")]
     pool_target = 0
+    fit_floor = 0
     max_new = settings.get("max_new_clips")
     if library:
         uploads = [c for c in ready if c.get("source") == "upload" and (_num(c.get("duration")) or 0) > 0]
@@ -965,7 +1288,9 @@ def plan_batch(
             key = clip.get("cache_key")
             if key and key not in existing_by_key:
                 existing_by_key[str(key)] = clip
-        pool_target = pool_target_size(reuse, shots_total, shots_per_video, len(scenes))
+        # Sized from the beat cuts (the fit below only shortens cut lists, never adds spend).
+        fit_floor = fit_clip_floor(duration_ms, clip_duration)
+        pool_target = pool_target_size(reuse, beat_total, max(beat_counts), len(scenes), fit_floor)
         weights = _scene_weights(scenes, song, list(zip(starts, cut_lists, strict=True)))
         pool = _generated_pool(
             scenes=scenes, weights=weights, provider=provider, model=model, clip_duration=clip_duration,
@@ -978,10 +1303,27 @@ def plan_batch(
                 "新規生成数の上限が0で、再利用できる素材もないため動画を作成できません",
                 status_code=422, code="no_clips",
             )  # fmt: skip
-        if max_new is not None and len(pool) < pool_target:
+        if max_new is not None and int(max_new) <= 0:
+            warnings.append(f"生成済みの素材{len(pool)}本だけで構成します")
+        elif max_new is not None and len(pool) < pool_target:
             warnings.append(f"新規生成の上限（{int(max_new)}本）により、素材数を{len(pool)}本に抑えました")
         for index, clip in enumerate(pool):
             clip.ref = f"c{index + 1:02d}"
+
+    fitted = [False] * count
+    if not library:  # uploads keep their beat cuts (long uploads give disjoint windows instead)
+        for index in range(count):
+            cut_lists[index], fitted[index], crossfade = _fit_to_pool(
+                song, starts[index], duration_ms, cut_lists[index], pool,
+                transitions[index] == "crossfade", seed, index, count,
+            )  # fmt: skip
+            if not crossfade:
+                transitions[index] = "cut"  # only fits without the fades' footage: a cut beats a repeat
+    pads = [
+        _shot_pads(len(cuts), transitions[i] == "crossfade") if fitted[i] else [0.0] * len(cuts)
+        for i, cuts in enumerate(cut_lists)
+    ]
+    shots_total = sum(len(cuts) for cuts in cut_lists)
 
     usage = _Usage()
     videos: list[dict[str, Any]] = []
@@ -1001,14 +1343,12 @@ def plan_batch(
             trial_usage = usage.copy()
             shots = _plan_video_shots(
                 song=song, start=starts[index], durations_ms=cut_lists[index], pool=pool, usage=trial_usage,
-                rng=rng, library=library, allow_mirror=allow_mirror,
+                rng=rng, library=library, allow_mirror=allow_mirror, pads=pads[index], fitted=fitted[index],
             )  # fmt: skip
             if _shot_signature(shots) not in signatures or attempt == 5:
                 usage = trial_usage
                 break
         signatures.add(_shot_signature(shots))
-        video_rng = random.Random(_stable_int("video-look", seed, index))
-        soft = preset["id"] in _SOFT_TRANSITION_PRESETS
         videos.append(
             {
                 "index": index,
@@ -1020,12 +1360,14 @@ def plan_batch(
                 "text_style": dict(text_style),
                 "color_grade": grades[(grade_offset + index) % len(grades)] if color_grade == "auto" else color_grade,
                 "shots": shots,
-                "transition": "crossfade" if video_rng.random() < (0.5 if soft else 0.15) else "cut",
+                "transition": transitions[index],
             }
         )
 
     must_use = {clip.ref for clip in pool if not library and clip.clip_id is None}
-    _assign_unused(videos, pool, must_use=must_use, usage=usage, library=library, rng=batch_rng)
+    _assign_unused(
+        videos, pool, must_use=must_use, usage=usage, library=library, rng=batch_rng, pads=pads, fitted=fitted
+    )
 
     used_refs = {str(s["clip_key"] or s["clip_id"]) for v in videos for s in v["shots"]}
     clip_specs: list[dict[str, Any]] = []
@@ -1039,6 +1381,7 @@ def plan_batch(
             for shot in video["shots"]:
                 shot["clip_key"] = renumber[shot["clip_key"]]
 
+    # variety_score is cross-video; in-video repeats are reported separately below.
     variety = _variety_score(videos)
     variety_warning = None
     if variety < VARIETY_WARNING_THRESHOLD:
@@ -1048,10 +1391,74 @@ def plan_batch(
             pool_target=pool_target,
             max_new=int(max_new) if max_new is not None else None,
             reuse=reuse,
-            shots_total=shots_total,
+            shots_total=beat_total,
             n_scenes=len(scenes),
         )
     new_clips = sum(1 for spec in clip_specs if spec["existing_clip_id"] is None)
+
+    repeat_total = overlap_total = scene_total = videos_with_repeats = 0
+    for index, video in enumerate(videos):
+        shots = video["shots"]
+        repeats, overlaps, scene_repeats = _repeat_counts(shots, pads[index], library=library)
+        video["fit"] = {
+            "beat_shots": beat_counts[index],
+            "shots": len(shots),
+            "fitted": fitted[index],
+            "min_speed": min(s["speed"] for s in shots),
+            "max_shot_sec": max(s["duration"] for s in shots),
+            "repeat_shots": repeats,
+            "overlap_repeat_shots": overlaps,
+            "scene_repeat_shots": scene_repeats,
+        }
+        repeat_total += repeats
+        overlap_total += overlaps
+        scene_total += scene_repeats
+        videos_with_repeats += repeats > 0
+
+    clean = [v["fit"] for i, v in enumerate(videos) if fitted[i] and not v["fit"]["repeat_shots"]]
+    if clean:
+        pace = _pace_ja(max(f["max_shot_sec"] for f in clean), min(f["min_speed"] for f in clean))
+        if count == 1:
+            warnings.append(
+                f"素材が{len(pool)}本のため、同じ映像を繰り返さないよう、"
+                f"ショットを{clean[0]['beat_shots']}→{clean[0]['shots']}にまとめました（{pace}）"
+            )
+        else:
+            warnings.append(
+                f"素材が{len(pool)}本のため、同じ映像を繰り返さないよう、"
+                f"{len(clean)}本の動画でショットを長めにまとめました（{pace}）"
+            )
+
+    repeat_warning = None
+    if repeat_total and library:
+        repeat_warning = (
+            f"アップロード素材が足りないため、同じ映像が{repeat_total}ショット再登場します。"
+            "素材を追加でアップロードすると解消します"
+        )
+    elif repeat_total:
+        where = "動画内で" if count == 1 else f"{videos_with_repeats}本の動画で"
+        total = f"{repeat_total}" if count == 1 else f"計{repeat_total}"
+        repeat_warning = (
+            f"素材が足りないため、{where}同じ素材が{total}ショット再登場します"
+            "（連続はせず、別の区間・寄りの構図で使います）。"
+        )
+        # Clips one video needs when every shot is as long as a clip allows (≤ 8 s at ≥ 0.75x).
+        usable = clip_duration - 2 * GENERATED_EDGE_MARGIN
+        limit_ms = min(_MAX_FIT_MS, int((usable / FIT_MIN_SPEED - (XFADE_PAD_SEC + FRAME_SLACK_SEC)) * 1000))
+        need = math.ceil(duration_ms / max(_MIN_MS, limit_ms))
+        if max_new is None:
+            repeat_warning += "動画を短くすると解消します"
+        elif int(max_new) > 0:
+            cached_in_pool = sum(1 for clip in pool if clip.clip_id is not None)
+            repeat_warning += (
+                f"新規生成の上限を{max(int(max_new) + 1, need - cached_in_pool)}本以上に引き上げると解消します"
+            )
+        else:
+            repeat_warning += (
+                f"生成済みの素材だけでは足りません。新しい素材を{max(1, need - len(pool))}本以上追加すると解消します"
+            )
+
+    all_shots = [s for v in videos for s in v["shots"]]
     stats = {
         "videos": count,
         "shots_total": shots_total,
@@ -1063,5 +1470,16 @@ def plan_batch(
         "pool_target": pool_target,
         "clip_duration": clip_duration,
         "shots_per_video": [len(v["shots"]) for v in videos],
+        # additive: fitting to the pool and in-video repeats (shots_total / shots_per_video are post-fit)
+        "beat_shots_per_video": beat_counts,
+        "fitted_videos": sum(fitted),
+        "repeat_shots": repeat_total,
+        "overlap_repeat_shots": overlap_total,
+        "scene_repeat_shots": scene_total,
+        "videos_with_repeats": videos_with_repeats,
+        "max_shot_sec": max(s["duration"] for s in all_shots),
+        "min_speed": min(s["speed"] for s in all_shots),
+        "repeat_warning": repeat_warning,
+        "pool_fit_floor": fit_floor,
     }
     return {"clip_specs": clip_specs, "videos": videos, "stats": stats, "warnings": list(dict.fromkeys(warnings))}

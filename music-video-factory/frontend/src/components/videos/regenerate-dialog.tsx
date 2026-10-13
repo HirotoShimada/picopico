@@ -33,7 +33,7 @@ export function RegenerateDialog({ open, onOpenChange, title, onConfirm }: Regen
         <div className="flex flex-col gap-0.5">
           <Label htmlFor="regenerate-new-clips">新しい素材も生成する</Label>
           <p className="text-xs leading-5 text-muted-foreground">
-            オフの場合は生成済みの素材だけで組み直します（費用なし）。オンにすると新しい素材を生成するため、外部 API のプロバイダーでは費用が発生し、生成ジョブの予算上限を超える場合は開始できません。
+            オフの場合は生成済みの素材だけで組み直します（費用なし）。素材がショット数より少ないときは、同じ映像を繰り返さないようショットを少なく・長めにまとめます。オンにすると新しい素材を生成するため、外部 API のプロバイダーでは費用が発生し、生成ジョブの予算上限を超える場合は開始できません。
           </p>
         </div>
         <Switch id="regenerate-new-clips" checked={newClips} onCheckedChange={setNewClips} />

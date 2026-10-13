@@ -416,6 +416,25 @@ export interface EstimateComparison {
   verified?: boolean;
 }
 
+/**
+ * Additive (§6.5): the plan re-priced with a lower `max_new_clips` that fits the budget (same storyboard,
+ * refs and seed), so applying `max_new_clips` reproduces exactly this estimate.
+ */
+export interface EstimateBudgetFit {
+  max_new_clips: number;
+  new_clips: number;
+  total_usd: number;
+  /** Max shots per video of that plan (fitted). */
+  shots_per_video: number;
+  /** Max beat (pre-fit) shots per video. */
+  beat_shots_per_video: number | null;
+  max_shot_sec: number | null;
+  min_speed: number | null;
+  repeat_shots: number;
+  /** Japanese one-liner, also appended to `Estimate.notes`. */
+  note: string;
+}
+
 export interface Estimate {
   provider: string;
   model: string;
@@ -443,6 +462,22 @@ export interface Estimate {
   as_of?: string | null;
   pricing_verified?: boolean;
   pricing_source_url?: string | null;
+  /** Additive (§6.4/§6.5), null or absent for older plans: shots per video of the (fitted) plan and the beat cut before fitting. */
+  shots_per_video_min?: number | null;
+  shots_per_video_max?: number | null;
+  beat_shots_per_video_max?: number | null;
+  /** Videos re-cut into fewer, longer shots so no clip repeats inside a video. */
+  fitted_videos?: number | null;
+  /** Longest shot (seconds) and slowest playback speed over all shots. */
+  max_shot_sec?: number | null;
+  min_speed?: number | null;
+  /** Shots that reuse a clip already used earlier in the same video (library: an overlapping window). */
+  repeat_shots?: number | null;
+  overlap_repeat_shots?: number | null;
+  scene_repeat_shots?: number | null;
+  videos_with_repeats?: number | null;
+  repeat_warning?: string | null;
+  budget_fit?: EstimateBudgetFit | null;
 }
 
 // --- plans (§6.4) ----------------------------------------------------------------------------------
@@ -480,6 +515,21 @@ export interface VideoPlan {
   regenerated?: boolean;
   edited?: boolean;
   lyric_offsets?: Record<string, LyricOffset> | null;
+  /** Planner addition (§6.4): how the video's cuts were fitted to its clips. */
+  fit?: VideoFit;
+}
+
+/** `VideoPlan.fit`: beat cut vs planned shots, and the repeats left inside the video. */
+export interface VideoFit {
+  beat_shots: number;
+  shots: number;
+  /** Re-cut into fewer, longer shots (≤ 8 s, ≥ 0.75x) to avoid repeating a clip. */
+  fitted: boolean;
+  min_speed: number;
+  max_shot_sec: number;
+  repeat_shots: number;
+  overlap_repeat_shots: number;
+  scene_repeat_shots: number;
 }
 
 export interface ClipSpec {
@@ -502,6 +552,22 @@ export interface BatchPlanStats {
   reused_clips: number;
   variety_score: number;
   variety_warning: string | null;
+  /** Additive (§6.4); absent in plans made before the no-repeat fit. */
+  pool_target?: number;
+  clip_duration?: number;
+  /** Shots per video of the fitted plan, and the beat cut before fitting. */
+  shots_per_video?: number[];
+  beat_shots_per_video?: number[];
+  fitted_videos?: number;
+  repeat_shots?: number;
+  overlap_repeat_shots?: number;
+  scene_repeat_shots?: number;
+  videos_with_repeats?: number;
+  max_shot_sec?: number | null;
+  min_speed?: number | null;
+  repeat_warning?: string | null;
+  /** Clips needed to fit the video without repeats (`fit_clip_floor`); 0 for library. */
+  pool_fit_floor?: number;
 }
 
 export interface BatchPlan {

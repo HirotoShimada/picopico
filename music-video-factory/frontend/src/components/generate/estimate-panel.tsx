@@ -21,6 +21,30 @@ import type { EstimateState } from "./use-estimate";
 
 /** Variety below this is flagged by the planner (§6.4). */
 const VARIETY_WARNING_THRESHOLD = 0.35;
+/** A slowest shot at or above this speed is shown as 等速 (natural speed). */
+const NATURAL_SPEED = 0.995;
+
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** True when the slowest shot plays at (about) natural speed: shown as 等速. */
+export function isNaturalSpeed(speed: number): boolean {
+  return speed >= NATURAL_SPEED;
+}
+
+/** Shots per video of the planned (fitted) cut: `5` or `3〜5`; null for an estimate without the field. */
+export function shotsPerVideoRange(estimate: Pick<Estimate, "shots_per_video_min" | "shots_per_video_max">): string | null {
+  const max = estimate.shots_per_video_max;
+  if (!isNumber(max)) return null;
+  const min = isNumber(estimate.shots_per_video_min) ? estimate.shots_per_video_min : max;
+  return min === max ? formatCount(max) : `${formatCount(min)}〜${formatCount(max)}`;
+}
+
+/** Shots that reuse a clip inside a video, or null for an estimate without the field. */
+export function repeatShots(estimate: Pick<Estimate, "repeat_shots">): number | null {
+  return isNumber(estimate.repeat_shots) ? estimate.repeat_shots : null;
+}
 
 function Row({
   label,
@@ -72,11 +96,13 @@ export interface EstimatePanelProps {
   unavailableReason?: React.ReactNode;
   /** Where the budget comes from when the form leaves it empty. */
   budgetSource?: string;
+  /** Apply `Estimate.budget_fit` (set the new-clip cap to `maxNewClips`; same seed = the same plan). */
+  onApplyMaxNewClips?: (maxNewClips: number) => void;
   className?: string;
 }
 
-/** Live cost estimate: new vs cached clips, price, LLM, total, savings, budget and variety. */
-export function EstimatePanel({ state, unavailableReason, budgetSource, className }: EstimatePanelProps) {
+/** Live cost estimate: new vs cached clips, price, LLM, total, savings, budget, shots per video and variety. */
+export function EstimatePanel({ state, unavailableReason, budgetSource, onApplyMaxNewClips, className }: EstimatePanelProps) {
   const { data: estimate, error, stale } = state;
 
   return (
@@ -111,19 +137,39 @@ export function EstimatePanel({ state, unavailableReason, budgetSource, classNam
             <Skeleton className="h-24 w-full" />
           </div>
         ) : (
-          <EstimateBody estimate={estimate} stale={stale} budgetSource={budgetSource} />
+          <EstimateBody estimate={estimate} stale={stale} budgetSource={budgetSource} onApplyMaxNewClips={onApplyMaxNewClips} />
         )}
       </CardContent>
     </Card>
   );
 }
 
-function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; stale: boolean; budgetSource?: string }) {
+function EstimateBody({
+  estimate,
+  stale,
+  budgetSource,
+  onApplyMaxNewClips,
+}: {
+  estimate: Estimate;
+  stale: boolean;
+  budgetSource?: string;
+  onApplyMaxNewClips?: (maxNewClips: number) => void;
+}) {
   const limit = estimate.budget_limit_usd;
   const usage = limit && limit > 0 ? Math.min(1, estimate.total_usd / limit) : null;
   const savings = savingsPercent(estimate);
-  const variety = estimate.variety_score;
+  // Variety is cross-video (§6.4): a single video has no bar, only a warning if the planner gives one.
+  const variety = estimate.videos > 1 && isNumber(estimate.variety_score) ? estimate.variety_score : null;
   const unverified = estimate.pricing_verified === false && estimate.price_per_second_usd > 0;
+  const shotsRange = shotsPerVideoRange(estimate);
+  const beatMax = estimate.beat_shots_per_video_max;
+  const recut =
+    isNumber(estimate.fitted_videos) && estimate.fitted_videos > 0 && isNumber(beatMax) && isNumber(estimate.shots_per_video_max) && beatMax > estimate.shots_per_video_max;
+  const repeats = repeatShots(estimate);
+  const budgetFit = !estimate.within_budget ? (estimate.budget_fit ?? null) : null;
+  // Shown on their own lines: keep them out of the notes list (the variety warning used to appear twice).
+  const shownElsewhere = new Set([estimate.variety_warning, estimate.repeat_warning, estimate.budget_fit?.note].filter(Boolean));
+  const notes = estimate.notes.filter((note) => !shownElsewhere.has(note));
 
   return (
     <div className={cn("flex flex-col gap-4 transition-opacity", stale && "opacity-50")}>
@@ -156,10 +202,37 @@ function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; s
         ) : (
           <p className="text-2xs text-subtle-foreground">予算上限なし</p>
         )}
+        {budgetFit ? (
+          <div className="flex items-start justify-between gap-3 rounded-md border border-border bg-surface-raised/50 px-3 py-2">
+            <p className="text-xs leading-5 text-muted-foreground">{budgetFit.note}</p>
+            {onApplyMaxNewClips ? (
+              <Button size="xs" variant="secondary" className="shrink-0" onClick={() => onApplyMaxNewClips(budgetFit.max_new_clips)}>
+                上限を{formatCount(budgetFit.max_new_clips)}本にする
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       <dl className="flex flex-col">
         <Row label="動画" value={`${formatCount(estimate.videos)}本 ・ ${formatCount(estimate.shots_total)}ショット`} />
+        {/* Fit to the clips (§6.4): each row only when the backend reports the field (older estimates do not). */}
+        {shotsRange !== null ? (
+          <Row label="1本あたりのショット" value={`${shotsRange}ショット${recut ? `（通常 ${formatCount(beatMax)}）` : ""}`} />
+        ) : null}
+        {isNumber(estimate.max_shot_sec) && isNumber(estimate.min_speed) ? (
+          <Row
+            label="ショットの長さ・速度"
+            value={`最長 ${estimate.max_shot_sec.toFixed(1)}秒 ・ ${isNaturalSpeed(estimate.min_speed) ? "等速" : `最も遅い ${estimate.min_speed.toFixed(2)}倍速`}`}
+          />
+        ) : null}
+        {repeats !== null ? (
+          <Row
+            label="動画内の同じ素材"
+            value={repeats > 0 ? <span className="whitespace-nowrap text-warning-foreground">{`${formatCount(repeats)}ショット`}</span> : "なし"}
+            hint={repeats > 0 ? "連続しない・別の区間・寄りの構図" : undefined}
+          />
+        ) : null}
         <Row label="使用する素材" value={`${formatCount(estimate.unique_clips)}本`} />
         <Row
           label="新規生成"
@@ -190,18 +263,29 @@ function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; s
         />
       </dl>
 
-      {variety !== null && variety !== undefined ? (
+      {estimate.repeat_warning ? (
+        <p className="flex items-start gap-1.5 text-xs leading-5 text-warning-foreground">
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+          {estimate.repeat_warning}
+        </p>
+      ) : null}
+
+      {variety !== null || estimate.variety_warning ? (
         <div className="flex flex-col gap-1.5">
-          <div className="flex items-baseline justify-between text-xs">
-            <span className="text-muted-foreground">映像のバリエーション</span>
-            <span className="font-mono text-foreground tabular">{formatPercent(variety)}</span>
-          </div>
-          <Progress
-            value={variety * 100}
-            tone={variety < VARIETY_WARNING_THRESHOLD ? "danger" : "neutral"}
-            size="sm"
-            aria-label="映像のバリエーション"
-          />
+          {variety !== null ? (
+            <>
+              <div className="flex items-baseline justify-between text-xs">
+                <span className="text-muted-foreground">動画間の映像バリエーション</span>
+                <span className="font-mono text-foreground tabular">{formatPercent(variety)}</span>
+              </div>
+              <Progress
+                value={variety * 100}
+                tone={variety < VARIETY_WARNING_THRESHOLD ? "danger" : "neutral"}
+                size="sm"
+                aria-label="動画間の映像バリエーション"
+              />
+            </>
+          ) : null}
           {estimate.variety_warning ? (
             <p className="flex items-start gap-1.5 text-xs leading-5 text-warning-foreground">
               <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
@@ -211,9 +295,9 @@ function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; s
         </div>
       ) : null}
 
-      {estimate.notes.length > 0 ? (
+      {notes.length > 0 ? (
         <ul className="flex list-disc flex-col gap-1 pl-4 text-2xs leading-4 text-muted-foreground marker:text-subtle-foreground">
-          {estimate.notes.map((note) => (
+          {notes.map((note) => (
             <li key={note}>{note}</li>
           ))}
         </ul>

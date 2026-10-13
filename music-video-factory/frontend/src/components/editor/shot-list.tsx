@@ -42,6 +42,11 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
   }
 
   const starts = shots.reduce<number[]>((acc, shot, index) => [...acc, index === 0 ? 0 : acc[index - 1] + shots[index - 1].duration], []);
+  // Index of each clip's first shot: a later shot with the same clip repeats footage inside this video.
+  const firstUse = new Map<string, number>();
+  shots.forEach((shot, index) => {
+    if (shot.clip_id && !firstUse.has(shot.clip_id)) firstUse.set(shot.clip_id, index);
+  });
   return (
     <ol className="flex flex-col divide-y divide-border rounded-md border border-border">
       {shots.map((shot, index) => {
@@ -50,6 +55,7 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
         const changed = baseShots[index]?.clip_id !== shot.clip_id;
         const active = playerTime !== null && playerTime >= begin && playerTime < begin + shot.duration;
         const short = clip?.duration !== null && clip?.duration !== undefined && clip.duration < shotSourceSeconds(shot);
+        const repeated = !!shot.clip_id && (firstUse.get(shot.clip_id) ?? index) < index;
         return (
           <li key={index} className={cn("flex items-center gap-3 px-3 py-2.5", active && "bg-surface-raised")}>
             <span className="w-6 shrink-0 text-right font-mono text-xs text-subtle-foreground">{index + 1}</span>
@@ -84,6 +90,11 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
                   </Badge>
                 ) : null}
                 {short ? <Badge tone="warning">素材が短い</Badge> : null}
+                {repeated ? (
+                  <Badge tone="warning" title="この動画の前のショットでも使われている素材です">
+                    同じ素材
+                  </Badge>
+                ) : null}
               </div>
               <span className="truncate text-2xs text-muted-foreground">
                 {clip ? [clip.scene_id, clipSourceLabel(clip)].filter(Boolean).join(" ・ ") : shot.clip_id ? "素材情報なし" : "未割り当て"}
