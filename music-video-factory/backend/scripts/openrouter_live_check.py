@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-usd", type=float, default=0.5, help="abort if the video estimate exceeds this")
     ap.add_argument("--skip-storyboard", action="store_true")
     ap.add_argument("--skip-video", action="store_true")
+    ap.add_argument("--storyboard-json", type=Path, help="reuse scene 1 of a saved storyboard.json instead of a new call")
     ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parents[1] / "var" / "openrouter_live")
     args = ap.parse_args(argv)
     if not args.yes_spend:
@@ -77,7 +78,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"account usage before: ${before}")
 
     prompt, negative = None, ""
-    if not args.skip_storyboard:
+    if args.storyboard_json:
+        saved = json.loads(args.storyboard_json.read_text(encoding="utf-8"))
+        prompt = saved["scenes"][0].get("prompt_en")
+        negative = saved["scenes"][0].get("negative_prompt_en") or ""
+    elif not args.skip_storyboard:
         lines, _ = parse_lyrics(DEMO_LYRICS.read_text(encoding="utf-8"), "txt")
         started = time.monotonic()
         board = generate_storyboard(
