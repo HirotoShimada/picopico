@@ -654,7 +654,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
       >
         {estimate.data?.pricing_verified === false && isOpenRouter(estimate.data.provider) ? (
           <Alert tone="warning">
-            この価格は OpenRouter のモデル一覧（取得できない場合は {estimate.data.as_of ?? "調査時点"} の調査値）に基づく概算で、実際の API キーでは未検証です。実際の請求額は生成の完了時に
+            この価格は {estimate.data.as_of ? `${estimate.data.as_of} 時点の ` : ""}OpenRouter のモデル一覧（最新の一覧を取得できないときは組み込みの写し）の料金に基づく概算で、実際の API キーでは未検証です。実際の請求額は生成の完了時に
             OpenRouter が返す金額で記録します。プロンプトは OpenRouter を経由してモデルの提供元に送られます。
           </Alert>
         ) : estimate.data?.pricing_verified === false ? (

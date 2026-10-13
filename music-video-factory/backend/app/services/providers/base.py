@@ -139,12 +139,17 @@ class ProviderModel:
     # is listed with ``price_per_second_usd: null`` but refused by ``check_model``: without a price the
     # batch budget cannot be reserved before each paid attempt.
     price_known: bool = True
+    # Per generated clip (OpenRouter pricing_skus): a clip costs max(seconds × $/s, min_clip_usd) + extra_clip_usd
+    # (minimum_cents_per_generation; cents_per_image_input of an image-to-video request).
+    min_clip_usd: float = 0.0
+    extra_clip_usd: float = 0.0
 
     def snap_duration(self, wanted: float) -> float:
         return snap_duration(self.clip_durations, self.max_clip_duration, wanted)
 
     def cost_for(self, seconds: float) -> float:
-        return round(self.price_per_second_usd * max(0.0, seconds), 4)
+        by_seconds = self.price_per_second_usd * max(0.0, seconds)
+        return round(max(by_seconds, self.min_clip_usd) + self.extra_clip_usd, 4)
 
     def to_info(self) -> dict[str, Any]:
         """``ProviderInfo.models[]`` entry (§5.1) plus the additive fields."""

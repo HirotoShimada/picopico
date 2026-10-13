@@ -481,7 +481,7 @@ def test_claude_gets_names_from_free_text_as_forbidden_and_its_detected_people_a
     # The cleaned consistency tokens still appear verbatim in every prompt.
     assert all(board["world_bible"]["consistency_tokens_en"] in s["prompt_en"] for s in board["scenes"])
     assert board["world_bible"]["consistency_tokens_en"].endswith(tokens)
-    assert any("Claude が実在の人物名を 1 件検出" in w for w in board["warnings"])
+    assert any("Claude が実在の人物名を 1 件検出" in w and "Taylor" in w for w in board["warnings"])
     assert "detected_real_people" in STORYBOARD_SCHEMA["required"]
     assert "detected_real_people" in SYSTEM_PROMPT
 

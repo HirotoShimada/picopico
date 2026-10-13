@@ -9,7 +9,10 @@ are priced live by :func:`get_pricing`; ``PRICING`` only holds an offline
 snapshot of them. Models without a known price (``price_known=False``) are
 left out of the comparison and cannot be selected (``check_model``).
 
-Cost model: ``new clips x clip seconds x $/s`` (+ the storyboard LLM call).
+Cost model: ``new clips x max(clip seconds x $/s, minimum per clip)`` (+ the
+storyboard LLM call; the minimum is OpenRouter's ``minimum_cents_per_generation``,
+0 elsewhere). The pipeline only generates text-to-video, so per-image input
+charges (image-to-video) are not part of these estimates.
 ``naive_total_usd`` prices the same batch with one freshly generated clip per
 shot (no reuse inside the batch, no cache), so ``savings_usd`` is what reuse
 and the clip cache save. Both totals include ``llm_usd``.
@@ -56,6 +59,7 @@ class ModelPricing:
     text_to_video: bool
     price_note: str
     price_known: bool = True
+    min_clip_usd: float = 0.0  # minimum per generated clip (0 = none)
 
     @classmethod
     def from_model(cls, provider_id: str, model: ProviderModel) -> ModelPricing:
@@ -73,13 +77,18 @@ class ModelPricing:
             text_to_video=model.text_to_video,
             price_note=model.price_note,
             price_known=model.price_known,
+            min_clip_usd=float(model.min_clip_usd),
         )
 
     def clip_duration_for(self, wanted: float) -> float:
         return snap_duration(self.clip_durations, self.max_clip_duration, wanted)
 
+    def clip_usd(self, seconds: float) -> float:
+        """One generated clip, unrounded: ``max(seconds x $/s, min_clip_usd)``."""
+        return _per_clip_usd(self.price_per_second_usd, self.min_clip_usd, seconds)
+
     def clip_cost_usd(self, seconds: float) -> float:
-        return _usd(self.price_per_second_usd * max(0.0, float(seconds)))
+        return _usd(self.clip_usd(seconds))
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -127,6 +136,10 @@ def clip_cost_usd(provider: str, model: str | None, seconds: float) -> float:
 
 def _usd(value: float) -> float:
     return round(value + 0.0, 4)
+
+
+def _per_clip_usd(price_per_second: float, min_clip_usd: float, seconds: float) -> float:
+    return max(float(price_per_second) * max(0.0, float(seconds)), float(min_clip_usd))
 
 
 def _money(value: float) -> str:
@@ -178,11 +191,13 @@ def estimate(
     cached = _int(cached_clips)
     clip_duration = _float(plan_stats.get("clip_duration")) or pricing.default_duration
     pps = pricing.price_per_second_usd
+    per_clip = pricing.clip_usd(clip_duration)
+    minimum_applies = per_clip > pps * clip_duration + 1e-12
     llm_usd = max(0.0, _float(llm_estimate_usd) or 0.0)
 
-    generation_usd = new_clips * clip_duration * pps
+    generation_usd = new_clips * per_clip
     total_usd = generation_usd + llm_usd
-    naive_generation_usd = 0.0 if source.kind == "library" else shots_total * clip_duration * pps
+    naive_generation_usd = 0.0 if source.kind == "library" else shots_total * per_clip
     naive_total_usd = naive_generation_usd + llm_usd
     savings_usd = max(0.0, naive_total_usd - total_usd)
 
@@ -197,13 +212,19 @@ def estimate(
     )  # fmt: skip
 
     notes: list[str] = []
-    if pps <= 0:
+    if per_clip <= 0:
         if source.kind == "mock":
             notes.append("モックはテスト用のダミー映像のため、動画生成の費用はかかりません（映像に「MOCK」と表示されます）")
         elif source.kind == "library":
             notes.append("アップロード済みの素材だけを使うため、動画生成の費用はかかりません")
     else:
-        notes.append(f"新規生成 {new_clips} 本 × {clip_duration:g} 秒 × ${pps:g}/秒 = {_money(generation_usd)}")
+        if minimum_applies:
+            notes.append(
+                f"新規生成 {new_clips} 本 × 1 本あたりの最低料金 ${per_clip:g}（{clip_duration:g} 秒 × ${pps:g}/秒 を"
+                f"上回るため）= {_money(generation_usd)}"
+            )
+        else:
+            notes.append(f"新規生成 {new_clips} 本 × {clip_duration:g} 秒 × ${pps:g}/秒 = {_money(generation_usd)}")
         if cached:
             notes.append(f"生成済みの素材 {cached} 本を再利用するため、その分の費用はかかりません")
         if savings_usd >= 0.005:
@@ -225,8 +246,8 @@ def estimate(
         notes.append(f"{source.name} はこのままでは生成を開始できません: {unusable_reason}")
     if source.kind == "api" and getattr(source, "dynamic_catalogue", False):
         notes.append(
-            "料金は OpenRouter のモデル一覧（または調査値）に基づく概算です。実際の請求額は、生成の完了時に"
-            "OpenRouter が返す実費（usage.cost）で記録します"
+            f"料金は {pricing.as_of} 時点の OpenRouter のモデル一覧（最新の一覧を取得できないときは組み込みの写し）の"
+            "料金に基づく概算です。実際の請求額は、生成の完了時に OpenRouter が返す実費（usage.cost）で記録します"
             + ("" if pricing.verified else "（実際の API キーでの検証前のため未検証）")
         )
     elif source.kind == "api":
@@ -289,7 +310,7 @@ def _comparison(
                 duration, generation = clip_duration, selected_generation_usd
             else:
                 duration = model.default_duration
-                generation = clips_needed * duration * model.price_per_second_usd
+                generation = clips_needed * _per_clip_usd(model.price_per_second_usd, model.min_clip_usd, duration)
             rows.append(
                 {
                     "provider": provider.id,

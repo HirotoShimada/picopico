@@ -46,13 +46,13 @@ function Row({
   );
 }
 
-function UnverifiedBadge({ provider }: { provider: string }) {
+function UnverifiedBadge({ provider, asOf }: { provider: string; asOf?: string | null }) {
   return (
     <Badge
       tone="warning"
       title={
         isOpenRouter(provider)
-          ? "OpenRouter のモデル一覧（または調査値）に基づく価格です。実際の API キーでは未検証です"
+          ? `${asOf ? `${asOf} 時点の ` : ""}OpenRouter のモデル一覧（最新の一覧を取得できないときは組み込みの写し）の料金に基づく価格です。実際の API キーでは未検証です`
           : "実際の API キーでの検証前の公式料金表に基づく価格です"
       }
     >
@@ -169,7 +169,7 @@ function EstimateBody({ estimate, stale, budgetSource }: { estimate: Estimate; s
         <div className="flex items-baseline justify-between gap-3 py-1">
           <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
             単価
-            {unverified ? <UnverifiedBadge provider={estimate.provider} /> : null}
+            {unverified ? <UnverifiedBadge provider={estimate.provider} asOf={estimate.as_of} /> : null}
           </dt>
           <dd className="text-right font-mono text-xs text-foreground tabular">{formatPricePerSecond(estimate.price_per_second_usd)}</dd>
         </div>

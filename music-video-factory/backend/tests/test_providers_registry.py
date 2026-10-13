@@ -47,7 +47,7 @@ def test_provider_info_without_keys(set_env: Callable[..., Any]) -> None:
         assert info["default_model"] in {m["id"] for m in info["models"]}
         for model in info["models"]:
             assert model["clip_durations"] or model["max_clip_duration"] > 0
-            # OpenRouter models whose 9:16 support the listing does not state are flagged, not hidden.
+            # A model without 9:16 output says so (OpenRouter only offers models listing 9:16).
             assert model["price_note"] and (model["supports_vertical"] or "9:16" in model["price_note"])
     assert infos["mock"]["configured"] and infos["mock"]["available"] and infos["mock"]["kind"] == "mock"
     assert infos["library"]["configured"] and infos["library"]["kind"] == "library"
@@ -55,7 +55,8 @@ def test_provider_info_without_keys(set_env: Callable[..., Any]) -> None:
         info = infos[provider_id]
         assert info["kind"] == "api" and info["configured"] is False and info["available"] is False
         assert info["reason"]
-        as_of = "2026-10-12" if provider_id == "openrouter" else "2026-10-11"
+        # OpenRouter without a key: the built-in copy of the 2026-10-13 listing
+        as_of = "2026-10-13" if provider_id == "openrouter" else "2026-10-11"
         assert all(m["verified"] is False and m["as_of"] == as_of and m["source_url"] for m in info["models"])
     assert infos["openrouter"]["models_source"] == "fallback" and "OPENROUTER_API_KEY" in infos["openrouter"]["models_note"]
     gen4_turbo = next(m for m in infos["runway"]["models"] if m["id"] == "gen4_turbo")

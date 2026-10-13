@@ -941,7 +941,10 @@ def _normalize_claude(
     extra = [name for name in dict.fromkeys(detected) if name not in forbidden]
     if extra:
         forbidden = [*forbidden, *extra]
-        warnings.append(f"Claude が実在の人物名を {len(extra)} 件検出したため、プロンプトに使わないよう除外しました")
+        warnings.append(
+            f"Claude が実在の人物名を {len(extra)} 件検出したため、プロンプトに使わないよう除外しました"
+            f"（{'、'.join(extra)}）"
+        )
 
     def text(key: str, fallback: str = "") -> str:
         value = raw_world.get(key)

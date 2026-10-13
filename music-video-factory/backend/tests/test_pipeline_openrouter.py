@@ -35,7 +35,7 @@ def _listing(price: str = "0.05", **extra: Any) -> httpx.Response:
         "id": MODEL, "name": "Veo 3.1 Lite", "canonical_slug": MODEL, "created": 1776902400,
         "supported_durations": [4, 6, 8], "supported_aspect_ratios": ["9:16", "16:9"],
         "supported_resolutions": ["720p"], "supported_frame_images": ["first_frame"], "generate_audio": True,
-        "seed": False, "allowed_passthrough_parameters": [], "pricing_skus": {"per-video-second": price},
+        "seed": False, "allowed_passthrough_parameters": [], "pricing_skus": {"duration_seconds": price},
         "creativity": None, "upscale_factor": None,
     }  # fmt: skip
     entries = [entry, {**entry, "id": "vendor/no-price", "name": "No price", "pricing_skus": None}]
@@ -284,7 +284,7 @@ UNLISTED = "bytedance/seedance-2.0"  # not in the built-in list / static prices
 
 def _entry(model_id: str, price: str | None) -> dict[str, Any]:
     return {"id": model_id, "name": model_id, "supported_durations": [4, 6, 8], "supported_aspect_ratios": ["9:16"],
-            "supported_resolutions": ["720p"], "pricing_skus": {"per-video-second": price} if price else None}
+            "supported_resolutions": ["720p"], "pricing_skus": {"duration_seconds": price} if price else None}
 
 
 def _crash_while_polling(

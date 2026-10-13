@@ -139,16 +139,17 @@ API キーはサーバー側でのみ読み込み、どの API レスポンス�
 2. `ANTHROPIC_API_KEY` がなく `OPENROUTER_API_KEY` がある → OpenRouter 経由で Claude（`OPENROUTER_CLAUDE_MODEL`）に送る
 3. どちらもない → テンプレートで作る（外部に送らない）
 
-OpenRouter を使う手順（**実際のキーでは未検証**。この開発コンテナからは openrouter.ai に接続できず、HTTP モックでのみテストしています）:
+OpenRouter を使う手順（2026-10-13 に実キーで確認: 無料のモデル一覧 `GET /videos/models` の取得と、OpenRouter 経由の Claude による絵コンテ生成 1 回は成功。**動画生成は未検証** — アカウントで ZDR を強制していたため送信段階で 404 で拒否され、課金はありませんでした）:
 
 1. OpenRouter でキーを作り、`backend/.env` に `OPENROUTER_API_KEY=...` を設定する。Celery 構成では API とワーカーの両方に渡す。
 2. API とワーカーのホストから `https://openrouter.ai`（`OPENROUTER_API_BASE`）へ HTTPS で接続できるようにする
    （プロキシ・ファイアウォールの許可リスト）。
 3. API とワーカーを再起動し、設定画面で OpenRouter が「設定済み」、モデル一覧が「OpenRouter から取得」になっていることを確認する。
-   取得できないときは組み込みの 6 モデル（検索による調査値）を表示します。
-4. OpenRouter のアカウント設定で **プロンプトのログ記録はオフのまま** にする。アカウント全体の ZDR 強制は有効にしない
-   （動画生成は ZDR の対象外とされ、使えなくなるおそれがあるため）。
-5. 生成設定でプロバイダー「OpenRouter」とモデルを選ぶ。見積もりはモデル一覧の料金（なければ調査値）による概算で、実際の
+   取得できないときは組み込みの 7 モデル（2026-10-13 に取得した実際のモデル一覧の写し）を表示します。
+4. OpenRouter のアカウント設定（https://openrouter.ai/settings/privacy）で **プロンプトのログ記録はオフのまま** にし、**アカウント全体の ZDR 強制は有効にしない**。
+   有効にすると動画生成は ZDR の対象外のため全提供元が除外され、`POST /videos` が 404（`ZDR violation (account settings)`）で拒否されます
+   （2026-10-13 に実際に確認。アプリは「アカウントのプライバシー設定により除外」と表示し、再試行しません）。Claude（歌詞を含む絵コンテ）はアカウント設定に関係なく、アプリがリクエストごとに `zdr: true` と `data_collection: "deny"` を指定します。
+5. 生成設定でプロバイダー「OpenRouter」とモデルを選ぶ。見積もりはモデル一覧の料金（取得できないときは組み込みの写し）による概算で、実際の
    費用は完了時に OpenRouter が返す金額（`usage.cost`）で記録します。料金を読み取れないモデルは選べません。
 
 `OPENROUTER_API_KEY` だけを設定すると、動画生成に加えて絵コンテ（**歌詞の本文を含む**）も OpenRouter 経由で Claude に送られます。
@@ -271,9 +272,9 @@ OpenRouter の「設定済み」の画面は、キーがないためバックエ
 | Veo（Gemini API） | 未検証（キーなし） | 実装・HTTP モックテスト済み。無効キーで公式エンドポイントの 400 応答のみ確認 |
 | Runway | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
 | Kling | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
-| OpenRouter（`openrouter`） | **未検証**（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み。モデル・料金は `GET /videos/models` から取得（取得できなければ組み込みの 6 モデル）。形状は公式 SDK（`@openrouter/sdk` 1.4.25）のソースによる。Claude の経路（絵コンテ）も同じく未検証 |
+| OpenRouter（`openrouter`） | **一部検証済み**（2026-10-13: モデル一覧の取得と Claude の絵コンテは実 API で成功。動画生成は未検証） | 実装・HTTP モックテスト済み。モデル・料金は `GET /videos/models` から取得（取得できなければ組み込みの 7 モデル。2026-10-13 の一覧の写し）。形状は公式 SDK（`@openrouter/sdk` 1.4.25）のソースによる。Claude の経路（絵コンテ）は実 API で 1 回成功（下の「検証済み」） |
 
-API モデルの料金は公式料金表・モデルページの調査値（`verified: false`）です。実キーでの検証が済むまでは概算として扱ってください。
+API モデルの料金は公式料金表・モデルページの調査値（OpenRouter はモデル一覧の料金。いずれも `verified: false`）です。実キーでの検証が済むまでは概算として扱ってください。
 Runway の利用規約に従い、UI には runwayml.com へのリンク付きで「Powered by Runway」を表示します（Runway の
 プロバイダーカード、Runway 選択時の詳細、Runway を使ったジョブの設定欄・動画一覧・プレビュー、Runway の素材、
 設定画面のプロバイダー一覧）。表示が必須かどうかの最終確認は `docs/VIDEO_PROVIDERS.md` §6 の未確定事項です。
@@ -305,14 +306,21 @@ Runway の利用規約に従い、UI には runwayml.com へのリンク付き�
   移動量の揺れが 0.04〜0.05 px）。暗部の階調（輝度 48 未満に 27〜40 段階）も確認。
 - Celery ワーカーの強制終了（kill -9）からの回収（ワーカー再起動時の回収処理で完了まで進むこと）は、以前の修正時に一度確認。
 
-**未検証（キー・接続先がないため）**
+- **OpenRouter の実 API（2026-10-13、`scripts/openrouter_live_check.py`）**:
+  - `GET /videos/models`（無料）: 30 モデルを取得し、料金（`pricing_skus`）の読み取りを全モデルで確認（`tests/fixtures/openrouter_videos_models_2026-10-13.json`）。
+  - Claude の絵コンテ（`anthropic/claude-opus-5.5`、`zdr: true`・`data_collection: "deny"`・json_schema 指定）: 3 シーンを 18 秒で生成。
+    構造化出力はスキーマどおりで、アプリが記録した費用 $0.05564 と OpenRouter の請求額（`GET /key` の増分）が一致。
+  - 動画（`google/veo-3.1-lite`、4 秒・9:16・720p・無音）: アカウントで ZDR を強制していたため `POST /videos` が 404 で拒否（課金なし）。
+    生成・ダウンロード・`usage.cost` の確認はまだです。
+
+**未検証（キー・接続先・設定の都合で）**
 
 - Veo / Runway / Kling / OpenRouter への実際の生成リクエスト、料金、課金の挙動（失敗したジョブが課金されるか、出力 URL の有効期限など）。
   ジョブ ID の保存と再開（`on_submitted` / `resume`）も HTTP モックでのみ確認しています。
 - OpenRouter のモデル一覧（`GET /videos/models`）の実際の内容と料金のキー名、`POST /videos` の成功ステータス（202 か 200 か）、
   `/content` の 409 / 410 の意味、BYOK の費用の内訳。OpenRouter の利用規約と各モデルの商用利用条件。
-- Claude による絵コンテ生成・翻訳（Anthropic SDK を偽の HTTP 応答で呼ぶテストのみ）。OpenRouter 経由の Claude（`zdr: true` と
-  `data_collection: "deny"` を満たす提供元があるか、`reasoning.effort` と json_schema の変換、拒否の表し方、`usage.cost` の有無）。
+- Anthropic 直接の Claude（Anthropic SDK を偽の HTTP 応答で呼ぶテストのみ）。OpenRouter 経由の Claude は上のとおり 1 回成功したが、
+  拒否（refusal）の表し方と翻訳（`translate_to_english`）は実 API では未確認。
 - Whisper による歌詞整列（モデルを取得できないため 503。整列ロジックは偽の文字起こしでのみテスト）。
 - 実 S3 / MinIO / R2（moto のみ）。H.264 を再生できる Chrome での動画再生（同梱の Chromium は H.264 非対応のため、
   E2E では VP9 に変換したコピーで再生を確認）。
@@ -339,7 +347,9 @@ Runway の利用規約に従い、UI には runwayml.com へのリンク付き�
 - 実際の AI 動画生成（Veo / Runway / Kling / OpenRouter）と Claude による絵コンテ生成（Anthropic 直接・OpenRouter 経由とも）は、
   上記のとおり未検証です。
 - OpenRouter（実キーでの確認が必要な点。詳しくは `docs/VIDEO_PROVIDERS.md` §8.8・§8.10）:
-  - モデル一覧の料金（`pricing_skus`）のキー名は未確認のため、料金を読み取れないモデルは調査値を使うか、選べなくなります。
+  - モデル一覧の料金（`pricing_skus`）は、2026-10-13 に取得した実際の一覧で見られた SKU の系統だけを読み取ります（セント表記は
+    USD に換算、無音・テキスト→動画・要求する解像度の単価を使用）。トークン単位の料金（Seedance）や未知の系統のモデルは、
+    推測せずに料金不明として選べなくなります。SKU の意味は名前からの推定で、実際の請求額との突き合わせは未確認です。
     各モデルが 9:16・720p・`generate_audio: false`・画像の data URI を受け付けるかも未確認です。
   - キャンセル API がないため、中断・タイムアウトしたジョブは課金されたものとして記録します（推定）。生成リクエストの結果が
     分からなかった場合（応答のタイムアウト、500 / 502 / 504 / 524 など）も、二重課金を避けて再送せず、推定額を課金済みとして記録します。

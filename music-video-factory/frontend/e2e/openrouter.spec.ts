@@ -110,13 +110,14 @@ const UNKNOWN_PRICE_MODEL: ModelDto = {
   resolution: "720x1280",
   supports_vertical: true,
   price_per_second_usd: null,
-  price_note: "料金を確認できません（モデル一覧に読み取れる料金がなく、調査値もありません）。予算を確保できないため使用できません",
+  price_note:
+    "料金を確認できません（モデル一覧の料金項目（video_seconds_720p）に、この条件（720p・テキスト→動画）で使える秒単価がありません）。予算を確保できないため使用できません",
   verified: false,
   price_known: false,
   default_duration: 5,
   text_to_video: true,
   image_to_video: false,
-  as_of: "2026-10-12",
+  as_of: "2026-10-13",
   source_url: "https://openrouter.ai/bytedance/seedance-2.0-pro",
 };
 const FETCHED_MINUTES_AGO = 35;
@@ -242,8 +243,8 @@ test("settings without keys: OpenRouter with its built-in candidates, Claude rou
   await expect(row).toContainText(`モデル一覧: 組み込みの候補`);
   await expect(row).toContainText(`${openrouter!.models.length} モデル`);
   await expect(row).toContainText(openrouter!.models_note!);
-  // The built-in candidates have no fetch time.
-  await expect(row).not.toContainText("取得 ");
+  // The built-in candidates have no fetch age ("取得 35分前"); their note names the date the listing was copied.
+  await expect(row).not.toContainText(/取得 \d/);
 
   const claude = page.getByTestId("claude-route");
   await expect(claude.getByText("テンプレート", { exact: true })).toBeVisible();
@@ -325,7 +326,8 @@ test("generate: OpenRouter card, models with price / 料金未取得, notes; est
   const unknown = page.getByRole("option", { name: /Seedance 2\.0 Pro/ });
   await expect(unknown).toContainText("料金未取得");
   await expect(unknown).toHaveAttribute("aria-disabled", "true");
-  await expect(page.getByRole("option", { name: /Veo 3\.1 Lite/ })).toContainText("$0.05/秒");
+  // The built-in list is a copy of the real 2026-10-13 listing: duration_seconds_without_audio_720p = $0.03/s.
+  await expect(page.getByRole("option", { name: /Veo 3\.1 Lite/ })).toContainText("$0.03/秒");
   await expect(page.getByRole("option", { name: /Veo 3\.1 Lite/ })).toContainText("提供元 Google");
   await viewportShot(page, "29-generate-openrouter-models");
 
@@ -335,17 +337,22 @@ test("generate: OpenRouter card, models with price / 料金未取得, notes; est
       request.url().endsWith(`/api/projects/${projectId}/estimate`) &&
       request.postDataJSON()?.model === "kwaivgi/kling-v3.0-std",
   );
-  await page.getByRole("option", { name: /Kling v3\.0 Standard/ }).click();
+  await page.getByRole("option", { name: /Kling: Video v3\.0 Standard/ }).click();
   expect((await estimateRequest).postDataJSON()).toMatchObject({ provider: "openrouter", model: "kwaivgi/kling-v3.0-std" });
   await expect(notes).toContainText("モデルの提供元（Kuaishou（Kling））");
   await expect(page.getByText("kwaivgi/kling-v3.0-std", { exact: true })).toBeVisible();
-  await expect(settingValue(page, "生成エンジン")).toHaveText("OpenRouter / Kling v3.0 Standard");
+  await expect(settingValue(page, "生成エンジン")).toHaveText("OpenRouter / Kling: Video v3.0 Standard");
 
   // The real backend prices the selection from OpenRouter's (built-in) model data.
   const estimatePanel = page.locator("[data-slot=card]").filter({ hasText: "費用の見積もり" });
   await expect(estimatePanel).toContainText("$0.084/秒");
   await expect(estimatePanel.getByText("未検証", { exact: true })).toBeVisible();
   await expect(estimatePanel).toContainText("OpenRouter が返す実費（usage.cost）で記録します");
+  // The built-in list is a copy of the real listing: the pricing basis never mentions researched values (調査値).
+  const pricingBasis = "時点の OpenRouter のモデル一覧（最新の一覧を取得できないときは組み込みの写し）の料金に基づく";
+  await expect(estimatePanel).toContainText(pricingBasis);
+  await expect(estimatePanel.getByTitle(pricingBasis, { exact: false })).toBeVisible();
+  await expect(estimatePanel).not.toContainText("調査値");
   await expect(page.getByText("見積もりは予算内です")).toBeVisible({ timeout: 60_000 });
   await screenshot(page, "30-generate-openrouter");
 
@@ -355,6 +362,8 @@ test("generate: OpenRouter card, models with price / 料金未取得, notes; est
   const dialog = page.getByRole("alertdialog");
   await expect(dialog).toContainText("OpenRouter で新規素材");
   await expect(dialog).toContainText("OpenRouter が返す金額で記録します");
+  await expect(dialog).toContainText(pricingBasis);
+  await expect(dialog).not.toContainText("調査値");
   await expect(dialog).toContainText("プロンプトは OpenRouter を経由してモデルの提供元に送られます");
   await dialog.getByRole("button", { name: "生成を開始" }).click();
   expect((await batchRequest).postDataJSON()).toMatchObject({ provider: "openrouter", model: "kwaivgi/kling-v3.0-std" });
@@ -379,7 +388,7 @@ test("generate: the last batch's OpenRouter model is gone from the listing → t
   await expect(page.getByRole("combobox", { name: "モデル" })).toContainText("Veo 3.1 Lite（既定）");
   // null = the provider's default model (what the select shows), not the unlisted id (the server would refuse it).
   expect((await estimateRequest).postDataJSON()).toMatchObject({ provider: "openrouter", model: null });
-  await expect(page.locator("[data-slot=card]").filter({ hasText: "費用の見積もり" })).toContainText("$0.05/秒");
+  await expect(page.locator("[data-slot=card]").filter({ hasText: "費用の見積もり" })).toContainText("$0.03/秒");
   await page.unrouteAll({ behavior: "ignoreErrors" });
   pageLog.assertClean();
 });
@@ -479,7 +488,7 @@ test("usage, batch and clips label OpenRouter (video and Claude costs) and the m
     } as StoryboardDto;
   });
   await openPage(page, `/batches/${batchId}`);
-  await expect(settingValue(page, "生成エンジン")).toHaveText("OpenRouter / Veo 3.1 Lite");
+  await expect(settingValue(page, "生成エンジン")).toHaveText("OpenRouter / Google: Veo 3.1 Lite");
   const storyboardCard = page.locator("[data-slot=card]").filter({ has: page.getByText("絵コンテ", { exact: true }) });
   await expect(storyboardCard).toContainText("Claude（OpenRouter 経由）で作成 ・ 1 シーン ・ $0.0042");
   await expect(storyboardCard.getByTitle("絵コンテを作成したモデル")).toHaveText(CLAUDE_VIA_OPENROUTER);

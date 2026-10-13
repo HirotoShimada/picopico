@@ -2,9 +2,11 @@
 
 Shapes come from the official SDK source (npm ``@openrouter/sdk`` 1.4.25,
 ``esm/funcs/videoGeneration*.js`` and ``esm/models/video*.js``; PyPI
-``openrouter`` 1.3.43 agrees). **Nothing has been verified against the real
-API** (openrouter.ai is unreachable from the dev container): every model is
-``verified: False`` and the adapter is tested with respx only.
+``openrouter`` 1.3.43 agrees). Only the free ``GET /videos/models`` listing
+has been read from the real API (2026-10-13, saved as
+``tests/fixtures/openrouter_videos_models_2026-10-13.json``); no video has been
+generated, so every model is ``verified: False`` and generation is tested with
+respx only.
 
 Flow:
 
@@ -35,10 +37,14 @@ Claude route always sends them, see ``app/services/openrouter.py``).
 Models come from ``GET {base}/videos/models`` (only when
 ``OPENROUTER_API_KEY`` is set), cached in memory and in
 ``WORK_DIR/cache/openrouter_video_models.json`` for
-``OPENROUTER_MODELS_CACHE_TTL`` seconds; a built-in list (search-based,
-unverified) stands in when the listing cannot be fetched. Models that
-explicitly lack 9:16 and upscalers are left out; models whose aspect ratios
-are unknown are listed with ``supports_vertical: False`` and a note.
+``OPENROUTER_MODELS_CACHE_TTL`` seconds; a built-in copy of a few entries of
+the 2026-10-13 listing stands in when the listing cannot be fetched. Only
+models with a non-empty ``supported_durations`` and "9:16" in
+``supported_aspect_ratios`` are offered (edit / upscale / avatar models have
+neither). Prices are read from ``pricing_skus`` by :func:`price_from_skus`
+(SKU families observed in the real listing; unknown families, unreadable
+values, $0 per second and implausible amounts are never guessed around —
+such a model is listed without a price and cannot be used).
 """
 
 from __future__ import annotations
@@ -55,6 +61,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import quote, urlsplit
@@ -63,7 +70,7 @@ import httpx
 
 from app.config import get_settings
 from app.services.errors import ProviderError, ProviderNotConfigured
-from app.services.openrouter import error_message, request_headers, same_origin
+from app.services.openrouter import error_message, no_provider_error, request_headers, same_origin
 from app.services.providers.base import (
     ApiVideoProvider,
     CancelCheck,
@@ -91,12 +98,14 @@ __all__ = [
     "STATIC_PRICES",
     "Catalogue",
     "OpenRouterProvider",
+    "SkuPrice",
+    "price_from_skus",
     "reset_model_cache",
     "sku_price_per_second",
 ]
 
-# Date of the OpenRouter research in docs/VIDEO_PROVIDERS.md §8 (built-in list and static prices).
-OPENROUTER_RESEARCH_AS_OF = "2026-10-12"
+# Date the built-in list (FALLBACK_MODELS) was copied from the real GET /videos/models listing.
+BUILT_IN_LISTING_AS_OF = "2026-10-13"
 CACHE_FILE_NAME = "openrouter_video_models.json"
 _CACHE_VERSION = 1
 _LISTING_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -108,52 +117,68 @@ _MAX_IMAGE_BYTES = 10 * 1024 * 1024  # [C] encoded data-URI size; 413 is a typed
 _SEED_MODULUS = 2**31
 _MAX_UNSIGNED_URLS = 3
 _MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*$")
+# A 404 that excludes every endpoint because of the account's privacy / guardrail settings (permanent).
+_POLICY_EXCLUSION = re.compile(r"guardrail|data[ _-]?polic|\bzdr\b|zero[ -]data[ -]retention|privacy", re.IGNORECASE)
 _MAX_MODEL_ID_CHARS = 90
 # Resolution to request for the base model, best first: 720p like the other adapters (the renderer
-# scales to 1080x1920); an "@1080p" variant is added when the listing prices 1080p separately.
+# scales to 1080x1920), else the first one the listing prices; an "@1080p" variant is added when the
+# listing prices 1080p separately.
 _RESOLUTION_PREFERENCE = ("720p", "768p", "1080p", "1K", "480p", "2K", "360p", "4K")
 _VERTICAL_SIZE = {"360p": "360x640", "480p": "480x854", "720p": "720x1280", "768p": "768x1366",
                   "1080p": "1080x1920", "2K": "1440x2560", "4K": "2160x3840"}  # fmt: skip
 _LOW_RESOLUTIONS = frozenset({"360p", "480p"})
-_RESOLUTION_TOKENS = frozenset({"360p", "480p", "720p", "768p", "1080p", "1k", "2k", "4k"})
-_SILENT_SKU = re.compile(r"(?:no|without|off|mute|muted)[-_]?audio|audio[-_]?(?:off|none|false)|silent|mute",
-                         re.IGNORECASE)  # fmt: skip
 _CONTENT_HINTS = ("moderation", "safety", "policy", "content", "inappropriate", "nsfw", "blocked", "flagged")
 _TRANSIENT_HINTS = ("internal", "timeout", "timed out", "busy", "try again", "temporar", "unavailable",
                     "overload", "capacity")  # fmt: skip
 
 
-# --- built-in catalogue (search-based, unverified: docs/VIDEO_PROVIDERS.md §8.3) -----------------------------
+# --- built-in catalogue (copy of the real listing, 2026-10-13) ---------------------------------------------
 #
-# Used only when GET /videos/models cannot be fetched (no key, network error). Aspect ratios,
-# durations and audio flags follow the model pages seen as search snippets [B]/mirrors [C].
+# Used only when GET /videos/models cannot be fetched (no key, network error): a few entries of the real
+# listing (tests/fixtures/openrouter_videos_models_2026-10-13.json, only the fields read here), priced by
+# the same code as a live listing.
 
 FALLBACK_MODELS: tuple[dict[str, Any], ...] = (
-    {"id": "google/veo-3.1-lite", "name": "Veo 3.1 Lite", "supported_durations": [4, 6, 8],
-     "supported_aspect_ratios": ["16:9", "9:16"], "supported_resolutions": ["720p"], "generate_audio": True},
-    {"id": "google/veo-3.1-fast", "name": "Veo 3.1 Fast", "supported_durations": [4, 6, 8],
-     "supported_aspect_ratios": ["16:9", "9:16"], "supported_resolutions": ["720p"], "generate_audio": True},
-    {"id": "kwaivgi/kling-v3.0-std", "name": "Kling v3.0 Standard", "supported_durations": list(range(3, 16)),
-     "supported_aspect_ratios": ["16:9", "9:16", "1:1"], "supported_resolutions": ["720p"], "generate_audio": True},
-    {"id": "kwaivgi/kling-video-o1", "name": "Kling Video O1", "supported_durations": [5, 10],
-     "supported_aspect_ratios": ["16:9", "9:16", "1:1"], "supported_resolutions": ["720p"]},
-    {"id": "minimax/hailuo-2.3", "name": "Hailuo 2.3", "supported_durations": [6, 10]},
-    {"id": "alibaba/wan-2.7", "name": "Wan 2.7", "supported_durations": list(range(2, 11)),
-     "supported_aspect_ratios": ["16:9", "9:16"], "supported_resolutions": ["720p"]},
+    {"id": "google/veo-3.1-lite", "name": "Google: Veo 3.1 Lite", "supported_durations": [8, 4, 6],
+     "supported_aspect_ratios": ["16:9", "9:16"], "supported_resolutions": ["720p", "1080p"],
+     "supported_frame_images": ["first_frame", "last_frame"], "generate_audio": True, "seed": True,
+     "pricing_skus": {"duration_seconds_with_audio": "0.08", "duration_seconds_without_audio": "0.05",
+                      "duration_seconds_with_audio_720p": "0.05", "duration_seconds_without_audio_720p": "0.03"}},
+    {"id": "google/veo-3.1-fast", "name": "Google: Veo 3.1 Fast", "supported_durations": [4, 6, 8],
+     "supported_aspect_ratios": ["16:9", "9:16"], "supported_resolutions": ["720p", "1080p", "4K"],
+     "supported_frame_images": ["first_frame", "last_frame"], "generate_audio": True, "seed": True,
+     "pricing_skus": {"duration_seconds_with_audio": "0.12", "duration_seconds_with_audio_4k": "0.30",
+                      "duration_seconds_without_audio": "0.10", "duration_seconds_with_audio_720p": "0.10",
+                      "duration_seconds_without_audio_4k": "0.25", "duration_seconds_without_audio_720p": "0.08"}},
+    {"id": "kwaivgi/kling-v3.0-std", "name": "Kling: Video v3.0 Standard", "supported_durations": list(range(3, 16)),
+     "supported_aspect_ratios": ["16:9", "9:16", "1:1"], "supported_resolutions": ["720p"],
+     "supported_frame_images": ["first_frame", "last_frame"], "generate_audio": True, "seed": False,
+     "pricing_skus": {"duration_seconds": "0.084", "duration_seconds_with_audio": "0.126",
+                      "text_to_video_duration_seconds_480p": "0.084", "text_to_video_duration_seconds_720p": "0.084",
+                      "image_to_video_duration_seconds_720p": "0.084",
+                      "text_to_video_duration_seconds_1080p": "0.084",
+                      "image_to_video_duration_seconds_1080p": "0.084"}},
+    {"id": "kwaivgi/kling-video-o1", "name": "Kling: Video O1", "supported_durations": [5, 10],
+     "supported_aspect_ratios": ["16:9", "9:16", "1:1"], "supported_resolutions": ["720p"],
+     "supported_frame_images": ["first_frame", "last_frame"], "generate_audio": True, "seed": False,
+     "pricing_skus": {"duration_seconds": "0.1120"}},
+    {"id": "alibaba/wan-2.7", "name": "Alibaba: Wan 2.7", "supported_durations": list(range(2, 11)),
+     "supported_aspect_ratios": ["16:9", "9:16", "1:1", "4:3", "3:4"], "supported_resolutions": ["720p", "1080p"],
+     "supported_frame_images": ["first_frame", "last_frame"], "generate_audio": True, "seed": True,
+     "pricing_skus": {"duration_seconds": "0.1"}},
+    {"id": "runway/gen-4.5", "name": "Runway: Gen-4.5", "supported_durations": list(range(2, 11)),
+     "supported_aspect_ratios": ["16:9", "9:16"], "supported_resolutions": ["720p"],
+     "supported_frame_images": ["first_frame"], "generate_audio": False, "seed": True,
+     "pricing_skus": {"cents_per_second_output": "12"}},
+    {"id": "x-ai/grok-imagine-video", "name": "SpaceXAI: Grok Imagine Video", "supported_durations": list(range(1, 16)),
+     "supported_aspect_ratios": ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"],
+     "supported_resolutions": ["480p", "720p"], "supported_frame_images": ["first_frame"], "generate_audio": None,
+     "seed": None, "pricing_skus": {"cents_per_image_input": "0.2", "cents_per_video_output_second_480p": "5",
+                                    "cents_per_video_output_second_720p": "7"}},
 )  # fmt: skip
-# USD per second for a silent 720p clip [B]/[C] ("from" prices of the model pages; Kling v3.0 std without
-# audio). Also the price of a live listing entry whose pricing_skus cannot be read.
-STATIC_PRICES: dict[str, float] = {
-    "google/veo-3.1-lite": 0.05,
-    "google/veo-3.1-fast": 0.10,
-    "kwaivgi/kling-v3.0-std": 0.084,
-    "kwaivgi/kling-video-o1": 0.112,
-    "minimax/hailuo-2.3": 0.0817,
-    "alibaba/wan-2.7": 0.10,
-}
-_STATIC_DURATIONS: dict[str, list[float]] = {
-    str(entry["id"]): [float(d) for d in entry["supported_durations"]] for entry in FALLBACK_MODELS
-}
+# USD per second (text-to-video, silent, base resolution) of the built-in entries, filled in below once the
+# parser exists. Prices a running job whose model left the listing (see _resume_model).
+STATIC_PRICES: dict[str, float] = {}
 
 
 # --- small helpers ---------------------------------------------------------------------------------------------
@@ -180,42 +205,284 @@ def _flag(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _resolution_token(sku: str) -> str | None:
-    for token in re.split(r"[-_:\s/]+", sku.lower()):
-        if token in _RESOLUTION_TOKENS:
-            return token
+# --- pricing_skus -------------------------------------------------------------------------------------------------
+#
+# ``pricing_skus`` maps SKU names to price strings ("Pricing SKUs with provider prefix stripped, values as
+# strings" [A]). The names are not documented; these families were seen in the real listing (2026-10-13):
+#
+#   duration_seconds[_with_audio|_without_audio][_<res>]               USD per output second
+#   text_to_video_duration_seconds_<res> / image_to_video_…_<res>       USD per output second, for that mode only
+#   cents_per_second_output[_<res>], cents_per_video_output_second_<res>  US cents per output second
+#   minimum_cents_per_generation                                        US cents, minimum per clip
+#   cents_per_image_input                                               US cents per input image (image-to-video)
+#   reference_duration_seconds_<res>, reference_images                  reference inputs (never sent): ignored
+#   cents_per_second_video_continuation_<res>                           continuing an earlier video: ignored
+#   cents_per_megapixel_second_*                                        upscalers (never offered): ignored
+#   video_tokens[_…]                                                    USD per token: not supported yet
+#
+# Anything else is unknown and never guessed (docs/VIDEO_PROVIDERS.md §8.3).
+
+_MAX_SKUS = 64
+_SKU_SUFFIX = re.compile(r"(?:_(?P<a1>with_audio|without_audio))?(?:_(?P<res>\d+p|\d+k))?"
+                         r"(?:_(?P<a2>with_audio|without_audio))?")  # fmt: skip
+# (name before the optional audio/resolution suffix, family, value in US cents?)
+_SKU_FAMILIES: tuple[tuple[re.Pattern[str], str, bool], ...] = (
+    (re.compile(r"(?:(?P<mode>text_to_video|image_to_video)_)?duration_seconds"), "output", False),
+    (re.compile(r"cents_per_second_output"), "output", True),
+    (re.compile(r"cents_per_video_output_second"), "output", True),
+    (re.compile(r"minimum_cents_per_generation"), "minimum", True),
+    (re.compile(r"cents_per_image_input"), "image_input", True),
+)
+_SKU_IGNORED = re.compile(r"reference_(?:duration_seconds|images)|cents_per_second_video_continuation"
+                          r"|cents_per_megapixel_second")  # fmt: skip
+_SKU_TOKENS = re.compile(r"video_tokens(?:_[a-z0-9]+)*")
+# Plausible USD range per family: the only guard against a listing in the wrong unit, since the unit comes
+# from the SKU name alone ("cents_per_second_output": "0.12" would be $0.0012/s, "duration_seconds": "12"
+# $12/s). The real listing (2026-10-13) spans $0.02–$0.60 per output second, a $0.56 minimum and
+# $0.002–$0.01 per input image. A value outside its range is never used: the price is unknown instead.
+_PLAUSIBLE_USD: dict[str, tuple[Decimal, Decimal, str, str]] = {
+    "output": (Decimal("0.005"), Decimal(3), "/秒", "1 秒あたりの料金"),
+    "minimum": (Decimal("0.01"), Decimal(20), "/本", "1 本あたりの最低料金"),
+    "image_input": (Decimal("0.0005"), Decimal(1), "/枚", "入力画像 1 枚あたりの料金"),
+}
+
+
+def _dec(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+@dataclass(frozen=True)
+class _Sku:
+    key: str
+    family: str  # "output" | "minimum" | "image_input" | "tokens" | "ignored"
+    value: Decimal | None  # as listed; None = unreadable (not a number, negative)
+    raw: str = ""  # the listed value as JSON (shortened), for notes
+    cents: bool = False  # the value is in US cents
+    resolution: str | None = None  # lower case ("720p", "2k"); None = not stated
+    mode: str | None = None  # "text_to_video" | "image_to_video"; None = both
+    audio: str | None = None  # "with" | "without"; None = not stated
+    video_input: bool = False  # token SKU for requests with an input video
+
+    @property
+    def usd(self) -> Decimal:
+        if self.value is None:
+            raise ValueError(f"unreadable SKU value: {self.key}")
+        return self.value / 100 if self.cents else self.value
+
+    def text(self, per: str) -> str:
+        """``cents_per_second_output: 12¢ = $0.12/秒`` or ``duration_seconds_720p: $0.08/秒``."""
+        if self.value is None:
+            return f"{self.key}: {self.raw}"
+        if self.cents:
+            return f"{self.key}: {_dec(self.value)}¢ = ${_dec(self.value / 100)}{per}"
+        return f"{self.key}: ${_dec(self.value)}{per}"
+
+
+def _sku_value(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        number = Decimal(str(value).strip())
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    return Decimal(0) if number.is_zero() else number  # "-0" / "0.00" → 0 (never shown as "$-0")
+
+
+def _raw_value(value: Any) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = type(value).__name__
+    return text if len(text) <= 24 else text[:23] + "…"
+
+
+def _parse_sku(key: str, value: Any) -> _Sku | None:
+    """One ``pricing_skus`` entry (``value`` None when it cannot be read), or ``None`` for an unknown family."""
+    name = key.strip().lower()
+    number = _sku_value(value)
+    raw = _raw_value(value)
+    if _SKU_IGNORED.match(name):
+        return _Sku(key, "ignored", number, raw)
+    if _SKU_TOKENS.fullmatch(name):
+        return _Sku(key, "tokens", number, raw, video_input="with_video_input" in name)
+    for pattern, family, cents in _SKU_FAMILIES:
+        head = pattern.match(name)
+        suffix = _SKU_SUFFIX.fullmatch(name[head.end():]) if head else None
+        if head is None or suffix is None or (suffix["a1"] and suffix["a2"]):
+            continue
+        audio = (suffix["a1"] or suffix["a2"] or "").removesuffix("_audio") or None
+        mode = head.groupdict().get("mode")
+        return _Sku(key, family, number, raw, cents, suffix["res"], mode, audio)
     return None
 
 
-def sku_price_per_second(skus: Any, resolution: str | None) -> tuple[float | None, str | None, bool]:
-    """``(USD per second, SKU used, resolution-specific?)`` from a VideoModel's ``pricing_skus`` [A].
+def _unusable_value(sku: _Sku) -> str | None:
+    """Why the listed value of an applicable SKU cannot be used (Japanese), or ``None`` when it can.
 
-    The key names are not documented beyond the example ``per-video-second`` /
-    ``per-video-second-1080p`` [B], so (docs/VIDEO_PROVIDERS.md §8.3, [C]):
-    per-second SKUs (key contains "second", value parses as a number) for the
-    requested resolution win, else those naming no resolution; silent-audio
-    SKUs are preferred (audio is always turned off when possible); among the
-    rest the **highest** price is taken so the estimate is never too low.
+    Unreadable, zero (per second) and implausible values make the price unknown: falling back to another
+    SKU could price the clip too low, and a $0 price would reserve no budget.
     """
-    if not isinstance(skus, Mapping):
-        return None, None, False
-    entries: list[tuple[str, float]] = []
-    for key, value in skus.items():
-        name = str(key)
-        price = _num(value)
-        if "second" in name.lower() and price is not None and price >= 0:
-            entries.append((name, price))
-    if not entries:
-        return None, None, False
+    if sku.value is None:
+        return (f"料金項目 {sku.key} の値 {sku.raw} を読み取れません。ほかの項目で代わりに見積もると"
+                "安く見積もるおそれがあるため、推測しません")  # fmt: skip
+    low, high, per, what = _PLAUSIBLE_USD[sku.family]
+    if sku.family == "output" and sku.value.is_zero():
+        return f"{sku.key} が 0 と記載されていますが、無料かどうかを確認できません"
+    if low <= sku.usd <= high:
+        return None
+    return (f"{sku.text(per)} は、{what}として想定の範囲（${_dec(low)}〜${_dec(high)}{per}）を外れています。"
+            "ドルとセントの取り違えなど、モデル一覧の誤りの可能性があります")  # fmt: skip
+
+
+@dataclass(frozen=True)
+class SkuPrice:
+    """The price of one clip according to ``pricing_skus`` (see :func:`price_from_skus`)."""
+
+    usd_per_second: float | None  # None: unknown (the model cannot be used: no budget can be reserved)
+    sku: str | None = None  # key of the per-second price
+    resolution_specific: bool = False  # that SKU names the requested resolution
+    text: str = ""  # e.g. "cents_per_second_output: 12¢ = $0.12/秒"
+    audio: str | None = None  # audio of that SKU: "with" | "without" | None (not stated)
+    audio_note: str | None = None  # why a with-audio price is used (Japanese)
+    min_clip_usd: float = 0.0  # minimum_cents_per_generation
+    min_text: str | None = None
+    image_input_usd: float = 0.0  # cents_per_image_input (image-to-video only)
+    image_text: str | None = None
+    problem: str | None = None  # why the price is unknown (Japanese)
+    # The listing states a price for this request that cannot be used (unreadable, $0 or implausible),
+    # as opposed to stating none: no other resolution is tried in its place.
+    broken: bool = False
+    unreadable: tuple[str, ...] = ()  # SKUs of no known family / with unreadable values (left out)
+
+    @property
+    def known(self) -> bool:
+        return self.usd_per_second is not None
+
+
+def _with_audio_note(
+    parsed: Sequence[_Sku], resolution: str | None, specific: bool, mode: str, generate_audio: bool | None
+) -> str:
+    """Why a with-audio SKU prices the clip (Japanese)."""
+    if generate_audio is not True:
+        return "音声をオフにする指定（generate_audio）にモデルが対応していないため、音声ありの料金で見積もります"
+    silent = [s for s in parsed if s.family == "output" and s.audio == "without"]
+    if not silent:
+        return "無音の料金がモデル一覧にないため、音声ありの料金で見積もります"
+    # A silent SKU that applied would have been chosen: these are for no resolution (while ``resolution``
+    # has its own SKU), for other resolutions or for the other mode.
+    generic = [s for s in silent if specific and s.resolution is None and s.mode in (None, mode)]
+    if generic:
+        listed = "、".join(s.text("/秒") for s in generic[:2])
+        return (f"解像度を指定しない無音の料金（{listed}）はありますが、{resolution} 専用の料金を優先するため、"
+                f"{resolution} の音声ありの料金で見積もります（実際より高めの場合があります）")  # fmt: skip
+    listed = "、".join(s.key for s in silent[:3])
+    return (f"無音の料金はほかの解像度または生成方法のもの（{listed}）だけのため、音声ありの料金で見積もります"
+            "（実際より高めの場合があります）")  # fmt: skip
+
+
+def price_from_skus(
+    skus: Any, resolution: str | None, *, image_to_video: bool = False, generate_audio: bool | None = True
+) -> SkuPrice:
+    """The price of one clip of ``resolution`` from a VideoModel's ``pricing_skus`` (families above).
+
+    * Mode: ``text_to_video_*`` / ``image_to_video_*`` SKUs apply to that mode only, the others to both.
+    * Resolution: SKUs naming ``resolution`` win, else those naming none (never another resolution's).
+    * Audio: ``generate_audio: true`` means audio can be turned off (and always is): silent
+      (``without_audio``) SKUs first, then those not stating audio, then ``with_audio``. Otherwise audio
+      cannot be turned off from here: SKUs not stating audio, then ``with_audio``; never ``without_audio``.
+    * Among equally good SKUs the mode-specific one wins, then the highest price (never too low).
+    * Per clip: ``minimum_cents_per_generation`` (the clip costs at least that) and, for image-to-video
+      only, ``cents_per_image_input``; a $0 one is no charge.
+    * Token prices and unknown families are never turned into a per-second price: when no per-second
+      SKU applies, the price is unknown (``problem`` says why).
+    * A SKU that would be used but whose value is unreadable, $0 per second or outside ``_PLAUSIBLE_USD``
+      makes the price unknown (``broken``): it is never replaced by another SKU, which could be lower.
+    """
+    if not isinstance(skus, Mapping) or not skus:
+        return SkuPrice(None, problem="モデル一覧に料金（pricing_skus）の記載がありません")
+    parsed: list[_Sku] = []
+    unreadable: list[str] = []
+    for key, value in list(skus.items())[:_MAX_SKUS]:
+        sku = _parse_sku(str(key), value)
+        if sku is None or sku.value is None:
+            unreadable.append(str(key)[:60])
+        if sku is not None:
+            parsed.append(sku)
+    left_out = tuple(unreadable)
+    mode = "image_to_video" if image_to_video else "text_to_video"
     wanted = resolution.lower() if resolution else None
-    specific = [(k, p) for k, p in entries if wanted and _resolution_token(k) == wanted]
-    generic = [(k, p) for k, p in entries if _resolution_token(k) is None]
-    pool = specific or generic
-    if not pool:
-        return None, None, False
-    silent = [(k, p) for k, p in pool if _SILENT_SKU.search(k)]
-    key, price = max(silent or pool, key=lambda item: item[1])
-    return price, key, bool(specific)
+
+    def candidates(family: str, audio: Mapping[str | None, int] | None = None) -> tuple[list[_Sku], bool]:
+        pool = [s for s in parsed if s.family == family and s.mode in (None, mode)
+                and (audio is None or s.audio in audio)]  # fmt: skip
+        specific = [s for s in pool if wanted is not None and s.resolution == wanted]
+        return (specific, True) if specific else ([s for s in pool if s.resolution is None], False)
+
+    def broken(problem: str) -> SkuPrice:
+        return SkuPrice(None, problem=problem, broken=True, unreadable=left_out)
+
+    tokens = [s for s in parsed if s.family == "tokens" and not s.video_input]
+    if tokens:
+        return SkuPrice(None, unreadable=left_out, problem=(
+            f"トークン単位の料金（{tokens[0].text('/トークン')}）にはまだ対応していません。"
+            "1 本あたりのトークン数が分からず、費用を見積もれないため"
+        ))  # fmt: skip
+    ranks: dict[str | None, int] = {"without": 0, None: 1, "with": 2} if generate_audio is True else {None: 0, "with": 1}
+    outputs, specific = candidates("output", ranks)
+    if not outputs:
+        condition = f"{resolution or '解像度の指定なし'}・{'画像→動画' if image_to_video else 'テキスト→動画'}"
+        if generate_audio is not True and candidates("output")[0]:
+            problem = (f"無音の料金しかありませんが、音声をオフにする指定（generate_audio）にモデルが対応していないため"
+                       f"使えません（{condition}）")  # fmt: skip
+        else:
+            listed = ", ".join(str(key)[:60] for key in list(skus)[:8])
+            problem = f"モデル一覧の料金項目（{listed}）に、この条件（{condition}）で使える秒単価がありません"
+        return SkuPrice(None, problem=problem, unreadable=left_out)
+    best = min(ranks[s.audio] for s in outputs)
+    group = [s for s in outputs if ranks[s.audio] == best]
+    if any(s.mode is not None for s in group):  # a mode-specific SKU wins over one for both modes
+        group = [s for s in group if s.mode is not None]
+    for sku in group:  # every one of them could be the highest: an unreadable one blocks the price
+        if sku.value is None:
+            return broken(_unusable_value(sku) or "")
+    chosen = max(group, key=lambda s: (s.usd, s.key))
+    if why := _unusable_value(chosen):
+        return broken(why)
+    per_clip: dict[str, _Sku | None] = {}
+    for family in ("minimum", "image_input") if image_to_video else ("minimum",):
+        pool = candidates(family)[0]
+        for sku in pool:
+            if sku.value is None:
+                return broken(_unusable_value(sku) or "")
+        charge = max((s for s in pool if s.usd > 0), key=lambda s: s.usd, default=None)  # $0: no charge
+        if charge is not None and (why := _unusable_value(charge)):
+            return broken(why)
+        per_clip[family] = charge
+    minimum, image = per_clip.get("minimum"), per_clip.get("image_input")
+    audio_note = _with_audio_note(parsed, resolution, specific, mode, generate_audio) if chosen.audio == "with" else None
+    return SkuPrice(
+        usd_per_second=float(chosen.usd),
+        sku=chosen.key,
+        resolution_specific=specific,
+        text=chosen.text("/秒"),
+        audio=chosen.audio,
+        audio_note=audio_note,
+        min_clip_usd=float(minimum.usd) if minimum else 0.0,
+        min_text=minimum.text("/本") if minimum else None,
+        image_input_usd=float(image.usd) if image else 0.0,
+        image_text=image.text("/枚") if image else None,
+        unreadable=left_out,
+    )
+
+
+def sku_price_per_second(
+    skus: Any, resolution: str | None, *, image_to_video: bool = False, generate_audio: bool | None = True
+) -> tuple[float | None, str | None, bool]:
+    """``(USD per second, SKU used, resolution-specific?)``: shorthand for :func:`price_from_skus`."""
+    price = price_from_skus(skus, resolution, image_to_video=image_to_video, generate_audio=generate_audio)
+    return price.usd_per_second, price.sku, price.resolution_specific
 
 
 def _is_public_host(host: str) -> bool:
@@ -390,13 +657,22 @@ def _save_cache_file(path: Path, base: str, catalogue: Catalogue) -> None:
 # --- model mapping ------------------------------------------------------------------------------------------------
 
 
-def _pick_resolution(resolutions: list[str] | None) -> str | None:
+def _pick_resolution(resolutions: list[str] | None, skus: Any, generate_audio: bool | None) -> str | None:
+    """The resolution to request: the most preferred one the listing prices (else the most preferred one).
+
+    Only a resolution the listing does not price at all is skipped: one whose price is listed but cannot be
+    used (``SkuPrice.broken``: unreadable, $0, implausible) stops the search, so a broken entry is never
+    priced by another resolution's (or the generic) SKU instead.
+    """
     if not resolutions:
         return None
-    for candidate in _RESOLUTION_PREFERENCE:
-        if candidate in resolutions:
+    ordered = [r for r in _RESOLUTION_PREFERENCE if r in resolutions]
+    ordered += [r for r in resolutions if r not in ordered]
+    for candidate in ordered:
+        price = price_from_skus(skus, candidate, generate_audio=generate_audio)
+        if price.known or price.broken:
             return candidate
-    return resolutions[0]
+    return ordered[0]
 
 
 def _vertical_size(resolution: str | None) -> str:
@@ -407,12 +683,47 @@ def _vertical_size(resolution: str | None) -> str:
 
 def _as_of(catalogue: Catalogue) -> str:
     if catalogue.fetched_at is None:
-        return OPENROUTER_RESEARCH_AS_OF
+        return BUILT_IN_LISTING_AS_OF
     return datetime.fromtimestamp(catalogue.fetched_at, tz=UTC).strftime("%Y-%m-%d")
 
 
+def _price_notes(price: SkuPrice, i2v: SkuPrice | None, audio: bool | None, catalogue: Catalogue,
+                 as_of: str) -> list[str]:  # fmt: skip
+    """Japanese notes on where the price comes from (SKU and original unit) and what it assumes."""
+    if not price.known:
+        return [f"料金を確認できません（{price.problem}）。予算を確保できないため使用できません"]
+    if catalogue.source == "fallback":
+        source = (f"組み込みの料金（{price.text}。{BUILT_IN_LISTING_AS_OF} に取得した OpenRouter のモデル一覧の写しで、"
+                  "最新の一覧は取得できていません）")  # fmt: skip
+    else:
+        source = f"OpenRouter のモデル一覧の料金（{price.text}、{as_of} 取得）"
+    notes = [source + "。未検証。実費は完了時の usage.cost で記録します"]
+    if price.min_text:
+        notes.append(f"1 本あたりの最低料金（{price.min_text}）があり、短いクリップはこの額で見積もります")
+    if price.audio_note:
+        notes.append(price.audio_note)
+    if audio is True:
+        notes.append("音声は使わないため無音（generate_audio: false）で生成します")
+    if i2v is not None and i2v.known:
+        if i2v.usd_per_second != price.usd_per_second:
+            notes.append(f"入力画像から生成する場合の秒単価は {i2v.text} です")
+        if i2v.image_text:
+            notes.append(f"入力画像から生成する場合は、入力画像 1 枚ごとに {i2v.image_text} が加わります")
+    elif i2v is not None and i2v.broken:
+        notes.append(f"入力画像からの生成には使えません（{i2v.problem}）")
+    if price.unreadable:
+        notes.append(f"読み取れない料金項目（{', '.join(price.unreadable[:5])}）は見積もりに含めていません")
+    return notes
+
+
 def _models_from_entry(entry: Mapping[str, Any], catalogue: Catalogue) -> tuple[list[ProviderModel], str | None]:
-    """ProviderModels for one listing entry (base + optional ``@1080p``), or ``([], why it is left out)``."""
+    """ProviderModels for one listing entry (base + optional ``@1080p``), or ``([], why it is left out)``.
+
+    Offered only with a non-empty ``supported_durations`` and "9:16" in ``supported_aspect_ratios``:
+    edit / upscale / avatar models list neither, and a missing value is never guessed. A model whose
+    price cannot be read (token pricing, unknown SKU families) is listed with ``price_known=False``
+    and a note, and cannot be used.
+    """
     model_id = str(entry.get("id") or "").strip()
     # ≤ _MAX_MODEL_ID_CHARS so that "<id>@1080p" fits GenerationSettings.model / Clip.model (100 chars).
     if not _MODEL_ID.match(model_id) or "@" in model_id or len(model_id) > _MAX_MODEL_ID_CHARS:
@@ -420,70 +731,55 @@ def _models_from_entry(entry: Mapping[str, Any], catalogue: Catalogue) -> tuple[
     if entry.get("upscale_factor") or entry.get("creativity"):
         return [], "upscaler"
     ratios = _str_list(entry.get("supported_aspect_ratios"))
-    if ratios is not None and "9:16" not in ratios:
+    if not ratios or "9:16" not in ratios:
         return [], "no 9:16"
     listed_durations = entry.get("supported_durations")
     raw_durations: list[Any] = listed_durations if isinstance(listed_durations, list) else []
     durations = sorted({d for d in (_num(v) for v in raw_durations) if d is not None and 0 < d <= 60})
-    durations_known = bool(durations)
     if not durations:
-        durations = list(_STATIC_DURATIONS.get(model_id, [5.0]))
+        return [], "no durations"
     resolutions = _str_list(entry.get("supported_resolutions"))
     frames = _str_list(entry.get("supported_frame_images")) or []
     audio = _flag(entry.get("generate_audio"))
     seed = _flag(entry.get("seed"))
     name = str(entry.get("name") or model_id).strip()[:80] or model_id
-    base_resolution = _pick_resolution(resolutions)
     skus = entry.get("pricing_skus")
+    base_resolution = _pick_resolution(resolutions, skus, audio)
     variants = [base_resolution]
     if resolutions and "1080p" in resolutions and base_resolution != "1080p":
-        price, _, specific = sku_price_per_second(skus, "1080p")
-        if price is not None and specific:  # only when 1080p has its own price (never guess it low)
+        hd = price_from_skus(skus, "1080p", generate_audio=audio)
+        if hd.known and hd.resolution_specific:  # only when 1080p has its own price (never guess it)
             variants.append("1080p")
     as_of = _as_of(catalogue)
     models: list[ProviderModel] = []
     for resolution in variants:
-        price, sku, _ = sku_price_per_second(skus, resolution)
-        if price is not None:
-            price_source = "listing"
-            price_text = f"OpenRouter のモデル一覧の料金（{sku}: ${price:g}/秒、{as_of} 取得）"
-        elif model_id in STATIC_PRICES and resolution in (None, base_resolution):
-            price = STATIC_PRICES[model_id]
-            price_source = "table"
-            price_text = (
-                f"${price:g}/秒（{OPENROUTER_RESEARCH_AS_OF} 時点のモデルページの調査値。"
-                + ("モデル一覧を取得できないため組み込みの候補を表示しています）" if catalogue.source == "fallback"
-                   else "モデル一覧の料金を読み取れなかったため）")
-            )  # fmt: skip
-        else:
-            price_source = "unknown"
-            price_text = "料金を確認できません（モデル一覧に読み取れる料金がなく、調査値もありません）。予算を確保できないため使用できません"
-        notes = [price_text + "。未検証。実費は完了時の usage.cost で記録します" if price is not None else price_text]
-        if audio is True:
-            notes.append("音声は使わないため無音（generate_audio: false）で生成します")
-        if ratios is None:
-            notes.append("9:16 に対応しているかはモデル一覧に記載がありません（未対応ならリクエストの時点で拒否されます）")
-        if not durations_known:
-            notes.append(f"対応する秒数がモデル一覧にないため {', '.join(f'{d:g}' for d in durations)} 秒で要求します（未確認）")
+        price = price_from_skus(skus, resolution, generate_audio=audio)
+        i2v = (price_from_skus(skus, resolution, image_to_video=True, generate_audio=audio)
+               if "first_frame" in frames else None)  # fmt: skip
+        notes = _price_notes(price, i2v, audio, catalogue, as_of)
         if resolution is None:
             notes.append("解像度はモデル一覧に記載がないため、提供元の既定です")
         elif resolution in _LOW_RESOLUTIONS:
             notes.append(f"出力が {resolution} のため、1080×1920 に拡大すると画質が下がります")
+        if price.known:
+            price_source = "built_in" if catalogue.source == "fallback" else "listing"
+        else:
+            price_source = "unknown"
         model = ProviderModel(
             id=model_id if resolution == base_resolution else f"{model_id}@{resolution}",
             name=name if resolution == base_resolution else f"{name}（{resolution}）",
             clip_durations=durations,
             max_clip_duration=max(durations),
             resolution=_vertical_size(resolution),
-            supports_vertical=ratios is not None,
-            price_per_second_usd=float(price) if price is not None else 0.0,
+            supports_vertical=True,
+            price_per_second_usd=price.usd_per_second if price.usd_per_second is not None else 0.0,
             price_note="。".join(notes),
             verified=False,
             default_duration=snap_duration(durations, max(durations), 5.0),
             text_to_video=True,
-            image_to_video="first_frame" in frames,
+            image_to_video=i2v is not None and i2v.known,
             source_url=f"https://openrouter.ai/{model_id}",
-            as_of=as_of if price_source == "listing" else OPENROUTER_RESEARCH_AS_OF,
+            as_of=as_of,
             params={
                 "api_model": model_id,
                 "resolution": resolution,
@@ -492,10 +788,15 @@ def _models_from_entry(entry: Mapping[str, Any], catalogue: Catalogue) -> tuple[
                 "seed": seed,
                 "frame_images": frames,
                 "price_source": price_source,
-                "price_sku": sku,
+                "price_sku": price.sku,
+                # image-to-video (ClipRequest.image_path): its own per-second SKU + the input image charge
+                "image_to_video_price_per_second": i2v.usd_per_second if i2v is not None else None,
+                "image_to_video_price_sku": i2v.sku if i2v is not None else None,
+                "image_input_usd": i2v.image_input_usd if i2v is not None else 0.0,
                 "catalogue": catalogue.source,
             },
-            price_known=price is not None,
+            price_known=price.known,
+            min_clip_usd=price.min_clip_usd,
         )
         models.append(model)
     return models, None
@@ -518,6 +819,13 @@ def _parse_catalogue(catalogue: Catalogue) -> list[ProviderModel]:
         catalogue._models = models
         catalogue._excluded = excluded
     return catalogue._models
+
+
+STATIC_PRICES.update(
+    (model.id, model.price_per_second_usd)
+    for model in _parse_catalogue(Catalogue(FALLBACK_MODELS, "fallback", None))
+    if model.price_known and "@" not in model.id
+)
 
 
 # --- provider -------------------------------------------------------------------------------------------------------
@@ -607,21 +915,26 @@ class OpenRouterProvider(ApiVideoProvider):
     def info(self) -> dict[str, Any]:
         info = super().info()
         catalogue = self.catalogue()
-        _parse_catalogue(catalogue)
+        models = _parse_catalogue(catalogue)
         fetched = (datetime.fromtimestamp(catalogue.fetched_at, tz=UTC).isoformat()
                    if catalogue.fetched_at is not None else None)  # fmt: skip
+        built_in = f"組み込みの候補（{BUILT_IN_LISTING_AS_OF} に取得したモデル一覧の一部の写し・未検証）"
         if catalogue.source == "fallback":
             note = (
-                "モデル一覧（GET /videos/models）を取得できないため、組み込みの候補（検索による調査値・未検証）を表示しています。"
+                f"モデル一覧（GET /videos/models）を取得できないため、{built_in}を表示しています。"
                 if get_settings().OPENROUTER_API_KEY
-                else "OPENROUTER_API_KEY が未設定のため、組み込みの候補（検索による調査値・未検証）を表示しています。"
+                else f"OPENROUTER_API_KEY が未設定のため、{built_in}を表示しています。"
             )
         else:
             note = f"OpenRouter のモデル一覧（{fetched[:10] if fetched else '不明'} 取得）より。"
             if catalogue.stale:
                 note += "一覧を更新できなかったため、最新ではない可能性があります。"
         if catalogue._excluded:
-            note += f"9:16 に対応していないモデルなど {catalogue._excluded} 件は表示していません。"
+            note += (f"9:16 に対応していない、または秒数を指定できない（編集・アップスケール・アバター用など）モデル "
+                     f"{catalogue._excluded} 件は表示していません。")  # fmt: skip
+        unpriced = sum(not m.price_known for m in models)
+        if unpriced:
+            note += f"料金を見積もれないモデル（トークン単位の料金など）{unpriced} 件は選べません。"
         info.update({"models_source": catalogue.source, "models_fetched_at": fetched, "models_note": note})
         return info
 
@@ -676,6 +989,17 @@ class OpenRouterProvider(ApiVideoProvider):
         if status == 413:
             return ProviderError(f"{self.name}: {what}に失敗しました（リクエストが大きすぎます。入力画像を小さくしてください{suffix}",
                                  retryable=False, code="provider_bad_input")  # fmt: skip
+        if status == 404 and no_provider_error(status, detail) and _POLICY_EXCLUSION.search(detail):
+            # Seen live (2026-10-13): an account that enforces ZDR gets 404 "0 endpoints … matching your
+            # guardrail restrictions and data policy … ZDR violation (account settings)" — video
+            # generation is not ZDR-eligible, so every endpoint is excluded before anything is billed.
+            # A 503 "No available provider" stays a retryable outage (classify_http_status below).
+            return ProviderError(
+                f"{self.name}: {what}に失敗しました（OpenRouter アカウントのプライバシー設定（ZDR のみ許可・"
+                f"ガードレールなど）により、このモデルの提供元がすべて除外されました。動画生成はゼロデータ保持（ZDR）の"
+                f"対象外です。https://openrouter.ai/settings/privacy で ZDR の強制を外すか、別のモデルを選んでください{suffix}",
+                retryable=False, code="provider_policy_blocked",
+            )  # fmt: skip
         retryable, code, summary = classify_http_status(status)
         return ProviderError(f"{self.name}: {what}に失敗しました（{summary}{suffix}", retryable=retryable, code=code)
 
@@ -730,7 +1054,17 @@ class OpenRouterProvider(ApiVideoProvider):
         if isinstance(ratios, list) and req.aspect_ratio not in ratios:
             raise ProviderError(f"{model.name} はアスペクト比 {req.aspect_ratio} に対応していません", retryable=False,
                                 code="provider_bad_input")  # fmt: skip
-        return model, duration
+        return (self._image_to_video_model(model) if req.image_path else model), duration
+
+    @staticmethod
+    def _image_to_video_model(model: ProviderModel) -> ProviderModel:
+        """``model`` priced for an image-to-video request: its own per-second SKU (e.g. Wan 2.6
+        ``image_to_video_duration_seconds_720p``) plus ``cents_per_image_input`` for the first frame."""
+        price = _num(model.params.get("image_to_video_price_per_second"))
+        if price is None or price < 0:
+            return model
+        extra = _num(model.params.get("image_input_usd")) or 0.0
+        return replace(model, price_per_second_usd=price, extra_clip_usd=max(0.0, extra))
 
     def _prepare_resume(self, req: ClipRequest, *, submitted_usd: float | None = None) -> tuple[ProviderModel, float]:
         """Follow an existing job whatever the listing says now (it only governs new submissions).
@@ -738,7 +1072,7 @@ class OpenRouterProvider(ApiVideoProvider):
         The listed model is used while it is listed with a price. When it left the listing, lost its
         readable price or no longer qualifies (e.g. 9:16 dropped), a minimal unverified model is built
         from ``req.model`` instead — polling and downloading need only the job id — priced with
-        ``submitted_usd`` (the job's estimate at submission), else the static research price. No
+        ``submitted_usd`` (the job's estimate at submission), else the built-in list's price. No
         submission checks apply: the job runs and is billed whether or not it is followed.
         """
         configured, reason = self.is_configured()
@@ -749,7 +1083,7 @@ class OpenRouterProvider(ApiVideoProvider):
         except ProviderError:
             listed = None
         if listed is not None and listed.price_known:
-            return listed, listed.snap_duration(req.duration)
+            return (self._image_to_video_model(listed) if req.image_path else listed), listed.snap_duration(req.duration)
         model = self._resume_model(req, listed, submitted_usd)
         return model, model.snap_duration(req.duration)
 
@@ -765,7 +1099,7 @@ class OpenRouterProvider(ApiVideoProvider):
             note = "ジョブ投入時の見積もり額"
         elif api_model in STATIC_PRICES:
             price = STATIC_PRICES[api_model]
-            note = f"{OPENROUTER_RESEARCH_AS_OF} 時点の調査値"
+            note = f"組み込みの一覧（{BUILT_IN_LISTING_AS_OF} 取得）の単価"
         else:
             price = None
             note = "料金不明"
@@ -786,7 +1120,7 @@ class OpenRouterProvider(ApiVideoProvider):
             verified=False,
             default_duration=duration,
             source_url=f"https://openrouter.ai/{api_model}",
-            as_of=OPENROUTER_RESEARCH_AS_OF,
+            as_of=BUILT_IN_LISTING_AS_OF,
             params={
                 "api_model": api_model,
                 "resolution": variant or None,

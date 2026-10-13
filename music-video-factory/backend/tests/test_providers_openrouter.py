@@ -92,7 +92,7 @@ def _video_model(model_id: str = MODEL, **overrides: Any) -> dict[str, Any]:
         "supported_durations": [4, 6, 8], "supported_aspect_ratios": ["16:9", "9:16"],
         "supported_resolutions": ["720p", "1080p"], "supported_sizes": ["720x1280", "1280x720"],
         "supported_frame_images": ["first_frame", "last_frame"], "generate_audio": True, "seed": True,
-        "allowed_passthrough_parameters": [], "pricing_skus": {"per-video-second": "0.05"},
+        "allowed_passthrough_parameters": [], "pricing_skus": {"duration_seconds": "0.05"},
         "creativity": None, "upscale_factor": None,
     }  # fmt: skip
     entry.update(overrides)
@@ -132,16 +132,18 @@ def _completed(cost: float | None = 0.31, **extra: Any) -> httpx.Response:
 @pytest.mark.parametrize(
     ("skus", "resolution", "expected"),
     [
-        ({"per-video-second": "0.50", "per-video-second-1080p": "0.75"}, "720p", (0.5, "per-video-second", False)),
-        ({"per-video-second": "0.50", "per-video-second-1080p": "0.75"}, "1080p", (0.75, "per-video-second-1080p", True)),
-        ({"per-video-second-with-audio": "0.126", "per-video-second-no-audio": "0.084"}, "720p",
-         (0.084, "per-video-second-no-audio", False)),
-        ({"per-video-second-a": "0.10", "per-video-second-b": "0.12"}, "720p", (0.12, "per-video-second-b", False)),
-        ({"per-video-second-480p": "0.06", "per-video-second-1080p": "0.2"}, "720p", (None, None, False)),
-        ({"per-video-second": "free", "per-video": "0.5"}, "720p", (None, None, False)),
-        ({"per-video-second": "-1"}, None, (None, None, False)),
+        ({"duration_seconds": "0.50", "duration_seconds_1080p": "0.75"}, "720p", (0.5, "duration_seconds", False)),
+        ({"duration_seconds": "0.50", "duration_seconds_1080p": "0.75"}, "1080p", (0.75, "duration_seconds_1080p", True)),
+        ({"duration_seconds_with_audio": "0.126", "duration_seconds_without_audio": "0.084"}, "720p",
+         (0.084, "duration_seconds_without_audio", False)),
+        ({"cents_per_second_output": "12"}, "720p", (0.12, "cents_per_second_output", False)),
+        ({"duration_seconds_480p": "0.06", "duration_seconds_1080p": "0.2"}, "720p", (None, None, False)),
+        # Unknown families (the documentation's example names included) are never guessed.
+        ({"per-video-second": "0.50", "per-video-second-1080p": "0.75"}, "720p", (None, None, False)),
+        ({"duration_seconds": "free", "per-video": "0.5"}, "720p", (None, None, False)),
+        ({"duration_seconds": "-1"}, None, (None, None, False)),
         (None, "720p", (None, None, False)),
-        ({"per-video-second": 0.07}, None, (0.07, "per-video-second", False)),
+        ({"duration_seconds": 0.07}, None, (0.07, "duration_seconds", False)),
     ],
 )  # fmt: skip
 def test_sku_price_per_second(skus: Any, resolution: str | None, expected: tuple[Any, ...]) -> None:
@@ -154,15 +156,19 @@ def test_sku_price_per_second(skus: Any, resolution: str | None, expected: tuple
 @respx.mock
 def test_listing_maps_models_and_leaves_out_unusable_entries(provider: OpenRouterProvider) -> None:
     route = respx.get(MODELS_URL).mock(return_value=_listing(
-        _video_model(pricing_skus={"per-video-second": "0.40", "per-video-second-1080p": "0.60"}),
+        _video_model(pricing_skus={"duration_seconds_without_audio_720p": "0.40",
+                                   "duration_seconds_without_audio_1080p": "0.60"}),
         _video_model("vendor/landscape-only", supported_aspect_ratios=["16:9"]),
         _video_model("vendor/upscaler", upscale_factor={"min": 2, "max": 4}, creativity=[1, 2]),
-        {"id": "vendor/bare-minimum", "name": "Bare"},
+        {"id": "vendor/bare-minimum", "name": "Bare"},  # no aspect ratios, no durations
+        _video_model("vendor/editor", supported_durations=None),  # edit models list no durations
+        _video_model("vendor/ratios-unknown", supported_aspect_ratios=None),
         _video_model("kwaivgi/kling-v3.0-std", name="Kling v3.0 std", supported_durations=list(range(3, 16)),
                      supported_resolutions=["720p"], seed=None,
-                     pricing_skus={"per-video-second-with-audio": "0.126", "per-video-second-no-audio": "0.084"}),
+                     pricing_skus={"duration_seconds": "0.084", "duration_seconds_with_audio": "0.126"}),
         _video_model("kwaivgi/kling-video-o1", supported_durations=[5, 10], supported_resolutions=["720p"],
-                     pricing_skus={"per-video-second": "n/a"}, supported_frame_images=None),
+                     pricing_skus={"duration_seconds": "n/a"}, supported_frame_images=None),
+        _video_model("vendor/tokens", pricing_skus={"video_tokens": "0.000007"}),
         _video_model("vendor/low-res", supported_resolutions=["480p"], generate_audio=False),
         "not-a-model",
     ))  # fmt: skip
@@ -170,35 +176,36 @@ def test_listing_maps_models_and_leaves_out_unusable_entries(provider: OpenRoute
     request = route.calls.last.request
     assert request.headers["authorization"] == f"Bearer {KEY}"
     assert request.headers["x-openrouter-title"] == "AI Music Video Factory"
-    assert set(models) == {MODEL, f"{MODEL}@1080p", "vendor/bare-minimum", "kwaivgi/kling-v3.0-std",
-                           "kwaivgi/kling-video-o1", "vendor/low-res"}  # fmt: skip
+    assert set(models) == {MODEL, f"{MODEL}@1080p", "kwaivgi/kling-v3.0-std", "kwaivgi/kling-video-o1",
+                           "vendor/tokens", "vendor/low-res"}  # fmt: skip
 
     veo = models[MODEL]
     assert (veo.price_per_second_usd, veo.clip_durations, veo.default_duration) == (0.40, [4.0, 6.0, 8.0], 6.0)
     assert veo.resolution == "720x1280" and veo.supports_vertical and veo.image_to_video and veo.text_to_video
     assert veo.verified is False and veo.price_known and veo.params["resolution"] == "720p"
-    assert "per-video-second" in veo.price_note and "未検証" in veo.price_note and "generate_audio" in veo.price_note
+    assert "duration_seconds_without_audio_720p: $0.4/秒" in veo.price_note
+    assert "未検証" in veo.price_note and "generate_audio" in veo.price_note
     assert veo.as_of == "2026-10-12" and veo.source_url == f"https://openrouter.ai/{MODEL}"
     hd = models[f"{MODEL}@1080p"]
     assert hd.price_per_second_usd == 0.60 and hd.resolution == "1080x1920" and hd.params["api_model"] == MODEL
 
-    bare = models["vendor/bare-minimum"]
-    assert bare.price_known is False and bare.supports_vertical is False and bare.clip_durations == [5.0]
-    assert "料金を確認できません" in bare.price_note and "9:16" in bare.price_note and "5 秒" in bare.price_note
-    info = next(m for m in provider.info()["models"] if m["id"] == "vendor/bare-minimum")
-    assert info["price_per_second_usd"] is None and info["price_known"] is False
-    assert provider.check_model("vendor/bare-minimum") == (False, provider.check_model("vendor/bare-minimum")[1])
-    assert "料金を確認できない" in (provider.check_model("vendor/bare-minimum")[1] or "")
-
     kling = models["kwaivgi/kling-v3.0-std"]
     assert kling.price_per_second_usd == 0.084 and kling.default_duration == 5.0 and kling.max_clip_duration == 15
-    o1 = models["kwaivgi/kling-video-o1"]  # unreadable SKU → the researched table price
-    assert o1.price_per_second_usd == 0.112 and o1.params["price_source"] == "table" and not o1.image_to_video
-    assert "読み取れなかった" in o1.price_note
+    # An unreadable price is never replaced by a guess: listed, but it cannot be used.
+    o1 = models["kwaivgi/kling-video-o1"]
+    assert o1.price_known is False and o1.params["price_source"] == "unknown" and not o1.image_to_video
+    assert "料金を確認できません" in o1.price_note and "duration_seconds" in o1.price_note
+    info = next(m for m in provider.info()["models"] if m["id"] == "kwaivgi/kling-video-o1")
+    assert info["price_per_second_usd"] is None and info["price_known"] is False
+    usable, reason = provider.check_model("kwaivgi/kling-video-o1")
+    assert usable is False and "料金を確認できない" in (reason or "")
+    tokens = models["vendor/tokens"]
+    assert tokens.price_known is False and "トークン単位の料金" in tokens.price_note
     assert "画質が下がります" in models["vendor/low-res"].price_note
 
     info = provider.info()
-    assert info["models_source"] == "live" and info["configured"] and "2 件は表示していません" in info["models_note"]
+    assert info["models_source"] == "live" and info["configured"] and "5 件は表示していません" in info["models_note"]
+    assert "2 件は選べません" in info["models_note"]
     assert info["default_model"] == MODEL and info["models"][0]["id"] == MODEL
     assert route.call_count == 1  # cached in memory
 
@@ -237,7 +244,7 @@ def test_listing_failure_uses_built_in_list_and_backs_off(set_env: Callable[...,
         provider.models()
         assert route.call_count == 1  # backing off, no request storm
         clock.wall += 301
-        route.mock(return_value=_listing(_video_model(pricing_skus={"per-video-second": "0.06"})))
+        route.mock(return_value=_listing(_video_model(pricing_skus={"duration_seconds": "0.06"})))
         assert provider.catalogue().source == "live" and provider.get_model(MODEL).price_per_second_usd == 0.06
         assert route.call_count == 2
 
@@ -245,7 +252,7 @@ def test_listing_failure_uses_built_in_list_and_backs_off(set_env: Callable[...,
 def test_failed_refresh_keeps_the_stale_listing(set_env: Callable[..., Any], clock: FakeClock) -> None:
     set_env(OPENROUTER_API_KEY=KEY, OPENROUTER_MODELS_CACHE_TTL="600")
     with respx.mock(assert_all_called=False) as router:
-        route = router.get(MODELS_URL).mock(return_value=_listing(_video_model(pricing_skus={"per-video-second": "0.07"})))
+        route = router.get(MODELS_URL).mock(return_value=_listing(_video_model(pricing_skus={"duration_seconds": "0.07"})))
         provider = _make(clock)
         assert provider.get_model(MODEL).price_per_second_usd == 0.07
         clock.wall += 700
@@ -386,6 +393,32 @@ def test_submit_http_errors(
     assert not isinstance(info.value, ProviderTaskError)  # no job exists: nothing billed, nothing reported
     assert (info.value.retryable, info.value.code) == (retryable, code) and text in info.value.message
     assert "nope" in info.value.message and submitted == []
+
+
+@respx.mock
+def test_account_privacy_policy_rejection_is_explained(provider: OpenRouterProvider, tmp_path: Path) -> None:
+    # Body as returned live on 2026-10-13 by an account that enforces ZDR (video is not ZDR-eligible).
+    message = ("0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy. "
+               "We removed them for the following reasons (an endpoint may have matched multiple reasons): "
+               "ZDR violation (account settings): 1 endpoint excluded; configurable at "
+               "https://openrouter.ai/settings/privacy")  # fmt: skip
+    respx.get(MODELS_URL).mock(return_value=_listing())
+    respx.post(SUBMIT_URL).mock(return_value=httpx.Response(404, json={"error": {"code": 404, "message": message}}))
+    with pytest.raises(ProviderError) as info:
+        provider.generate(_req(), str(tmp_path / "clip.mp4"))
+    assert not isinstance(info.value, ProviderTaskError)  # rejected before a job existed: nothing billed
+    assert (info.value.retryable, info.value.code) == (False, "provider_policy_blocked")
+    assert "プライバシー設定" in info.value.message and "openrouter.ai/settings/privacy" in info.value.message
+
+
+@respx.mock
+def test_temporary_no_available_provider_stays_retryable(provider: OpenRouterProvider, tmp_path: Path) -> None:
+    respx.get(MODELS_URL).mock(return_value=_listing())
+    respx.post(SUBMIT_URL).mock(return_value=httpx.Response(503, json={"error": {"code": 503,
+                                                                                "message": "No available provider"}}))
+    with pytest.raises(ProviderError) as info:
+        provider.generate(_req(), str(tmp_path / "clip.mp4"))
+    assert info.value.retryable is True and info.value.code != "provider_policy_blocked"
 
 
 @pytest.mark.parametrize(
@@ -720,7 +753,7 @@ def test_a_listing_without_usable_models_never_replaces_the_good_one(
     settings = set_env(OPENROUTER_API_KEY=KEY, OPENROUTER_MODELS_CACHE_TTL="600")
     cache_file = settings.WORK_DIR / "cache" / CACHE_FILE_NAME
     with respx.mock(assert_all_called=False) as router:
-        route = router.get(MODELS_URL).mock(return_value=_listing(_video_model(pricing_skus={"per-video-second": "0.07"})))
+        route = router.get(MODELS_URL).mock(return_value=_listing(_video_model(pricing_skus={"duration_seconds": "0.07"})))
         provider = _make(clock)
         assert provider.get_model(MODEL).price_per_second_usd == 0.07
         good_file = cache_file.read_text(encoding="utf-8")

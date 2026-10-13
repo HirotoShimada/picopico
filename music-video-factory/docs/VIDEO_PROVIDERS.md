@@ -41,7 +41,7 @@
 4. **OpenAI Sora API は 2026-09-24 に提供終了済み**のため対象外 [A]。Luma、MiniMax Hailuo、ByteDance Seedance（BytePlus）、Alibaba Wan には公式 API がある。ただし今回の 3 社で足り、かつ Seedance、Hailuo、Wan の一部は Runway 経由でも呼べるため、MVP では実装しない。
 5. 30 本 × 15 秒の場合、クリップを再利用（`balanced`、60 クリップ）すると、Veo 3.1 Lite 720p で **$18**（再利用なしなら $54）、Runway gen4.5 で **$36**（同 $108）になる。詳しくは §3。
 6. **OpenRouter**（§8）を使うと、1 本のキーで Veo 3.1 / Kling / Hailuo / Seedance / Wan などの動画モデルと Claude を呼べる。ただし次の制約がある。
-   - このサンドボックスからは `openrouter.ai` に接続できず、実リクエストは一度も通していない。すべて未検証（`verified: false`）。
+   - 実際の API に送ったのは無料の `GET /videos/models`（2026-10-13）だけで、動画の生成は一度も通していない。すべて未検証（`verified: false`）。
    - 動画生成はゼロデータ保持（ZDR）の対象外。
    - Claude 経由の絵コンテでは、歌詞が OpenRouter とその先の提供元（Anthropic / Amazon Bedrock / Google Vertex / Azure / Claude Platform on AWS のいずれか）を通る。
 
@@ -680,7 +680,7 @@ GET https://api-singapore.klingai.com/tasks?external_task_ids=<id>    // 公式�
   1. `ANTHROPIC_API_KEY` がある: Anthropic に直接送る（既存のコード。挙動は変えない）。
   2. なく、`OPENROUTER_API_KEY` がある: OpenRouter 経由で Claude に送る。
   3. どちらもない: テンプレートで作る（外部に送らない）。
-- **このサンドボックスからは `openrouter.ai` に接続できない**（WebFetch は DNS 解決失敗、curl はプロキシの 403）。実リクエストは一度も送っていない。以下の形状は公式 SDK のソースと Web 検索の抜粋から組み立てたもので、実装のテストも respx のモックだけになる。OpenRouter 関連のモデル・料金はすべて `verified: false` として扱う。
+- 調査時（2026-10-12）は、このサンドボックスから `openrouter.ai` に接続できなかった（WebFetch は DNS 解決失敗、curl はプロキシの 403）。以下の形状は公式 SDK のソースと Web 検索の抜粋から組み立てたもの。2026-10-13 に無料の `GET /videos/models` だけを実際に取得し、モデル一覧と `pricing_skus` の形を確認した（§8.3）。動画の生成（有料）は一度も送っておらず、生成のテストは respx のモックだけになる。OpenRouter 関連のモデル・料金はすべて `verified: false` として扱う。
 
 ### 8.0 情報源と信頼度
 
@@ -861,15 +861,63 @@ X-OpenRouter-Title: AI Music Video Factory
 **`pricing_skus` の形**:
 
 - 型は「SKU 名 → 価格の文字列」の辞書で、SDK の説明は「Pricing SKUs with provider prefix stripped, values as strings」[A]。
-- 公式ドキュメントの Veo 3.1 の例では、キーが `per-video-second`（0.50）と `per-video-second-1080p`（0.75）になっている [B]。ただしモデルページの Veo 3.1 は「$0.40/s から」と表示しており、例の数値は説明用とみられる。
-- モデルページでは、音声あり・なし（例: Kling v3.0 std が $0.126/s と $0.084/s）や解像度ごと（例: Seedance 2.5 は 480p から 4K まで）に単価が分かれている [B][C]。**それぞれの SKU キー名は確認できていない** [C]。
+- 公式ドキュメントの例のキー `per-video-second` / `per-video-second-1080p` [B] は、実際の一覧には存在しない。
+- **実際の一覧**（2026-10-13 に `GET /videos/models` を取得。30 モデル。`backend/tests/fixtures/openrouter_videos_models_2026-10-13.json`）で見られた SKU の系統と、本アプリでの扱い:
 
-**USD/秒の求め方**（本アプリの方針。[C]）:
+  | SKU 名 | 単位 | 扱い |
+  |---|---|---|
+  | `duration_seconds[_<解像度>]` | USD/秒 | 出力 1 秒の単価 |
+  | `duration_seconds_with_audio[_<解像度>]` / `duration_seconds_without_audio[_<解像度>]` | USD/秒 | 音声あり・なしの単価 |
+  | `text_to_video_duration_seconds_<解像度>` / `image_to_video_duration_seconds_<解像度>` | USD/秒 | テキスト→動画・画像→動画それぞれの単価 |
+  | `cents_per_second_output[_<解像度>]` / `cents_per_video_output_second_<解像度>` | セント/秒 | 100 で割って USD/秒 |
+  | `minimum_cents_per_generation` | セント/本 | 1 本あたりの最低料金。見積もりは `max(単価 × 秒数, 最低料金)` |
+  | `cents_per_image_input` | セント/枚 | 入力画像 1 枚ごとの料金。画像→動画のときだけ加算 |
+  | `reference_duration_seconds_<解像度>` / `reference_images` | — | 参照入力の料金。本アプリは参照入力を送らないため無視 |
+  | `cents_per_second_video_continuation_<解像度>` | — | 既存動画の続きの生成。使わないため無視 |
+  | `cents_per_megapixel_second_*` | — | アップスケーラー。候補に出さない |
+  | `video_tokens*` | USD/トークン | 1 本あたりのトークン数が分からないため未対応。そのモデルは料金不明として選べない |
 
-1. `resolution` が 720p 以外なら `per-video-second-<resolution>` を探し、なければ `per-video-second` を使う。
-2. 音声の有無で分かれたキー（名前は未確認）が複数ある場合は、高いほうを採用し、見積もりを過小にしない。
-3. どのキーにも当たらない、または値が数値として読めない場合は、下表の静的な単価を使う。どちらの場合も `verified: false`。
-4. 実際の請求額は、完了時の `usage.cost` で置き換える。
+**USD/秒の求め方**（`price_from_skus`。[C]）:
+
+1. 解像度: 要求する解像度（既定は 720p。なければ一覧が料金を載せている解像度を優先順に選ぶ）の SKU を使い、なければ解像度を名前に含まない SKU を使う。別の解像度の単価は使わない。`@1080p` の候補は、1080p 専用の SKU があるときだけ作る。
+2. 生成方法: 入力画像がなければ `text_to_video_*`（と、生成方法を名前に含まない SKU）を使う。
+3. 音声: `generate_audio: true` のモデルは常に音声をオフにして送るため、`without_audio` → 音声の記載なし → `with_audio` の順に選ぶ。音声をオフにできないモデル（`generate_audio` が false / null）は、記載なし → `with_audio` の順で、`without_audio` は使わない。音声ありの単価を使う場合は料金の注記にそう書く（無音の単価が解像度の指定なし・別の解像度・別の生成方法にしかない場合は、その SKU 名と、要求する解像度の単価を優先したことを書く）。
+4. 同じ条件の候補が複数あれば、生成方法を名前に含むほうを優先し、さらに高いほうを採用する（見積もりを過小にしない）。
+5. 上のどれにも当たらない（未知の系統だけ、トークン単位）場合は、推測せずに料金不明とし、そのモデルは選べない。未知の SKU や、使わない SKU の読めない値が既知の単価と並んでいる場合は、見積もりに含めていないことを注記する。
+6. 使うはずの SKU（上の 1〜4 で選ばれる単価、最低料金、画像→動画の入力画像料金）の値が使えない場合も料金不明とし、ほかの SKU（解像度の指定がない単価や別の解像度）で代わりに見積もらない（安く見積もるおそれがあるため）。その解像度の料金が不明なら、別の解像度にも切り替えない。使えない値は次のとおり（注記に理由を書く）:
+   - 数値として読めない値・負の値（例: `"$0.30"`）。
+   - 1 秒あたり 0 の値（`"0"`・`"-0"` など）。無料とは確認できず、予算を確保できないため。最低料金・入力画像料金の 0 は「料金なし」として扱う。
+   - 想定範囲の外の値。単位は SKU 名だけで決まるため、ドルとセントの取り違え（例: `cents_per_second_output: "0.12"` → $0.0012/秒、`duration_seconds: "12"` → $12/秒）を検出する。範囲は 1 秒あたり $0.005〜$3、最低料金 $0.01〜$20/本、入力画像 $0.0005〜$1/枚（実際の一覧は $0.02〜$0.60/秒・$0.56/本・$0.002〜$0.01/枚）。
+7. 料金の注記には、使った SKU 名と元の単位を書く（例: `cents_per_second_output: 12¢ = $0.12/秒`）。
+8. 実際の請求額は、完了時の `usage.cost` で置き換える。
+
+**候補に出すモデル**: `supported_durations` が空でなく、`supported_aspect_ratios` に 9:16 があるモデルだけ。編集（`black-forest-labs/flux-video-edit`）・アップスケール（`black-forest-labs/flux-video-upscale`）・動画→動画（`runway/aleph-2`）・アバター（`heygen/avatar-iv`）のモデルは秒数の指定がなく、`minimax/hailuo-2.3` は 16:9 のみのため出さない。
+
+**2026-10-13 の一覧から求めた単価**（テキスト→動画・無音・720p またはモデルの既定解像度。カッコ内は `@1080p`）:
+
+| モデル | USD/秒 | 使う SKU |
+|---|---|---|
+| `google/veo-3.1-lite` | 0.03 | `duration_seconds_without_audio_720p` |
+| `google/veo-3.1-fast` | 0.08 | `duration_seconds_without_audio_720p` |
+| `google/veo-3.1` | 0.20 | `duration_seconds_without_audio` |
+| `kwaivgi/kling-v3.0-std` / `-pro` | 0.084 / 0.112 | `text_to_video_duration_seconds_720p` |
+| `kwaivgi/kling-video-o1` | 0.112 | `duration_seconds` |
+| `runway/gen-4.5` | 0.12 | `cents_per_second_output`（12¢） |
+| `x-ai/grok-imagine-video` | 0.07 | `cents_per_video_output_second_720p`（7¢） |
+| `x-ai/grok-imagine-video-1.5` / `-1.5-lite` | 0.14（0.25）/ 0.03（0.14） | `cents_per_video_output_second_720p` / `_1080p` |
+| `black-forest-labs/flux-3-video` | 0.17（0.29） | `cents_per_second_output_720p` / `_1080p` |
+| `heygen/heygen-video-1` | 0.03（768p） | `duration_seconds_768p` |
+| `minimax/hailuo-3-max` | 0.08（768p） | `duration_seconds_768p` |
+| `minimax/hailuo-3` | 0.13（2K のみ） | `duration_seconds` |
+| `alibaba/wan-2.6` | 0.08（0.12） | `text_to_video_duration_seconds_720p` / `_1080p` |
+| `alibaba/wan-2.7` | 0.10 | `duration_seconds` |
+| `alibaba/wan-3.0` / `wan-3.0-prime` | 0.10（0.20）/ 0.14（0.28） | `duration_seconds_720p` / `_1080p` |
+| `alibaba/happyhorse-1.0` / `-1.1` | 0.0988（0.1694）/ 0.0988（0.1278） | `duration_seconds_720p` / `_1080p` |
+| `bytedance/seedance-*`（5 モデル） | 不明（選べない） | `video_tokens*`（トークン単位） |
+
+- 一覧を取得できないとき（キー未設定・通信エラー）は、この一覧の一部（Veo 3.1 Lite / Fast、Kling v3.0 std、Kling O1、Wan 2.7、Runway Gen-4.5、Grok Imagine Video）を写した組み込みの候補を、同じ規則で使う。
+
+以下の「既知のモデル」と推奨値の表は、一覧を取得する前（2026-10-12）の検索による調査の記録として残す。単価は上の表が優先される。
 
 **既知のモデル**（**検索による。未検証**。秒数と単価はモデルページの抜粋で、「from」付きの最低価格を含む）:
 
@@ -1076,7 +1124,7 @@ X-OpenRouter-Title: AI Music Video Factory
 
 ### 8.8 未確認事項（OpenRouter）
 
-1. **実リクエスト全般**（このサンドボックスからは接続できない）。キーを得たら、まず `GET /videos/models` と、短い 1 本の生成で、形状・費用・所要時間を確認する。
+1. **実リクエスト全般**: 2026-10-13 に確認済みなのは `GET /videos/models`、`GET /key`、Claude の `POST /chat/completions`（`zdr: true`・`data_collection: "deny"`・`require_parameters: true`・json_schema strict で成功。記録費用 $0.05564 = 請求額）。**`POST /videos` は、アカウント全体で ZDR を強制していると 404 `0 endpoints … matching your guardrail restrictions and data policy … ZDR violation (account settings)` で拒否される（課金なし）ことを確認**。動画の生成・ダウンロード・`usage.cost` は未確認。
 2. **動画の作成**:
    - `POST /videos` の成功ステータス（SDK は 202 だけを成功として扱う）。
    - 各モデルが 9:16 と 720p を受け付けるか。
@@ -1089,11 +1137,11 @@ X-OpenRouter-Title: AI Music Video Factory
    - `/content` の 409 / 410 の正確な意味。
    - `unsigned_urls` の保持期間と `expires_at`。
    - `/content` がリダイレクトを返すか。
-5. **`pricing_skus` のキー名**（音声の有無・解像度の表し方）と、`/videos/models` が認証を要するか。
+5. **`pricing_skus` の意味**: キー名は 2026-10-13 の実際の一覧で確認した（§8.3）。ただし各 SKU の意味（例: `duration_seconds` が無音か、`text_to_video_*` が音声の有無を含むか）は名前からの推定で、実際の請求額（`usage.cost`）との突き合わせは未確認。`/videos/models` が認証を要するかも未確認。
 6. **データ保持**:
    - 動画のリクエストに `zdr` / `data_collection` を入れたときの挙動（無視か 400 か）。
-   - アカウントで ZDR を強制したとき、動画が拒否されるか。
-7. **Opus 5.5 の提供元**: `zdr: true` と `data_collection: "deny"` を両方満たす提供元があるか。ないときのエラー（404 か 503 か）。
+   - ~~アカウントで ZDR を強制したとき、動画が拒否されるか~~ → 拒否される（2026-10-13 確認、上記 1）。
+7. **Opus 5.5 の提供元**: `zdr: true` と `data_collection: "deny"` を両方満たす提供元は**ある**（2026-10-13、`anthropic/claude-opus-5.5` で成功）。ないときのエラーの形は未確認。
 8. **Claude のパラメータ変換**:
    - `reasoning.effort` が Anthropic の `output_config.effort` にどう対応するか。`none` で 400 になるか。
    - `response_format`（json_schema、strict）が Anthropic の構造化出力にどう変換されるか。
@@ -1160,10 +1208,10 @@ X-OpenRouter-Title: AI Music Video Factory
 - **モデル一覧**: キーがあるときだけ `GET /videos/models` を取得し、メモリと `WORK_DIR/cache/openrouter_video_models.json` に
   `OPENROUTER_MODELS_CACHE_TTL` 秒（既定 3600、最小 60）保持する。
   - 取得に失敗したとき、または 200 でも使えるモデルが 1 つもない（空・ID が不正・9:16 非対応だけ）ときは、前回の一覧（なければ
-    組み込みの 6 モデル）を使い続け、キャッシュファイルは上書きせず、5 分後まで再取得しない。
+    組み込みの 7 モデル。2026-10-13 の実際の一覧の写し）を使い続け、キャッシュファイルは上書きせず、5 分後まで再取得しない。
   - 9:16 を明示的に含まないモデル、アップスケーラー、ID が不正または 90 文字を超えるモデルは表示しない。アスペクト比の記載が
     ないモデルは `supports_vertical: false` と注記付きで表示する。
-  - 料金を読み取れず調査値もないモデルは `price_known: false`（`price_per_second_usd: null`）で表示し、選択できない（予算を確保できないため）。
+  - 料金を読み取れないモデル（トークン単位の料金、使えない値など。§8.3）は `price_known: false`（`price_per_second_usd: null`）で表示し、選択できない（予算を確保できないため）。
   - 1080p の料金が別にあるときだけ `<id>@1080p` を追加する。
 - **ダウンロード**: `/content?index=0`（キー付き）を先に、だめなら `unsigned_urls` を試す。どの URL もリダイレクト先も、API と同じ
   オリジンか、https の公開ホストだけを許可する（`localhost`・`.local`・グローバルでない IP。`2130706433` や `0x7f000001`、`127.1`
