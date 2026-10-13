@@ -321,6 +321,9 @@ def _fictional(identity: str) -> str:
     """``"A woman in her 20s"`` → ``"a fictional woman in her 20s"`` (no "a fictional a woman")."""
     # Stored world bibles (and HEAD before 2026-10-13) already carry "a fictional a woman …": repair them too.
     identity = re.sub(r"\b(fictional)\s+(?:an?|the)\s+", r"\1 ", identity.strip(), flags=re.IGNORECASE)
+    # Claude sometimes writes "fictional woman in her late 20s …" without an article.
+    if re.match(r"fictional\b", identity, flags=re.IGNORECASE):
+        return f"a fictional{identity[len('fictional'):]}"
     if not identity or "fictional" in identity.lower():
         return identity
     bare = _LEADING_ARTICLE.sub("", identity)

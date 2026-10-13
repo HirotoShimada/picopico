@@ -689,6 +689,18 @@ def test_identity_article_is_not_doubled() -> None:
     assert legacy["world_bible"]["identity_en"] == "a fictional man in his 30s"
 
 
+def test_identity_without_article_gets_one() -> None:
+    """Regression (live run 2026-10-13): Claude wrote "fictional woman in her late 20s …" and the prompt read
+    "The woman is fictional woman …"."""
+    answer = _claude_answer(
+        [{"scene_type": "close_portrait", "framing": "close_up", "prompt_en": "Close-up of the woman blinking"}],
+        identity_en="fictional woman in her late 20s, round everyday face with light freckles",
+    )
+    board = _claude_board(answer)
+    assert board["world_bible"]["identity_en"] == "a fictional woman in her late 20s, round everyday face with light freckles"
+    assert "The woman is a fictional woman in her late 20s" in board["scenes"][0]["prompt_en"]
+
+
 @pytest.mark.parametrize(
     "identity",
     [
