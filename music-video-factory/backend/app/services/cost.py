@@ -17,8 +17,8 @@ charges (image-to-video) are not part of these estimates.
 shot (no reuse inside the batch, no cache), so ``savings_usd`` is what reuse
 and the clip cache save. Both totals include ``llm_usd``. Shots are counted
 after the planner fitted videos to their clip pool (fewer, longer shots), so a
-fitted single video saves nothing. The plan's shots per video, slowest speed
-and in-video repeats are copied into the estimate.
+fitted single video saves only what its cached clips save. The plan's shots per
+video, slowest speed and in-video repeats are copied into the estimate.
 """
 
 from __future__ import annotations
@@ -296,7 +296,10 @@ def estimate(
     }
 
 
-_FIT_COUNTS = ("fitted_videos", "repeat_shots", "overlap_repeat_shots", "scene_repeat_shots", "videos_with_repeats")
+_FIT_COUNTS = (
+    "fitted_videos", "repeat_shots", "overlap_repeat_shots", "adjacent_repeat_shots", "scene_repeat_shots",
+    "videos_with_repeats",
+)  # fmt: skip
 
 
 def _fit_fields(plan_stats: Mapping[str, Any]) -> dict[str, Any]:

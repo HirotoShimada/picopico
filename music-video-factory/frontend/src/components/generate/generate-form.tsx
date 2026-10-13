@@ -97,8 +97,9 @@ function SummaryRow({ label, value }: { label: string; value: React.ReactNode })
 }
 
 /**
- * First lines of the 生成開始 confirmation: shots per video, the longest / slowest shot, and whether a clip
- * repeats inside a video (§6.4). Nothing for an estimate without these fields.
+ * First lines of the 生成開始 confirmation: shots per video, the longest / slowest shot (rounded by the backend
+ * as its notes print them), and whether a clip repeats inside a video (§6.4). Nothing for an estimate without
+ * these fields.
  */
 function PlanShotsNote({ estimate }: { estimate: Estimate }) {
   const range = shotsPerVideoRange(estimate);
@@ -534,7 +535,7 @@ export function GenerateForm({ project, previous, worldEstimate = null }: Genera
             <Field
               label="新規生成する素材の上限"
               error={errors.maxNewClips}
-              description="素材が1本の動画のショット数より少ないときは、同じ映像を繰り返さないようショットを少なく・長めにまとめます（最長8秒・0.75倍速まで）。それでも足りない場合だけ、同じ素材が別の区間・別の構図で再登場します。"
+              description="素材が1本の動画のショット数より少ないときは、同じ映像を繰り返さないようショットを少なく・長めにまとめます（最長8秒・0.75倍速まで）。それでも足りない場合だけ、同じ素材が寄りの構図で再登場します（素材が2本以上なら連続はしません）。"
             >
               <div className="flex items-center gap-3">
                 <Switch

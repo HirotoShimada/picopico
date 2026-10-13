@@ -35,6 +35,27 @@ function describeMotion(shot: ShotPlan): string {
   return parts.join(" ・ ") || "固定";
 }
 
+/** Source windows of one clip closer than this (seconds) show the same footage (planner REPEAT_GAP_SEC). */
+const REPEAT_GAP_SEC = 0.5;
+
+/**
+ * Per shot: does it show footage an earlier shot of this video already showed? A generated clip repeats
+ * whenever it was used before; an uploaded clip only when its source window comes within REPEAT_GAP_SEC
+ * of an earlier window of it (a long upload gives disjoint windows), as the planner counts repeats (§6.4).
+ */
+export function repeatedShots(shots: readonly ShotPlan[], clipsById: ReadonlyMap<string, ClipOut>): boolean[] {
+  const windows = new Map<string, [number, number][]>();
+  const gap = REPEAT_GAP_SEC - 1e-6; // windows exactly the gap apart are disjoint
+  return shots.map((shot) => {
+    if (!shot.clip_id) return false;
+    const window: [number, number] = [shot.src_in, shotSourceSeconds(shot)];
+    const earlier = windows.get(shot.clip_id) ?? [];
+    windows.set(shot.clip_id, [...earlier, window]);
+    if (clipsById.get(shot.clip_id)?.source !== "upload") return earlier.length > 0;
+    return earlier.some(([start, end]) => window[0] < end + gap && start - gap < window[1]);
+  });
+}
+
 /** Shots in order with their clip thumbnail, timing and motion; each clip can be swapped. */
 export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onReset, onSeek }: ShotListProps) {
   if (shots.length === 0) {
@@ -42,11 +63,7 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
   }
 
   const starts = shots.reduce<number[]>((acc, shot, index) => [...acc, index === 0 ? 0 : acc[index - 1] + shots[index - 1].duration], []);
-  // Index of each clip's first shot: a later shot with the same clip repeats footage inside this video.
-  const firstUse = new Map<string, number>();
-  shots.forEach((shot, index) => {
-    if (shot.clip_id && !firstUse.has(shot.clip_id)) firstUse.set(shot.clip_id, index);
-  });
+  const repeats = repeatedShots(shots, clipsById);
   return (
     <ol className="flex flex-col divide-y divide-border rounded-md border border-border">
       {shots.map((shot, index) => {
@@ -55,7 +72,7 @@ export function ShotList({ shots, baseShots, clipsById, playerTime, onSwap, onRe
         const changed = baseShots[index]?.clip_id !== shot.clip_id;
         const active = playerTime !== null && playerTime >= begin && playerTime < begin + shot.duration;
         const short = clip?.duration !== null && clip?.duration !== undefined && clip.duration < shotSourceSeconds(shot);
-        const repeated = !!shot.clip_id && (firstUse.get(shot.clip_id) ?? index) < index;
+        const repeated = repeats[index];
         return (
           <li key={index} className={cn("flex items-center gap-3 px-3 py-2.5", active && "bg-surface-raised")}>
             <span className="w-6 shrink-0 text-right font-mono text-xs text-subtle-foreground">{index + 1}</span>

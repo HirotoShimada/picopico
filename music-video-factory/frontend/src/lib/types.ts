@@ -468,12 +468,15 @@ export interface Estimate {
   beat_shots_per_video_max?: number | null;
   /** Videos re-cut into fewer, longer shots so no clip repeats inside a video. */
   fitted_videos?: number | null;
-  /** Longest shot (seconds) and slowest playback speed over all shots. */
+  /** Longest shot (seconds, rounded to 0.1) and slowest playback speed (rounded to 0.01) over all shots. */
   max_shot_sec?: number | null;
   min_speed?: number | null;
   /** Shots that reuse a clip already used earlier in the same video (library: an overlapping window). */
   repeat_shots?: number | null;
+  /** Repeats that show footage of an earlier window again (within 0.5 s). */
   overlap_repeat_shots?: number | null;
+  /** Repeats right after a shot of the same clip (only a pool of one clip has them). */
+  adjacent_repeat_shots?: number | null;
   scene_repeat_shots?: number | null;
   videos_with_repeats?: number | null;
   repeat_warning?: string | null;
@@ -525,10 +528,13 @@ export interface VideoFit {
   shots: number;
   /** Re-cut into fewer, longer shots (≤ 8 s, ≥ 0.75x) to avoid repeating a clip. */
   fitted: boolean;
+  /** Rounded to 0.01 / 0.1 s, as the notes print them. */
   min_speed: number;
   max_shot_sec: number;
   repeat_shots: number;
   overlap_repeat_shots: number;
+  /** Absent in plans made before it was reported. */
+  adjacent_repeat_shots?: number;
   scene_repeat_shots: number;
 }
 
@@ -561,6 +567,7 @@ export interface BatchPlanStats {
   fitted_videos?: number;
   repeat_shots?: number;
   overlap_repeat_shots?: number;
+  adjacent_repeat_shots?: number;
   scene_repeat_shots?: number;
   videos_with_repeats?: number;
   max_shot_sec?: number | null;

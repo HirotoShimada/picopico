@@ -582,6 +582,7 @@ class Estimate(LooseModel):
     min_speed: float | None = None
     repeat_shots: int | None = None
     overlap_repeat_shots: int | None = None
+    adjacent_repeat_shots: int | None = None
     scene_repeat_shots: int | None = None
     videos_with_repeats: int | None = None
     repeat_warning: str | None = None

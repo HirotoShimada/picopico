@@ -13,6 +13,7 @@ import json
 import math
 import random
 import time
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import pytest
@@ -45,6 +46,10 @@ def _sample(**overrides: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str,
 
 def _refs(video: dict[str, Any]) -> list[str]:
     return [str(s["clip_key"] or s["clip_id"]) for s in video["shots"]]
+
+
+def _cuts(video: dict[str, Any]) -> tuple[int, ...]:
+    return tuple(round(s["duration"] * 1000) for s in video["shots"])
 
 
 def _move(shot: dict[str, Any]) -> tuple[str, int]:
@@ -184,11 +189,14 @@ def test_last_resort_repeats_are_few_apart_and_reframed(count: int) -> None:
             earlier.append(_move(shot))
     stats = result["stats"]
     assert stats["repeat_shots"] == stats["videos_with_repeats"] == count
+    # A last-resort shot plays (almost) the whole 6 s clip: the repeat shows the same footage again,
+    # so the warning does not claim another section (別の区間); it is never back to back (連続はせず).
+    assert stats["overlap_repeat_shots"] == count and stats["adjacent_repeat_shots"] == 0
     where = "動画内で同じ素材が1ショット" if count == 1 else f"{count}本の動画で同じ素材が計{count}ショット"
     need = _need_clips(20, CLIP_SEC)
     assert need == 3
     assert stats["repeat_warning"] == (
-        f"素材が足りないため、{where}再登場します（連続はせず、別の区間・寄りの構図で使います）。"
+        f"素材が足りないため、{where}再登場します（連続はせず、寄りの構図で使います）。"
         f"新規生成の上限を{max(2 + 1, need)}本以上に引き上げると解消します"
     )
     assert "再登場" in stats["repeat_warning"] and "上限を" in stats["repeat_warning"]
@@ -223,9 +231,39 @@ def test_too_few_ready_clips_without_new_ones_advise_adding_clips() -> None:
     assert result["stats"]["new_clips"] == 0 and result["stats"]["repeat_shots"] == 1
     assert "生成済みの素材2本だけで構成します" in result["warnings"]
     assert result["stats"]["repeat_warning"] == (
-        "素材が足りないため、動画内で同じ素材が1ショット再登場します（連続はせず、別の区間・寄りの構図で使います）。"
+        "素材が足りないため、動画内で同じ素材が1ショット再登場します（連続はせず、寄りの構図で使います）。"
         f"生成済みの素材だけでは足りません。新しい素材を{_need_clips(20, CLIP_SEC) - 2}本以上追加すると解消します"
     )
+
+
+@pytest.mark.parametrize(
+    ("clip_sec", "duration_sec", "manner"),
+    [
+        # One 6 s clip for 15 s: two shots of the whole clip, back to back.
+        (CLIP_SEC, 15, "寄りの構図"),
+        # One 10 s clip for 9 s: two 4.5 s shots fit in it 0.5 s apart, back to back.
+        (10.0, 9, "別の区間・寄りの構図"),
+    ],
+)
+def test_repeat_warning_only_claims_what_holds_for_every_repeat(
+    clip_sec: float, duration_sec: int, manner: str
+) -> None:
+    # Regression: the warning always said 「連続はせず、別の区間」, also for a pool of one (back to back)
+    # and for last-resort shots that show the same footage again.
+    analysis = _analysis()
+    for seed in (1, 2, 3):
+        conf = settings(**{**SAMPLE, "max_new_clips": 1, "duration_sec": duration_sec})
+        result = plan(analysis=analysis, settings=conf, provider_clip_duration=clip_sec, seed=seed)
+        check_plan(result, analysis=analysis, conf=conf, clip_duration=clip_sec, existing=[])
+        (video,) = result["videos"]
+        assert len(video["shots"]) == 2 and len(set(_refs(video))) == 1
+        stats = result["stats"]
+        assert stats["repeat_shots"] == stats["adjacent_repeat_shots"] == video["fit"]["adjacent_repeat_shots"] == 1
+        assert stats["overlap_repeat_shots"] == (0 if "別の区間" in manner else 1)
+        assert stats["repeat_warning"] == (
+            f"素材が足りないため、動画内で同じ素材が1ショット再登場します（{manner}で使います）。"
+            f"新規生成の上限を{_need_clips(duration_sec, clip_sec)}本以上に引き上げると解消します"
+        )
 
 
 # --- uncapped and long videos ---------------------------------------------------------------------
@@ -234,13 +272,16 @@ def test_too_few_ready_clips_without_new_ones_advise_adding_clips() -> None:
 @pytest.mark.parametrize("bpm", [72.0, 128.0])
 def test_uncapped_plans_never_repeat_a_clip_in_a_video(bpm: float) -> None:
     analysis = make_analysis(duration=120, bpm=bpm, seed=2)
-    for reuse, count, n_scenes, duration in itertools.product(REUSES, (1, 3, 10), (3, 8), (15, 30, 60)):
+    plans = []
+    for case in itertools.product(REUSES, (1, 3, 10), (3, 8), (15, 30, 60)):
+        reuse, count, n_scenes, duration = case
         conf = settings(reuse=reuse, count=count, duration_sec=duration)
         result = plan(analysis=analysis, settings=conf, storyboard=storyboard(n_scenes=n_scenes), segment=(10.0, 70.0))
-        check_plan(result, analysis=analysis, conf=conf, clip_duration=5.0, existing=[])
-        case = (reuse, count, n_scenes, duration)
         for video in result["videos"]:
             assert len(set(_refs(video))) == len(video["shots"]), case
+        plans.append((case, conf, result))
+    for case, conf, result in plans:
+        check_plan(result, analysis=analysis, conf=conf, clip_duration=5.0, existing=[])
         assert result["stats"]["repeat_shots"] == 0 and result["stats"]["repeat_warning"] is None, case
 
 
@@ -391,16 +432,41 @@ def test_plans_are_deterministic_and_videos_with_a_shared_start_differ() -> None
     assert all(v["fit"]["fitted"] for v in first["videos"]) and first["stats"]["repeat_shots"] == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="R8 promises different cuts for videos that share a start, but the minimax fit (R2, §3 step 4: 1 % "
-    "tolerance, slow motion outweighs the per-video weights) gives every fitted video the same cuts, and with "
-    "no source slack in a 6 s clip only the clip order can differ: check_plan's distinct-signature rule fails",
-)
-def test_fitted_videos_with_a_shared_start_are_different_edits() -> None:
-    analysis, conf, result = _sample(conf={"count": 3})
-    assert len({v["start"] for v in result["videos"]}) == 1
+@pytest.mark.parametrize("bpm", [72.0, 120.0])
+def test_fitted_videos_with_a_shared_start_are_different_edits(bpm: float) -> None:
+    # Regression: the minimax fit gives every video that shares a start the same cuts, and a 6 s clip has no
+    # source slack, so the retry kept the clip order too: 3 videos came out as 2 distinct edits.
+    analysis = make_analysis(duration=120, bpm=bpm, seed=1)
+    conf = settings(**{**SAMPLE, "count": 3})
+    result = plan(analysis=analysis, settings=conf, provider_clip_duration=CLIP_SEC)
     check_plan(result, analysis=analysis, conf=conf, clip_duration=CLIP_SEC, existing=[])
+    videos = result["videos"]
+    assert len({v["start"] for v in videos}) == 1
+    # They differ in clip order and keep the most even cuts (no slower shots), the cuts of a single video.
+    single = plan(analysis=analysis, settings=settings(**SAMPLE), provider_clip_duration=CLIP_SEC)["videos"][0]
+    assert {_cuts(v) for v in videos} == {_cuts(single)}
+    assert len({tuple(_refs(v)) for v in videos}) == 3
+    assert all(v["fit"]["fitted"] and v["fit"]["repeat_shots"] == 0 for v in videos)
+
+
+@pytest.mark.parametrize("bpm", [72.0, 120.0])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_more_shared_start_videos_than_clip_orders_take_the_next_most_even_split(bpm: float, seed: int) -> None:
+    # 3 clips allow 6 clip orders: the first 6 videos keep the most even cuts, the rest are re-cut on the
+    # next most even on-beat splits (still ≥ 0.75x, no repeats) instead of repeating an edit.
+    analysis = make_analysis(duration=120, bpm=bpm, seed=1)
+    conf = settings(**{**SAMPLE, "count": 10})
+    result = plan(analysis=analysis, settings=conf, provider_clip_duration=CLIP_SEC, seed=seed)
+    check_plan(result, analysis=analysis, conf=conf, clip_duration=CLIP_SEC, existing=[])  # distinct edits
+    videos = result["videos"]
+    assert len({v["start"] for v in videos}) == 1
+    cuts = [_cuts(v) for v in videos]
+    single = plan(analysis=analysis, settings=settings(**SAMPLE), provider_clip_duration=CLIP_SEC, seed=seed)
+    assert cuts[0] == _cuts(single["videos"][0]) and cuts.count(cuts[0]) == 6
+    assert len(set(cuts)) >= 2 and len({(c, tuple(_refs(v))) for c, v in zip(cuts, videos, strict=True)}) == 10
+    assert all(len(c) == 3 and v["fit"]["fitted"] for c, v in zip(cuts, videos, strict=True))
+    stats = result["stats"]
+    assert stats["repeat_shots"] == 0 and stats["min_speed"] >= variation.FIT_MIN_SPEED
 
 
 @pytest.mark.parametrize("cap", [None, 3])
@@ -481,7 +547,84 @@ def test_long_upload_gives_disjoint_windows() -> None:
     assert video["fit"]["repeat_shots"] == 0 and result["stats"]["repeat_warning"] is None
 
 
+def _windows(video: dict[str, Any]) -> list[tuple[float, float]]:
+    return sorted((s["src_in"], s["src_in"] + s["duration"] * s["speed"]) for s in video["shots"])
+
+
+@pytest.mark.parametrize(("upload_sec", "duration_sec", "seed"), [(12.0, 8, 9), (16.0, 10, 17)])
+def test_short_upload_with_room_gives_disjoint_windows(upload_sec: float, duration_sec: int, seed: int) -> None:
+    # Regression: in-points were picked greedily on a 0.5 s grid, so 8 s of footage from a 12 s upload
+    # overlapped and the user was told to upload more footage although the upload had room.
+    uploads = [_upload("u0", upload_sec)]
+    analysis = make_analysis(duration=120, bpm=120, seed=9)
+    conf = settings(provider="library", model=None, count=1, duration_sec=duration_sec, start_strategy="custom",
+                    start_sec=20)  # fmt: skip
+    result = plan(analysis=analysis, settings=conf, existing_clips=uploads, storyboard=None, seed=seed)
+    check_plan(result, analysis=analysis, conf=conf, clip_duration=5.0, existing=uploads)
+    (video,) = result["videos"]
+    for (_, end), (start, _) in itertools.pairwise(_windows(video)):
+        assert start >= end + variation.REPEAT_GAP_SEC - 1e-6, _windows(video)
+    assert video["fit"]["repeat_shots"] == 0 and result["stats"]["repeat_warning"] is None
+
+
+def test_single_upload_windows_are_disjoint_whenever_they_fit() -> None:
+    rng = random.Random(42)
+    fitting = 0
+    for _ in range(150):
+        upload_sec = rng.choice([6.0, 8.0, 10.0, 12.0, 14.0, 16.0])
+        analysis = make_analysis(duration=120, bpm=rng.choice([72, 90, 120, 140]), seed=rng.randrange(50))
+        conf = settings(provider="library", model=None, count=1, duration_sec=rng.choice([5, 6, 7, 8, 9, 10]),
+                        start_strategy="custom", start_sec=round(rng.uniform(0, 100), 1))  # fmt: skip
+        uploads = [_upload("u0", upload_sec)]
+        result = plan(analysis=analysis, settings=conf, existing_clips=uploads, storyboard=None,
+                      seed=rng.randrange(100))  # fmt: skip
+        (video,) = result["videos"]
+        footage = sum(e - a for a, e in _windows(video))
+        room = upload_sec - 2 * variation.UPLOAD_EDGE_MARGIN - (len(video["shots"]) - 1) * variation.REPEAT_GAP_SEC
+        if footage <= room:  # the shots fit side by side, the gap apart: no window may overlap another
+            fitting += 1
+            assert video["fit"]["repeat_shots"] == 0, (upload_sec, conf["duration_sec"], _windows(video))
+    assert fitting >= 50
+
+
 # --- speed ----------------------------------------------------------------------------------------
+
+
+def test_long_capped_batches_share_the_fit_search_and_plan_fast() -> None:
+    # Regression: the fit's feasibility search ran again for every video: 50 videos of 90 s took ~5 s.
+    analysis = make_analysis(duration=240, bpm=200, seed=1)
+    conf = settings(**{**SAMPLE, "count": 50, "duration_sec": 90, "start_strategy": "segment"})
+    plan(analysis=analysis, settings=conf, provider_clip_duration=CLIP_SEC, segment=(30.0, 120.0))  # warm-up
+    variation._even_limits.cache_clear()
+    started = time.perf_counter()
+    result = plan(analysis=analysis, settings=conf, provider_clip_duration=CLIP_SEC, segment=(30.0, 120.0))
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0, elapsed
+    # One search for the start all 50 videos share (each video only runs its own weighted split).
+    assert variation._even_limits.cache_info().hits >= 49
+    check_plan(result, analysis=analysis, conf=conf, clip_duration=CLIP_SEC, existing=[])
+    assert result["stats"]["fitted_videos"] == 50
+
+
+def _js_fixed(value: float, digits: int) -> str:
+    """``Number.prototype.toFixed``: the exact binary value, a tie rounds up (Python's format rounds to even)."""
+    return str(Decimal(value).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP))
+
+
+def test_longest_shot_and_slowest_speed_are_reported_as_the_notes_print_them() -> None:
+    # Regression: a 5.25 s longest shot read 「最長5.2秒」 in the note (Python rounds the tie to even) but
+    # 「最長 5.3秒」 in the estimate panel (toFixed rounds it up).
+    analysis = make_analysis(duration=120, bpm=80.0, seed=23)
+    conf = settings(**{**SAMPLE, "count": 2, "max_new_clips": 4})
+    result = plan(analysis=analysis, settings=conf, provider_clip_duration=CLIP_SEC, segment=(10.0, 30.0), seed=23)
+    check_plan(result, analysis=analysis, conf=conf, clip_duration=CLIP_SEC, existing=[])
+    stats = result["stats"]
+    assert max(s["duration"] for v in result["videos"] for s in v["shots"]) == 5.25
+    assert stats["max_shot_sec"] == 5.2 and _js_fixed(stats["max_shot_sec"], 1) == "5.2"
+    assert any("（最長5.2秒・" in w for w in result["warnings"])
+    for fit in [stats, *(v["fit"] for v in result["videos"])]:
+        assert _js_fixed(fit["max_shot_sec"], 1) == f"{fit['max_shot_sec']:.1f}"
+        assert _js_fixed(fit["min_speed"], 2) == f"{fit['min_speed']:.2f}"
 
 
 def test_planning_is_fast_and_prompts_are_memoised() -> None:

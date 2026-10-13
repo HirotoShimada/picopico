@@ -46,6 +46,21 @@ export function repeatShots(estimate: Pick<Estimate, "repeat_shots">): number | 
   return isNumber(estimate.repeat_shots) ? estimate.repeat_shots : null;
 }
 
+/**
+ * How the repeated shots are shown, naming only what holds for every one of them (as the backend's
+ * `repeat_warning` does): not back to back unless the pool has one clip, another section only when no
+ * repeat shows footage of an earlier window, and always a punch-in framing.
+ */
+export function repeatHint(estimate: Pick<Estimate, "adjacent_repeat_shots" | "overlap_repeat_shots">): string {
+  return [
+    estimate.adjacent_repeat_shots === 0 ? "連続しない" : null,
+    estimate.overlap_repeat_shots === 0 ? "別の区間" : null,
+    "寄りの構図",
+  ]
+    .filter(Boolean)
+    .join("・");
+}
+
 function Row({
   label,
   value,
@@ -206,7 +221,14 @@ function EstimateBody({
           <div className="flex items-start justify-between gap-3 rounded-md border border-border bg-surface-raised/50 px-3 py-2">
             <p className="text-xs leading-5 text-muted-foreground">{budgetFit.note}</p>
             {onApplyMaxNewClips ? (
-              <Button size="xs" variant="secondary" className="shrink-0" onClick={() => onApplyMaxNewClips(budgetFit.max_new_clips)}>
+              // A stale estimate's cap was priced for the previous settings: only a current one can be applied.
+              <Button
+                size="xs"
+                variant="secondary"
+                className="shrink-0"
+                disabled={stale}
+                onClick={() => onApplyMaxNewClips(budgetFit.max_new_clips)}
+              >
                 上限を{formatCount(budgetFit.max_new_clips)}本にする
               </Button>
             ) : null}
@@ -220,6 +242,7 @@ function EstimateBody({
         {shotsRange !== null ? (
           <Row label="1本あたりのショット" value={`${shotsRange}ショット${recut ? `（通常 ${formatCount(beatMax)}）` : ""}`} />
         ) : null}
+        {/* The backend rounds both as its notes print them (0.1 s, 0.01x), so toFixed shows the same digits. */}
         {isNumber(estimate.max_shot_sec) && isNumber(estimate.min_speed) ? (
           <Row
             label="ショットの長さ・速度"
@@ -230,7 +253,7 @@ function EstimateBody({
           <Row
             label="動画内の同じ素材"
             value={repeats > 0 ? <span className="whitespace-nowrap text-warning-foreground">{`${formatCount(repeats)}ショット`}</span> : "なし"}
-            hint={repeats > 0 ? "連続しない・別の区間・寄りの構図" : undefined}
+            hint={repeats > 0 ? repeatHint(estimate) : undefined}
           />
         ) : null}
         <Row label="使用する素材" value={`${formatCount(estimate.unique_clips)}本`} />

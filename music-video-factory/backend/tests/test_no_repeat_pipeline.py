@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 import respx
+from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from test_pipeline_openrouter import BASE, MODEL, _listing, _no_zdr_claude, openrouter  # noqa: F401 (fixture)
@@ -49,8 +50,8 @@ def _stats(**overrides: Any) -> dict[str, Any]:
     stats = {
         "videos": 1, "shots_total": 5, "unique_clips": 3, "new_clips": 3, "reused_clips": 0, "clip_duration": 5.0,
         "variety_score": 0.3, "variety_warning": "V", "shots_per_video": [5], "beat_shots_per_video": [7],
-        "fitted_videos": 1, "repeat_shots": 2, "overlap_repeat_shots": 1, "scene_repeat_shots": 1,
-        "videos_with_repeats": 1, "max_shot_sec": 6.4, "min_speed": 0.77, "repeat_warning": "X",
+        "fitted_videos": 1, "repeat_shots": 2, "overlap_repeat_shots": 1, "adjacent_repeat_shots": 0,
+        "scene_repeat_shots": 1, "videos_with_repeats": 1, "max_shot_sec": 6.4, "min_speed": 0.77, "repeat_warning": "X",
     }  # fmt: skip
     stats.update(overrides)
     return stats
@@ -73,6 +74,7 @@ def test_estimate_reports_shots_and_in_video_repeats(priced_mock: Any) -> None:
     )  # fmt: skip
     assert estimate["fitted_videos"] == 1 and estimate["max_shot_sec"] == 6.4 and estimate["min_speed"] == 0.77
     assert (estimate["repeat_shots"], estimate["overlap_repeat_shots"], estimate["scene_repeat_shots"]) == (2, 1, 1)
+    assert estimate["adjacent_repeat_shots"] == 0  # the panel's hint names only what holds (連続しない here)
     assert estimate["videos_with_repeats"] == 1 and estimate["repeat_warning"] == "X"
     notes = estimate["notes"]
     assert notes.index("V") < notes.index("X"), "the repeat warning follows the variety warning"
@@ -90,24 +92,34 @@ def test_estimate_savings_note_names_reuse_between_videos_only_without_repeats(p
     between = _estimate(_stats(videos=2, shots_total=10, shots_per_video=[5, 5], repeat_shots=0,
                                videos_with_repeats=0, repeat_warning=None))  # fmt: skip
     assert any(n.startswith("素材を動画間で使い回すため、全 10 ショット") for n in between["notes"])
-    assert between["repeat_warning"] is None and "X" not in between["notes"]
+    assert between.get("repeat_warning") is None and "X" not in between["notes"]
     repeated = _estimate(_stats(videos=2, shots_total=10, shots_per_video=[5, 5]))
     assert any(n.startswith("素材を使い回すため、全 10 ショット") for n in repeated["notes"])
-    # A fitted single video uses each clip once: nothing is saved against one clip per shot.
-    fitted = _estimate(_stats(shots_total=3, shots_per_video=[3], repeat_shots=0, overlap_repeat_shots=0,
-                              scene_repeat_shots=0, videos_with_repeats=0, repeat_warning=None))  # fmt: skip
-    assert fitted["savings_usd"] == 0 and not any("使い回す" in n for n in fitted["notes"])
+    # A fitted single video uses each clip once: with only new clips nothing is saved against one clip per shot.
+    fitted = _stats(shots_total=3, shots_per_video=[3], repeat_shots=0, overlap_repeat_shots=0, scene_repeat_shots=0,
+                    videos_with_repeats=0, repeat_warning=None)  # fmt: skip
+    new_only = _estimate(fitted)
+    assert new_only["savings_usd"] == 0 and not any("使い回す" in n for n in new_only["notes"])
+    # Cached clips in its pool still count as savings: 4 shots from 1 new clip and 3 ready ones.
+    cached = cost_service.estimate({"count": 1}, {**fitted, "shots_total": 4, "shots_per_video": [4], "new_clips": 1,
+                                                  "reused_clips": 3, "unique_clips": 4}, "mock", None, cached_clips=3,
+                                   llm_estimate_usd=0.0, budget_limit_usd=None)  # fmt: skip
+    assert cached["naive_total_usd"] == pytest.approx(2.0) and cached["total_usd"] == pytest.approx(0.5)
+    assert cached["savings_usd"] == pytest.approx(1.5)
+    savings = "素材を使い回すため、全 4 ショットを新規生成する場合（$2.00）より $1.50（75%）安くなります"
+    assert savings in cached["notes"]
 
 
 def test_estimate_of_old_plan_stats_keeps_its_shape(priced_mock: Any) -> None:
     priced_mock(0.1)
     new_keys = ("shots_per_video", "beat_shots_per_video", "fitted_videos", "repeat_shots", "overlap_repeat_shots",
-                "scene_repeat_shots", "videos_with_repeats", "max_shot_sec", "min_speed", "repeat_warning")  # fmt: skip
+                "adjacent_repeat_shots", "scene_repeat_shots", "videos_with_repeats", "max_shot_sec", "min_speed",
+                "repeat_warning")  # fmt: skip
     old = {k: v for k, v in _stats().items() if k not in new_keys}
     estimate = _estimate(old)
     Estimate.model_validate(estimate)
     for key in ("shots_per_video_min", "shots_per_video_max", "beat_shots_per_video_max", "repeat_shots",
-                "repeat_warning", "budget_fit", "min_speed"):  # fmt: skip
+                "adjacent_repeat_shots", "repeat_warning", "budget_fit", "min_speed"):  # fmt: skip
         assert key not in estimate, key
 
 
@@ -168,6 +180,27 @@ def test_budget_fit_suggests_a_cap_that_reproduces_its_estimate(db: Session, rea
         )
         assert "新規生成の上限を" in info.value.message
         assert db.scalars(select(Batch)).all() == []
+
+
+def test_estimate_endpoint_returns_the_fit_and_the_budget_fit(
+    client: TestClient, ready_project: Project, priced_mock: Any
+) -> None:
+    priced_mock(0.1)  # $0.50 per 5 s mock clip, no LLM cost (no keys)
+    url = f"/api/projects/{ready_project.id}/estimate"
+    capped = client.post(url, json={"provider": "mock", "count": 1, "duration_sec": 15, "seed": 7, "max_new_clips": 2})
+    assert capped.status_code == 200, capped.text
+    body = capped.json()
+    assert body["repeat_shots"] >= 1 and body["repeat_warning"] in body["notes"]
+    assert body["shots_per_video_max"] < body["beat_shots_per_video_max"] and body["fitted_videos"] == 1
+
+    natural = client.post(url, json={"provider": "mock", "count": 1, "duration_sec": 15, "seed": 7}).json()
+    assert natural["repeat_shots"] == 0 and natural["new_clips"] >= 3
+    limit = natural["total_usd"] - 0.6  # two clips fewer fit
+    over = client.post(url, json={"provider": "mock", "count": 1, "duration_sec": 15, "seed": 7,
+                                  "budget_limit_usd": limit}).json()  # fmt: skip
+    fit = over["budget_fit"]
+    assert not over["within_budget"] and fit["max_new_clips"] == natural["new_clips"] - 2
+    assert fit["total_usd"] <= limit and fit["note"] in over["notes"]
 
 
 @pytest.mark.usefixtures("openrouter")

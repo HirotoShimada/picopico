@@ -184,23 +184,31 @@ def check_plan(
         pool = len(specs) if not library else len({c["id"] for c in existing if c["source"] == "upload"})
         if pool > 1:
             assert all(a != b for a, b in itertools.pairwise(refs)), "same clip twice in a row"
-        assert fit["min_speed"] == min(s["speed"] for s in video["shots"])
-        assert fit["max_shot_sec"] == max(durations)
+        # Rounded as the notes print them (1 decimal / 2 decimals), so every surface shows the same figure.
+        assert fit["min_speed"] == round(min(s["speed"] for s in video["shots"]), 2)
+        assert fit["max_shot_sec"] == round(max(durations), 1)
+        # An adjacent repeat follows a shot of the same clip; only a pool of one has them.
+        adjacent = sum(a == b for a, b in itertools.pairwise(refs))
         if library:
-            # Uploads repeat only when a source window overlaps an earlier one of the same clip.
+            # Uploads repeat only when a source window comes closer than REPEAT_GAP_SEC to an earlier one
+            # of the same clip (windows exactly the gap apart are disjoint; 1 µs for float noise).
             windows: dict[str, list[tuple[float, float]]] = {}
-            overlapping = 0
-            for shot in video["shots"]:
+            overlapping = adjacent = 0
+            gap = variation.REPEAT_GAP_SEC - 1e-6
+            for i, shot in enumerate(video["shots"]):
                 a, b = shot["src_in"], shot["src_in"] + shot["duration"] * shot["speed"]
                 earlier = windows.setdefault(_ref(shot), [])
-                gap = variation.REPEAT_GAP_SEC
-                overlapping += any(a < y + gap and x - gap < b for x, y in earlier)
+                hit = any(a < y + gap and x - gap < b for x, y in earlier)
+                overlapping += hit
+                adjacent += hit and i > 0 and refs[i - 1] == refs[i]
                 earlier.append((a, b))
             assert fit["repeat_shots"] == fit["overlap_repeat_shots"] == overlapping
+            assert fit["adjacent_repeat_shots"] == adjacent
         else:
             repeats = len(refs) - len(set(refs))
             assert fit["repeat_shots"] == repeats, (refs, fit)
             assert 0 <= fit["overlap_repeat_shots"] <= repeats
+            assert fit["adjacent_repeat_shots"] == adjacent and (adjacent == 0 or pool == 1)
             scene_refs: dict[str, set[str]] = {}
             scene_repeats = 0  # another clip of a storyboard scene already shown in the video
             for shot in video["shots"]:
@@ -255,12 +263,12 @@ def check_plan(
     assert stats["shots_per_video"] == [f["shots"] for f in fits]
     assert stats["beat_shots_per_video"] == [f["beat_shots"] for f in fits]
     assert stats["fitted_videos"] == sum(f["fitted"] for f in fits)
-    for key in ("repeat_shots", "overlap_repeat_shots", "scene_repeat_shots"):
+    for key in ("repeat_shots", "overlap_repeat_shots", "adjacent_repeat_shots", "scene_repeat_shots"):
         assert stats[key] == sum(f[key] for f in fits), key
     assert stats["videos_with_repeats"] == sum(f["repeat_shots"] > 0 for f in fits)
     assert (stats["repeat_warning"] is not None) == (stats["repeat_shots"] > 0)
-    assert stats["min_speed"] == min(s["speed"] for v in result["videos"] for s in v["shots"])
-    assert stats["max_shot_sec"] == max(s["duration"] for v in result["videos"] for s in v["shots"])
+    assert stats["min_speed"] == round(min(s["speed"] for v in result["videos"] for s in v["shots"]), 2)
+    assert stats["max_shot_sec"] == round(max(s["duration"] for v in result["videos"] for s in v["shots"]), 1)
 
     if conf["count"] >= 2:
         full = [json.dumps(v["shots"], sort_keys=True) for v in result["videos"]]

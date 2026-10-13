@@ -52,6 +52,8 @@ interface EstimateDto {
   max_shot_sec?: number;
   min_speed?: number;
   repeat_shots?: number;
+  overlap_repeat_shots?: number;
+  adjacent_repeat_shots?: number;
   repeat_warning?: string | null;
   budget_fit?: BudgetFitDto | null;
 }
@@ -122,6 +124,13 @@ function shotsText(estimate: EstimateDto): string {
 function paceText(estimate: EstimateDto): string {
   const slowest = estimate.min_speed!;
   return `最長 ${estimate.max_shot_sec!.toFixed(1)}秒 ・ ${slowest >= 0.995 ? "等速" : `最も遅い ${slowest.toFixed(2)}倍速`}`;
+}
+
+/** The hint of 「動画内の同じ素材」: only what holds for every repeated shot (as `repeat_warning` words it). */
+function repeatHintText(estimate: EstimateDto): string {
+  return [estimate.adjacent_repeat_shots === 0 ? "連続しない" : null, estimate.overlap_repeat_shots === 0 ? "別の区間" : null, "寄りの構図"]
+    .filter(Boolean)
+    .join("・");
 }
 
 async function expectShotRows(panel: Locator, estimate: EstimateDto): Promise<void> {
@@ -214,7 +223,15 @@ test("mock: uncapped videos never repeat a clip; a cap of 1 shows the repeats an
     expect(estimate.repeat_warning).toContain("再登場");
     await expect(estimateRow(panel, "動画内の同じ素材")).toHaveText(/^\d+ショット$/);
     await expectShotRows(panel, estimate);
-    await expect(panel.locator("dt", { hasText: "動画内の同じ素材" })).toContainText("連続しない・別の区間・寄りの構図");
+    // One clip: the repeat follows it back to back and shows its footage again, so the hint claims neither
+    // 連続しない nor 別の区間 (the warning's parenthesis says the same).
+    expect(estimate.adjacent_repeat_shots).toBeGreaterThan(0);
+    expect(estimate.overlap_repeat_shots).toBeGreaterThan(0);
+    const hint = panel.locator("dt", { hasText: "動画内の同じ素材" });
+    await expect(hint).toContainText(repeatHintText(estimate));
+    await expect(hint).not.toContainText("連続しない");
+    await expect(hint).not.toContainText("別の区間");
+    expect(estimate.repeat_warning).toContain("（寄りの構図で使います）。");
     // Shown once, above the variety block (not repeated in the notes list).
     await expect(panel.getByText(estimate.repeat_warning!, { exact: true })).toBeVisible();
 
@@ -283,7 +300,10 @@ test("OpenRouter: budget fit applies the cap that fits; the confirmation names t
 
   await test.step("applying it sets the cap; the same seed reproduces exactly the plan it priced", async () => {
     const applied = nextEstimate(page, { provider: "openrouter", max_new_clips: fit.max_new_clips, budget_limit_usd: budget });
-    await panel.getByRole("button", { name: `上限を${fit.max_new_clips}本にする` }).click();
+    const apply = panel.getByRole("button", { name: `上限を${fit.max_new_clips}本にする` });
+    await apply.click();
+    // Until the new estimate arrives the old suggestion is stale (priced for other settings): it cannot be applied again.
+    await expect(apply).toBeDisabled();
     await expect(limitSwitch).toHaveAttribute("aria-checked", "true");
     await expect(limitInput).toHaveValue(String(fit.max_new_clips));
     const estimate = await applied;
