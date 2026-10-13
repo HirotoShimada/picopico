@@ -26,7 +26,12 @@
   only with ``settings["allow_mirror"]``: mirroring turns any text in the
   footage into mirror writing); clip usage is balanced so every newly
   generated clip is used, and footage that comes back gets a different
-  camera move (or a flip, when allowed).
+  camera move (or a flip, when allowed). Generated clips already carry the
+  model's own camera move, so their synthetic move is only a slight centred
+  zoom (≤ ``GENERATED_MAX_ZOOM_DELTA``, no pan); footage back from an earlier
+  video gets a *static* crop (``GENERATED_CROP_ZOOM``), a clip shown again in
+  the same video a *static* punch-in (alternating with the crop when it comes
+  back more than once); library uploads keep the full moves.
 
 Everything is deterministic for a given ``seed``; the budget is not an input
 (the estimate, not the plan, decides whether a batch is affordable).
@@ -55,11 +60,14 @@ __all__ = [
     "FIT_MIN_SPEED",
     "FIT_SLOW_WEIGHT",
     "FRAME_SLACK_SEC",
+    "GENERATED_CROP_ZOOM",
+    "GENERATED_MAX_ZOOM_DELTA",
     "MAX_FIT_SHOT_SEC",
     "MAX_POOL",
     "MAX_SHOT_SEC",
     "MIN_SHOT_SEC",
     "NEAR_NATURAL_SPEED",
+    "PUNCH_IN_ZOOM",
     "REPEAT_GAP_SEC",
     "SCENE_ADJACENT_COST",
     "SCENE_REPEAT_COST",
@@ -96,6 +104,16 @@ SCENE_ADJACENT_COST = 3.0  # the previous shot shows the same scene
 FIT_SLOW_WEIGHT = 10.0  # fit DP: weight of slow motion against uneven shot lengths
 _ORDER_TAKEN_COST = 20.0  # retry of an identical edit: per earlier video whose clip order a pick would follow
 _MAX_REFITS = 4  # next most even splits tried for a fitted video whose every clip order is taken
+# Ken Burns: library uploads get a zoom of 0.03–0.12 and pans; a generated clip already has the
+# model's own camera move, and a synthetic glide on top of it reads as floaty, so it only gets a
+# centred zoom of at most this much over the shot (no pan).
+GENERATED_MAX_ZOOM_DELTA = 0.02
+_LIBRARY_MAX_ZOOM_DELTA = 0.12
+PUNCH_IN_ZOOM = (1.12, 1.19)  # a clip shown again in the same video is framed this much tighter
+# A generated clip's second visible framing besides the full frame and the punch-in: a static crop
+# between the two (footage back from an earlier video, and every other repeat of a clip that has to
+# come back more than once in a video, so two uses in a row never share a framing).
+GENERATED_CROP_ZOOM = 1.08
 
 _MIN_MS = int(MIN_SHOT_SEC * 1000)
 _MAX_MS = int(MAX_SHOT_SEC * 1000)
@@ -878,12 +896,40 @@ def _generated_pool(
 
 
 Footage = tuple[str, int]  # (clip ref, in-point bucket)
-Framing = tuple[bool, str, int]  # (mirrored, pan, zoom direction: 1 in, -1 out, 0 still)
+Framing = tuple[bool, str, int]  # (mirrored, move class: a pan / "gentle" / "punch", zoom direction)
+Move = tuple[str, int]  # (pan / "gentle" / "punch", zoom direction: 1 in, -1 out, 0 still or not told apart)
+
+
+def _zoom_sign(zoom_from: float, zoom_to: float) -> int:
+    """Zoom direction: 1 in, -1 out, 0 still."""
+    return (zoom_to > zoom_from) - (zoom_to < zoom_from)
+
+
+def _move_class(pan: str, zoom_from: float, zoom_to: float) -> Move:
+    """A camera move as it reads on screen.
+
+    Library moves (pans, 3–12 % zooms) are told apart by pan and zoom direction. A generated clip's slight
+    centred zoom (≤ GENERATED_MAX_ZOOM_DELTA) looks the same in or out — its own camera move dominates —
+    so every such zoom is one class, ``("gentle", 0)``; the static crop (GENERATED_CROP_ZOOM) and the static
+    punch-in (PUNCH_IN_ZOOM) are two more, ``("crop", 0)`` and ``("punch", 0)``.
+    """
+    if zoom_from == zoom_to and zoom_from >= PUNCH_IN_ZOOM[0] - 1e-9:
+        return "punch", 0
+    if pan == "center" and max(zoom_from, zoom_to) <= 1.0 + GENERATED_MAX_ZOOM_DELTA + 1e-9:
+        return "gentle", 0
+    if zoom_from == zoom_to:
+        return "crop", 0
+    return str(pan), _zoom_sign(zoom_from, zoom_to)
+
+
+_GENTLE: Move = ("gentle", 0)
+_CROP: Move = ("crop", 0)
+_PUNCH: Move = ("punch", 0)
 
 
 def _framing(hflip: bool, pan: str, zoom_from: float, zoom_to: float) -> Framing:
-    """How a shot frames its footage: mirrored or not, the pan and the zoom direction."""
-    return bool(hflip), str(pan), (zoom_to > zoom_from) - (zoom_to < zoom_from)
+    """How a shot frames its footage: mirrored or not, and its camera move as it reads on screen."""
+    return (bool(hflip), *_move_class(pan, zoom_from, zoom_to))
 
 
 @dataclass
@@ -975,22 +1021,43 @@ def _speed_and_in(
 
 
 def _ken_burns(
-    energy: str, rng: random.Random, avoid: frozenset[tuple[str, int]] = frozenset(), punch_in: bool = False
+    energy: str,
+    rng: random.Random,
+    avoid: frozenset[Move] = frozenset(),
+    punch_in: bool = False,
+    *,
+    gentle: bool = False,
+    crop: bool = False,
 ) -> tuple[float, float, str]:
-    """(zoom_from, zoom_to, pan); a (pan, zoom direction) in ``avoid`` (the moves this footage
+    """(zoom_from, zoom_to, pan); a move in ``avoid`` (:func:`_move_class` of the moves this footage
     already had) is re-drawn a few times, so repeated footage looks different. ``punch_in``
-    (a clip shown again in the same video) frames it tighter: zoom 1.12–1.19."""
+    (a clip shown again in the same video) frames it tighter: zoom 1.12–1.19.
+
+    ``gentle`` (generated clips: the footage already moves) keeps the frame centred and the zoom
+    within GENERATED_MAX_ZOOM_DELTA (1/6 of the library move), and a punch-in holds still at
+    1.15–1.19; ``crop`` (gentle only) holds still at GENERATED_CROP_ZOOM. Every gentle zoom reads
+    the same, so for generated clips the caller picks one of the three visible framings (full frame,
+    crop, punch-in; see :func:`_plan_video_shots`). Both modes draw the same random numbers per attempt.
+    """
     for _ in range(6):
         delta = rng.uniform(0.06, 0.12) if energy == "high" else rng.uniform(0.03, 0.07)
         pan = "center" if rng.random() < (0.3 if energy == "high" else 0.45) else rng.choice(_PANS)
-        base = 1.0 if pan == "center" else 1.06  # a pan needs headroom at both ends
-        if punch_in:
-            base, delta = 1.12, min(delta, 0.07)
-        if rng.random() < 0.65:
-            zoom_from, zoom_to = base, base + delta
+        zoom_in = rng.random() < 0.65
+        if gentle:
+            pan = "center"
+            if punch_in:  # a static tighter framing: no glide stacked on the clip's own move
+                zoom_from = zoom_to = PUNCH_IN_ZOOM[0] + min(delta, PUNCH_IN_ZOOM[1] - PUNCH_IN_ZOOM[0])
+            elif crop:
+                zoom_from = zoom_to = GENERATED_CROP_ZOOM
+            else:
+                delta *= GENERATED_MAX_ZOOM_DELTA / _LIBRARY_MAX_ZOOM_DELTA
+                zoom_from, zoom_to = (1.0, 1.0 + delta) if zoom_in else (1.0 + delta, 1.0)
         else:
-            zoom_from, zoom_to = base + delta, base
-        if (pan, 1 if zoom_to > zoom_from else -1) not in avoid:
+            base = 1.0 if pan == "center" else 1.06  # a pan needs headroom at both ends
+            if punch_in:
+                base, delta = PUNCH_IN_ZOOM[0], min(delta, PUNCH_IN_ZOOM[1] - PUNCH_IN_ZOOM[0])
+            zoom_from, zoom_to = (base, base + delta) if zoom_in else (base + delta, base)
+        if _move_class(pan, zoom_from, zoom_to) not in avoid:
             break
     return round(zoom_from, 3), round(zoom_to, 3), pan
 
@@ -1062,7 +1129,9 @@ def _plan_video_shots(
 ) -> list[dict[str, Any]]:
     """Pick a clip, in-point, speed and camera move per shot. A clip not yet in this video wins
     whenever one is long enough (fresh-first); a clip that has to come back gets the source
-    window that overlaps its earlier ones least and a tighter framing it has not had.
+    window that overlaps its earlier ones least and a tighter framing it has not had (generated
+    clips: a static punch-in, alternating with a static crop when the clip comes back again; their
+    camera moves are slight, see :func:`_ken_burns`).
 
     ``taken_orders`` (a retry after an edit identical to an earlier video's) are the clip orders
     earlier videos with these cuts used: a clip that would follow one of them again costs more,
@@ -1073,7 +1142,8 @@ def _plan_video_shots(
     in_video: dict[str, int] = {}
     scenes_in_video: dict[str, int] = {}
     windows: dict[str, list[tuple[float, float]]] = {}  # source windows per clip in this video
-    moves: dict[str, set[tuple[str, int]]] = {}  # (pan, zoom direction) per clip in this video
+    moves: dict[str, set[Move]] = {}  # camera moves (:func:`_move_class`) per clip in this video
+    last_move: dict[str, Move] = {}  # the clip's most recent move in this video
     previous: str | None = None
     previous_scene: str | None = None
     t_ms = 0
@@ -1123,7 +1193,23 @@ def _plan_video_shots(
                 hflip = rng.random() < 0.5
         # Footage seen before gets a camera move it has not had with this mirroring.
         avoid = frozenset((f[1], f[2]) for f in seen if f[0] == hflip) | frozenset(moves.get(clip.ref, ()))
-        zoom_from, zoom_to, pan = _ken_burns(energy, rng, avoid, punch_in=repeat)
+        crop = False
+        if library:
+            punch_in = repeat
+        elif repeat:
+            # A generated clip shown again in this video is framed tighter, as a static punch-in; when it
+            # has to come back more than once, punch-in and the static crop alternate, so two uses in a
+            # row (a pool of one) never share a framing.
+            punch_in = last_move.get(clip.ref) != _PUNCH
+            crop = not punch_in
+        else:
+            # Footage back from an earlier video gets a framing it has not had: a slight zoom in or out
+            # reads the same, so the static crop, then the punch-in.
+            crop = _GENTLE in avoid and _CROP not in avoid
+            punch_in = _GENTLE in avoid and _CROP in avoid and _PUNCH not in avoid
+        zoom_from, zoom_to, pan = _ken_burns(
+            energy, rng, avoid, punch_in=punch_in, gentle=not library, crop=crop
+        )
         shots.append(
             {
                 "clip_key": None if library else clip.ref,
@@ -1143,7 +1229,8 @@ def _plan_video_shots(
         if clip.scene_id is not None:
             scenes_in_video[clip.scene_id] = scenes_in_video.get(clip.scene_id, 0) + 1
         windows.setdefault(clip.ref, []).append((src_in, src_in + (shot_sec + pad) * speed))
-        moves.setdefault(clip.ref, set()).add((pan, 1 if zoom_to > zoom_from else -1))
+        moves.setdefault(clip.ref, set()).add(_move_class(pan, zoom_from, zoom_to))
+        last_move[clip.ref] = _move_class(pan, zoom_from, zoom_to)
         previous_scene = clip.scene_id
         usage.global_uses[clip.ref] = usage.global_uses.get(clip.ref, 0) + 1
         usage.positions[(clip.ref, position)] = usage.positions.get((clip.ref, position), 0) + 1
@@ -1229,7 +1316,8 @@ def _assign_unused(
 
 def _variety_score(videos: Sequence[Mapping[str, Any]]) -> float:
     """Distinct looks per shot: each footage (clip, in-point bucket) counts once, twice when it
-    comes back framed differently (another camera move or a mirror); further repeats add nothing."""
+    comes back framed visibly differently (another camera move, a punch-in or a mirror; a generated
+    clip's slight zoom in or out counts as one framing); further repeats add nothing."""
     framings: dict[Footage, set[Framing]] = {}
     total = 0
     for video in videos:

@@ -53,7 +53,9 @@ def _cuts(video: dict[str, Any]) -> tuple[int, ...]:
 
 
 def _move(shot: dict[str, Any]) -> tuple[str, int]:
-    return shot["pan"], 1 if shot["zoom_to"] > shot["zoom_from"] else -1
+    """The camera move as the planner's framings count it: (pan, zoom direction) for library moves; a
+    generated clip's slight zoom, static crop and static punch-in are one class each."""
+    return variation._move_class(shot["pan"], shot["zoom_from"], shot["zoom_to"])
 
 
 def _pads(video: dict[str, Any]) -> list[float]:
@@ -186,6 +188,8 @@ def test_last_resort_repeats_are_few_apart_and_reframed(count: int) -> None:
                 zooms = (shot["zoom_from"], shot["zoom_to"])
                 assert 1.12 <= min(zooms) <= max(zooms) <= 1.19, shot
                 assert _move(shot) not in earlier, (shot, earlier)
+                # Generated footage moves on its own: the punch-in holds still instead of gliding.
+                assert shot["zoom_from"] == shot["zoom_to"] and shot["pan"] == "center", shot
             earlier.append(_move(shot))
     stats = result["stats"]
     assert stats["repeat_shots"] == stats["videos_with_repeats"] == count
@@ -201,6 +205,26 @@ def test_last_resort_repeats_are_few_apart_and_reframed(count: int) -> None:
     )
     assert "再登場" in stats["repeat_warning"] and "上限を" in stats["repeat_warning"]
     assert not any("まとめました" in w for w in result["warnings"]), "only repeat-free fitted videos are announced"
+
+
+@pytest.mark.parametrize(("max_new", "duration", "seed"), [(1, 20, 3), (1, 30, 5), (2, 30, 3), (1, 20, 1)])
+def test_a_clip_that_keeps_coming_back_never_repeats_its_framing_back_to_back(
+    max_new: int, duration: int, seed: int
+) -> None:
+    """Regression: with a pool of one, the 3rd use got the same static punch-in as the 2nd (only a 1-2 % zoom
+    apart, from the same in-point), so the cut read as the clip restarting."""
+    _, _, result = _sample(conf={"max_new_clips": max_new, "duration_sec": duration}, seed=seed)
+    for video in result["videos"]:
+        last: dict[str, dict[str, Any]] = {}
+        for shot in video["shots"]:
+            ref = str(shot["clip_key"])
+            if ref in last:
+                before = last[ref]
+                assert _move(shot) != _move(before), (before, shot)
+                # Visibly tighter or wider: the framings are at least 7 % apart.
+                assert abs(max(shot["zoom_from"], shot["zoom_to"]) - max(before["zoom_from"], before["zoom_to"])) >= 0.07
+                assert _move(shot) in (("punch", 0), ("crop", 0)), "a repeat is framed tighter than the first use"
+            last[ref] = shot
 
 
 def test_without_a_beat_solution_the_beat_cuts_stay_and_the_plan_never_raises() -> None:

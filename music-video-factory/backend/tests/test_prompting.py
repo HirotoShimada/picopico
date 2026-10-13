@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -20,8 +21,10 @@ from app.services.prompting import (
     glossary_translate,
     mood_keywords,
     rewrite_brand_names,
+    sanitize_fragment,
     sanitize_prompt,
     screen_free_text,
+    strip_ai_cliches,
     strip_forbidden_names,
     strip_person_references,
     translate_to_english,
@@ -329,3 +332,164 @@ def test_sanitize_rewrites_product_names(text: str, brand: str) -> None:
 def test_generic_film_and_place_words_are_kept() -> None:
     text = "Mount Fuji at dawn, 35mm anamorphic lens, tungsten night-film halation, 16mm grain"
     assert rewrite_brand_names(text) == (text, [])
+
+
+# --- stock "AI look" vocabulary ("映像がAI感強くない？", 2026-10-13) -------------------------------------------------
+
+_BUZZWORDS = re.compile(
+    r"cinematic|\bepic\b|ethereal|dreamy|bokeh|anamorphic|lens flare|halation|grain|\b8k\b|ultra-detailed|"
+    r"masterpiece|#[0-9a-f]{6}|palette|\d+mm",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            (
+                "Cinematic live-action shot: a woman waits at a bus stop. Shot on 35mm anamorphic lens, shallow "
+                "depth of field, gentle oval bokeh."
+            ),
+            "Live-action shot: a woman waits at a bus stop. Shallow depth of field.",
+        ),
+        (
+            "soft morning light through the petals with gentle lens flare, camera at eye level",
+            "soft morning light through the petals, camera at eye level",
+        ),
+        ("a quiet street, tungsten night-film look with soft red halation around highlights", "a quiet street"),
+        ("forest green, blossom pink and sky blue color palette, a woman walking", "a woman walking"),
+        ("a man on a pier, #2F5D3A, fine grain, 8k, masterpiece, ultra-detailed", "a man on a pier"),
+        ("Close-up shot on a 50mm lens of the woman laughing", "Close-up shot of the woman laughing"),
+        ("dark, moody, cinematic mood", "dark, moody mood"),
+        ("an epic view of the bay on a dreamy afternoon", "a view of the bay on an afternoon"),
+        ("a soft dreamy glow over the meadow, wind in the grass", "wind in the grass"),
+    ],
+)
+def test_strip_ai_cliches(text: str, expected: str) -> None:
+    out, removed = strip_ai_cliches(text)
+    assert out == expected and removed
+    assert not _BUZZWORDS.search(out)
+    assert strip_ai_cliches(out) == (out, [])  # idempotent
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "A fictional woman walking through a misty forest at dawn",
+        "golden grain fields at dusk, a red mailbox by the road",
+        "the woman wipes a fogged window, the bus lights pass outside, handheld camera",
+        "warm street lamps, shallow depth of field, a man laughing",
+    ],
+)
+def test_ordinary_prompts_are_not_touched_by_the_cliche_filter(text: str) -> None:
+    assert strip_ai_cliches(text) == (text, [])
+
+
+def test_fragments_lose_cliches_silently_and_stay_idempotent() -> None:
+    text = (
+        "Cinematic medium shot of a woman tying her shoelace on a wet platform, 35mm anamorphic lens, soft halation, "
+        "teal and amber palette, #0B0F2B, fine film grain, 8k"
+    )
+    fragment, warnings = sanitize_fragment(text, forbidden_names=[])
+    assert warnings == []  # Claude's own style words: removed without bothering the user
+    assert fragment == "Medium shot of a woman tying her shoelace on a wet platform"
+    assert sanitize_fragment(fragment, forbidden_names=[]) == (fragment, [])
+
+
+# Paid alternate take 2ff76cf0 (project 454e4da5, $0.18): its stored prompt is the scene's legacy prompt plus the
+# first alternate-take hint, re-sanitized by variation._variant_prompt. The clip cache key is derived from that
+# text, so sanitize_prompt must reproduce it byte for byte (cliché stripping belongs where prompts are composed).
+_PAID_ALTERNATE_STORED = (
+    "Wide establishing shot of a misty green glen with dry-stone walls and a winding country road, a man in his late "
+    "20s with short wavy dark-brown hair standing small on the road, charcoal wool overcoat, cream cable-knit sweater, "
+    "olive corduroy trousers, brown leather boots. Soft overcast light, drifting mist. High-angle locked-off camera. "
+    "28mm lens. Muted slate, beige, olive, low-contrast film grain. Vertical 9:16 composition. Photorealistic "
+    "live-action footage, natural skin texture, realistic hands, subtle natural motion. charcoal wool overcoat, cream "
+    "cable-knit sweater, olive corduroy trousers, brown leather boots; muted film grain. charcoal wool overcoat, cream "
+    "cable-knit sweater, olive corduroy trousers, brown leather boots; slate, beige, olive palette; muted low-contrast "
+    "film grain, misty light. fictional characters only, no real or identifiable people, no celebrities, no text, no "
+    "captions, no watermark."
+)
+_PAID_ALTERNATE_CLIP = (
+    _PAID_ALTERNATE_STORED.replace(
+        "misty light. fictional characters only", "misty light. Alternate take with tighter framing. fictional "
+        "characters only"
+    )
+)  # fmt: skip
+
+
+def test_sanitize_prompt_is_byte_stable_for_stored_prompts() -> None:
+    """Regression: stripping look words inside sanitize_prompt changed every alternate take of stored storyboards."""
+    prompt, warnings = sanitize_prompt(
+        f"{_PAID_ALTERNATE_STORED} Alternate take with tighter framing.", forbidden_names=[]
+    )
+    assert prompt == _PAID_ALTERNATE_CLIP and warnings == []
+    assert sanitize_prompt(_PAID_ALTERNATE_STORED, forbidden_names=[])[0] == _PAID_ALTERNATE_STORED
+    assert "28mm lens" in prompt and "palette" in prompt  # left alone: this text is already composed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Close-up of the woman's hands mixing blue and yellow paint on a wooden palette by the window",
+        "Medium shot of the woman scraping paint off a palette knife in a cluttered art room",
+        "Setting: a painter's attic studio with a paint palette and canvases",
+        "A bookshelf with LUT manuals",
+        "Medium shot of the woman at a desk with a colour scheme chart, choosing paint swatches",
+        "Close detail of the warm grain of an old wooden door, paint peeling, no people",
+        "Close-up of the natural grain of a cedar table, a coffee ring on it, no people",
+        "Close-up of rice grains falling into a pot, steam rising, no people",
+        "Morning light leaks through a gap in the curtains onto an unmade bed, no people",
+        "Wide shot of a magical-looking night market, lanterns and steam, no people",
+        "Close-up of a 50mm-wide crack in the concrete wall, weeds growing out of it, no people",
+        "Medium shot of the woman holding an old 35mm film camera, winding it on a rooftop",
+        "Full shot of the woman carrying a 16mm projector up the stairs of a small cinema",
+        "The woman stands on a bridge, a 4k TV glowing in a shop window behind her",
+    ],
+)
+def test_real_textures_props_and_paint_palettes_are_not_look_words(text: str) -> None:
+    """Regression: a bare "palette", "grain of …", "light leaks through …", "50mm-wide" emptied whole shots."""
+    assert strip_ai_cliches(text) == (text, [])
+    assert sanitize_fragment(text, forbidden_names=[]) == (text, [])
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("A dreamy, epic afternoon on the porch", "An afternoon on the porch"),
+        ("An epic dreamy cinematic shot of a harbour", "A shot of a harbour"),
+        ("Close-up of the woman, cinematic, epic, and dreamy, laughing", "Close-up of the woman, laughing"),
+        ("cinematic, epic, and dreamy, laughing", "laughing"),
+        ("Wide shot of a lake with bokeh", "Wide shot of a lake"),
+        ("Medium shot of the woman in a sunlit kitchen with a warm colour palette",
+         "Medium shot of the woman in a sunlit kitchen"),
+        ("a teal-and-orange grading, a man walking", "a man walking"),
+        ("palette of teal and amber, a woman walking", "a woman walking"),
+        ("low-angle slow arc orbit, 35mm anamorphic lens, flares, amber against deep teal",
+         "low-angle slow arc orbit, amber against deep teal"),
+        ("high-angle camera with slow smooth pan, 16mm-style lens, lifted blacks",
+         "high-angle camera with slow smooth pan"),
+    ],
+)  # fmt: skip
+def test_cliche_removal_repairs_the_sentence(text: str, expected: str) -> None:
+    out, removed = strip_ai_cliches(text)
+    assert out == expected and removed
+    assert strip_ai_cliches(out) == (out, [])
+
+
+def test_a_fragment_made_only_of_look_words_is_kept_with_a_warning() -> None:
+    """The filter never sends an empty or gutted shot: it keeps the text and says why."""
+    text = "Cinematic 35mm anamorphic shot with bokeh and lens flare, 8k"
+    assert strip_ai_cliches(text)[0] == ""
+    fragment, warnings = sanitize_fragment(text, forbidden_names=[])
+    assert fragment == text and len(warnings) == 1 and "元の表現のまま" in warnings[0]
+
+
+def test_sanitize_fragment_cleans_without_clauses() -> None:
+    fragment, warnings = sanitize_fragment(
+        "Taylor Swift walking past a vending machine, cinematic lens flare, no text", forbidden_names=["Taylor Swift"]
+    )
+    assert fragment == "walking past a vending machine"
+    assert any("Taylor Swift" in w for w in warnings)
+    assert LIKENESS_SAFETY_CLAUSE not in fragment and NO_TEXT_CLAUSE not in fragment

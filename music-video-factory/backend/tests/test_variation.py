@@ -511,14 +511,24 @@ def test_no_mirroring_unless_allowed() -> None:
     assert any(s["hflip"] for s in mirrored) and not all(s["hflip"] for s in mirrored)
 
 
+def _move(shot: dict[str, Any]) -> tuple[str, int]:
+    """The camera move as the planner's framings count it: (pan, zoom direction) for library moves; a
+    generated clip's slight zoom, static crop and static punch-in are one class each."""
+    return variation._move_class(shot["pan"], shot["zoom_from"], shot["zoom_to"])
+
+
 def test_repeated_footage_gets_a_different_camera_move() -> None:
     # Without flips, variety comes from the camera move: footage that comes back (same clip,
-    # same in-point bucket) is framed with a pan / zoom direction it has not had yet.
-    result = plan(settings=settings(count=30, reuse="economy"), provider_clip_duration=2.0)
+    # same in-point bucket) is framed with a pan / zoom direction it has not had yet. Library
+    # uploads keep the full moves (pans, 3-12 % zooms), so almost every comeback gets a new one
+    # (29 short uploads: the pool the generated batch below gets, each footage back ~5 times).
+    uploads = [{"id": f"u{i}", "duration": 2.0, "source": "upload"} for i in range(29)]
+    result = plan(settings=settings(provider="library", model=None, count=30, reuse="economy"),
+                  existing_clips=uploads, storyboard=None)  # fmt: skip
     moves: dict[tuple[str, int], list[tuple[str, int]]] = {}
     fresh = repeats = 0
     for shot in (s for v in result["videos"] for s in v["shots"]):
-        move = (shot["pan"], 1 if shot["zoom_to"] > shot["zoom_from"] else -1)
+        move = _move(shot)
         earlier = moves.setdefault((_ref(shot), int(shot["src_in"] // 1.0)), [])
         if earlier:
             repeats += 1
@@ -526,6 +536,101 @@ def test_repeated_footage_gets_a_different_camera_move() -> None:
         earlier.append(move)
     assert repeats > 50
     assert fresh / repeats >= 0.97  # random moves alone repeated one in ~7 of them
+    assert len({pan for pan, _ in itertools.chain.from_iterable(moves.values())}) == 5
+
+
+def test_generated_clips_get_only_a_slight_centred_zoom() -> None:
+    # A generated clip already carries the model's own camera move; a synthetic glide on top of it
+    # reads as floaty. Its move is a centred zoom of at most GENERATED_MAX_ZOOM_DELTA (no pan). A slight
+    # zoom in or out reads the same, so footage that comes back in a later video gets a visibly
+    # different framing instead: a static crop (then a static punch-in).
+    result = plan(settings=settings(count=30, reuse="economy"), provider_clip_duration=2.0)
+    moves: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    first_comebacks = fresh = 0
+    for video in result["videos"]:
+        for shot in video["shots"]:
+            zooms = (shot["zoom_from"], shot["zoom_to"])
+            assert shot["pan"] == "center", shot
+            move = _move(shot)
+            if move == ("gentle", 0):
+                assert min(zooms) == 1.0 and 0 < max(zooms) - 1.0 <= variation.GENERATED_MAX_ZOOM_DELTA + 1e-9, shot
+            elif move == ("crop", 0):
+                assert zooms == (variation.GENERATED_CROP_ZOOM, variation.GENERATED_CROP_ZOOM), shot
+            else:
+                assert move == ("punch", 0) and zooms[0] == zooms[1], shot
+                assert variation.PUNCH_IN_ZOOM[0] <= zooms[0] <= variation.PUNCH_IN_ZOOM[1], shot
+            earlier = moves.setdefault((_ref(shot), int(shot["src_in"] // 1.0)), [])
+            if len(earlier) == 1:
+                first_comebacks += 1
+                fresh += move not in earlier
+            earlier.append(move)
+    assert first_comebacks > 20 and fresh / first_comebacks >= 0.97
+    assert {m for m in itertools.chain.from_iterable(moves.values())} == {("gentle", 0), ("crop", 0), ("punch", 0)}
+
+
+def test_slight_zoom_directions_do_not_count_as_variety() -> None:
+    """Regression: a ≤ 2 % zoom in vs out counted as a "different framing" and hid the variety warning."""
+
+    def shot(zoom_from: float, zoom_to: float, src_in: float = 0.2) -> dict[str, Any]:
+        return {"clip_key": "c01", "clip_id": None, "src_in": src_in, "hflip": False, "pan": "center",
+                "zoom_from": zoom_from, "zoom_to": zoom_to}  # fmt: skip
+
+    score = variation._variety_score
+    assert score([{"shots": [shot(1.0, 1.009), shot(1.007, 1.0)]}]) == 0.5  # same look
+    assert score([{"shots": [shot(1.0, 1.009), shot(1.08, 1.08)]}]) == 1.0  # a static crop is visibly tighter
+    assert score([{"shots": [shot(1.0, 1.009), shot(1.17, 1.17)]}]) == 1.0  # so is a punch-in
+    # Four clips shown five times each over ten videos, coming back only with the other slight zoom direction:
+    # one look per footage (0.2), below the warning line (counted as two framings this read 0.4: no warning).
+    videos = [
+        {"shots": [{**shot(*((1.0, 1.009) if v % 2 else (1.009, 1.0))), "clip_key": f"c{(2 * v + k) % 4}"}
+                   for k in range(2)]}
+        for v in range(10)
+    ]  # fmt: skip
+    assert score(videos) == 0.2 < variation.VARIETY_WARNING_THRESHOLD
+
+
+def _visible_framing(shot: dict[str, Any]) -> tuple[Any, ...]:
+    """A framing as a viewer tells it apart (independent of the planner): every slight centred zoom looks alike."""
+    a, b = shot["zoom_from"], shot["zoom_to"]
+    if shot["pan"] == "center" and abs(b - a) <= 0.0201 and max(a, b) <= 1.0201:
+        return shot["hflip"], "slight zoom"
+    return shot["hflip"], shot["pan"], round(a, 2), round(b, 2)
+
+
+def test_generated_variety_score_counts_only_visible_framings() -> None:
+    # The reviewed economy batch: 10 videos of 20 s from at most 4 generated clips.
+    result = plan(analysis=make_analysis(duration=200, bpm=120), settings=settings(
+        count=10, duration_sec=20, max_new_clips=4, reuse="economy"), storyboard=storyboard(n_scenes=8),
+        provider_clip_duration=6.0, segment=(0.0, 200.0), seed=11)  # fmt: skip
+    looks: dict[tuple[str, int], set[tuple[Any, ...]]] = {}
+    shots = [s for v in result["videos"] for s in v["shots"]]
+    for shot in shots:
+        looks.setdefault((_ref(shot), int(shot["src_in"] // variation.SRC_IN_BUCKET_SEC)), set()).add(
+            _visible_framing(shot)
+        )
+    visible = round(sum(min(2, len(f)) for f in looks.values()) / len(shots), 3)
+    stats = result["stats"]
+    assert stats["variety_score"] == visible
+    assert (stats["variety_warning"] is not None) == (visible < variation.VARIETY_WARNING_THRESHOLD)
+    # Comebacks are reframed visibly (static crop / punch-in), not by an invisible zoom direction.
+    assert any(_move(s) in (("crop", 0), ("punch", 0)) for s in shots)
+
+
+def test_ken_burns_modes_draw_the_same_random_numbers() -> None:
+    # Gentle (generated) and full (library) moves consume the RNG identically, so the slight moves
+    # change nothing else in a plan: the clip order, in-points and speeds stay what they were.
+    for energy, punch_in, seed in itertools.product(("high", "mid", "low"), (False, True), range(40)):
+        full, gentle = random.Random(seed), random.Random(seed)
+        library = variation._ken_burns(energy, full, punch_in=punch_in)
+        generated = variation._ken_burns(energy, gentle, punch_in=punch_in, gentle=True)
+        assert full.random() == gentle.random()
+        assert generated[2] == "center"
+        if punch_in:
+            assert generated[0] == generated[1] == max(library[:2]) and min(library[:2]) == 1.12
+        else:
+            ratio = variation.GENERATED_MAX_ZOOM_DELTA / 0.12
+            assert variation._zoom_sign(*generated[:2]) == variation._zoom_sign(*library[:2])
+            assert abs(generated[1] - generated[0]) == pytest.approx(abs(library[1] - library[0]) * ratio, abs=1e-3)
 
 
 def test_variety_score_counts_a_new_camera_move_like_a_mirror() -> None:
@@ -748,9 +853,13 @@ def test_lyric_style_text_style_and_transitions() -> None:
         assert video["text_style"] == {"font_size": 72, "position": "center"}
     assert {v["transition"] for v in result["videos"]} == {"cut", "crossfade"}
     assert not any(s["hflip"] for v in result["videos"] for s in v["shots"])  # mirroring is opt-in
-    pans = {s["pan"] for v in result["videos"] for s in v["shots"]}
+    # Generated clips move on their own: no synthetic pan (see test_generated_clips_get_only_a_slight_centred_zoom).
+    assert {s["pan"] for v in result["videos"] for s in v["shots"]} == {"center"}
+    library = plan(settings=settings(provider="library", model=None, count=12, preset="dreamy"),
+                   existing_clips=_uploads(), storyboard=None)  # fmt: skip
+    pans = {s["pan"] for v in library["videos"] for s in v["shots"]}
     assert len(pans) >= 4
-    for shot in (s for v in result["videos"] for s in v["shots"]):
+    for shot in (s for v in library["videos"] for s in v["shots"]):
         if shot["pan"] != "center":
             assert min(shot["zoom_from"], shot["zoom_to"]) >= 1.05, "pans need zoom headroom"
 

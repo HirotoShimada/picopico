@@ -2,9 +2,15 @@
 
 ``sanitize_prompt`` is applied to every *positive* video prompt before it is
 sent to a provider: it removes the artist's name and real-person / celebrity /
-look-alike phrasing (English and Japanese), and always appends the
-likeness-safety and no-text clauses. Negative prompts are not passed through it
-(they legitimately contain words such as "celebrity likeness").
+look-alike phrasing (English and Japanese), rewrites product names, and always
+appends the likeness-safety and no-text clauses. It is byte-stable for prompts
+that are already composed (the planner re-sanitizes stored prompts for
+alternate takes, and clip cache keys depend on the text). The stock "AI look"
+vocabulary (:func:`strip_ai_cliches`: cinematic/epic/dreamy…, bokeh, lens
+flares, anamorphic, film look, grain, halation, 8k, masterpiece…, colour
+palettes, hex codes) is removed where prompts are composed
+(:func:`sanitize_fragment` and the storyboard template). Negative prompts are not passed through it (they legitimately contain
+words such as "celebrity likeness" or "lens flare").
 
 ``translate_to_english`` uses Claude when it is configured — Anthropic directly
 (``ANTHROPIC_API_KEY``) or else via OpenRouter (``OPENROUTER_API_KEY``), see
@@ -42,6 +48,7 @@ __all__ = [
     "PersonReferences",
     "artist_name_variants",
     "detect_person_names",
+    "drop_colour_lists",
     "first_text_block",
     "glossary_keywords",
     "glossary_translate",
@@ -49,8 +56,11 @@ __all__ = [
     "mood_keywords",
     "person_reference_warnings",
     "prompt_body_budget",
+    "sanitize_fragment",
     "sanitize_prompt",
     "screen_free_text",
+    "strip_ai_cliches",
+    "strip_ai_cliches_guarded",
     "strip_forbidden_names",
     "strip_person_references",
     "translate_to_english",
@@ -291,6 +301,247 @@ _PLACE_WORDS = _wordset(
     "melbourne australia zealand"
 )
 _PERSON_NAME_MAX = 60
+
+
+# --- stock "AI look" vocabulary ------------------------------------------------------------------
+#
+# Video models answer "cinematic, anamorphic, bokeh, film grain, halation, 8k" with the glossy, floaty
+# footage people recognise as AI-generated ("映像がAI感強くない？", 2026-10-13). Those words are removed
+# where prompts are composed (storyboard shots, template text, stored storyboards being upgraded — never
+# inside ``sanitize_prompt``, which must stay byte-stable for prompts that are already composed: the clip
+# cache keys of paid takes depend on it). Grain and grading are added in post by the renderer, and colour
+# belongs to the things in the scene, not to a palette. Technical "look" clauses (``35mm anamorphic lens``,
+# ``soft halation around highlights``) go as a whole; in a clause that also carries content ("soft morning
+# light through the petals with gentle lens flare") only the look phrase goes, and a sentence is never
+# emptied when it has content. Adjectives such as "cinematic" or "dreamy" are removed as words (never inside
+# a hyphenated word such as "magical-looking"). Real textures and light are not look words: "the grain of an
+# old door", "light leaks through the curtains", "a paint palette", "a 35mm film camera", "a 50mm-wide crack".
+
+# Props that are film gear, not a film look ("a 35mm film camera", "a 16mm projector").
+_FILM_PROP = r"(?!\s+(?:film\s+)?(?:cameras?|projectors?|reels?|rolls?|canisters?|strips?|negatives?|spools?)\b)"
+_LOOK_PATTERNS: tuple[str, ...] = (
+    # Grain as a film look, never the grain of wood or rice ("the warm grain of an old wooden door").
+    r"\b(?:film|fine|visible|heavy|subtle|soft|light|gentle|organic|analog(?:ue)?|coarse|(?:16|35)\s?mm)"
+    + r"\s+grain\b(?!\s+of\b)",
+    r"\b(?:warm|natural)\s+grain\b(?=\s+(?:texture|structure|overlay|look|effect)\b)",
+    # …and as a clause of its own in a look list ("muted slate, beige, natural grain").
+    r"(?:^|(?<=[,;]))\s*(?:warm|natural)\s+grain(?=\s*(?:[,;.]|$))",
+    r"\bgrain(?:y|iness)?\s+(?:texture|structure|overlay)\b",
+    r"\bgrainy\b",
+    r"\bhalation\b",
+    r"\bfilm[\s-](?:look|stock|emulation|aesthetic|texture|grain)\b",
+    r"\b(?:8|16|35|65|70)\s?mm\s+film\b" + _FILM_PROP,
+    r"\bcinema\s+film\b" + _FILM_PROP,
+    r"\banamorphic(?:\s+(?:lens\s+)?flares?)?\b",
+    r"\b(?:horizontal|streaking)\s+(?:blue\s+)?flares?\b|\bblue\s+(?:lens\s+)?flares?\b",
+    r"\b(?:lifted|crushed|milky)\s+blacks\b",
+    r"(?:^|(?<=[,;]))\s*(?:(?:soft|warm|golden|subtle)\s+)?flares?(?=\s*(?:[,;.]|$))",
+    r"\bbokeh\b",
+    r"\blens\s+flares?\b",
+    # "light leaks" as a film effect, not light that leaks through a gap.
+    r"\blight\s+leaks?\b(?!\s+(?:through|in|into|from|out|under|around|past|between|onto|across|over|beneath|behind"
+    + r"|along|down|up|across)\b)",
+    r"\b(?:4|8|16)k\b(?!\s+(?:tvs?|televisions?|screens?|monitors?|displays?)\b)",
+    r"\bultra[\s-]?hd\b",
+    r"\b(?:ultra|hyper|highly)[\s-]?detailed\b",
+    r"\bmasterpiece\b",
+    r"\bbest\s+quality\b",
+    r"\bhigh(?:est)?[\s-]quality\b",
+    r"\baward[\s-]winning\b",
+    r"\btrending\s+on\s+[a-z]+\b",
+    r"\boctane\s+render\b",
+    r"\bunreal\s+engine\b",
+    r"\bray[\s-]?trac(?:ed|ing)\b",
+    r"\b(?:hyper|ultra)[\s-]?realis(?:tic|m)\b",
+    r"\bvolumetric\b",
+    r"\bgod[\s-]?rays\b",
+    r"\b(?:dreamy|ethereal|magical|heavenly|otherworldly|mystical)\s+glow\b",
+    r"\bf/\d+(?:\.\d+)?",
+    # Focal lengths ("35mm", "50 mm"), not measurements ("a 50mm-wide crack") or film gear.
+    r"\b\d{1,3}\s?mm(?:-(?:style|look|feel|like|film))?(?![\w-])" + _FILM_PROP,
+)
+_LOOK_TRIGGER = re.compile("|".join(_LOOK_PATTERNS), re.IGNORECASE)
+# Colour names (and their modifiers) of a palette list spread over several clauses before "… palette".
+_COLOUR_WORDS = _wordset(
+    "red orange yellow green blue purple violet pink white black grey gray brown beige cream ivory navy teal cyan "
+    "magenta amber ochre olive sage mint coral peach lilac lavender periwinkle mustard terracotta charcoal slate "
+    "crimson burgundy maroon turquoise indigo gold golden silver copper bronze rust blush pearl sand sky forest "
+    "sea blossom midnight electric neon deep dark light pale soft warm cool cold muted dusty faded burnt bright "
+    "rich off and tones tone hues hue pastel pastels earthy earth neutral neutrals monochrome monochromatic "
+    "desaturated vibrant limited restrained moody complementary colour color colours colors"
+)
+_COLOUR_ALT = "|".join(sorted(_COLOUR_WORDS - {"and"}, key=len, reverse=True))
+# "teal and orange", "blush-pink, sage", "warm colour": colour words with their separators.
+_COLOUR_RUN = rf"(?:(?:{_COLOUR_ALT})(?:[\s,-]+(?:and[\s-]+)?|\s+))+"
+_NOT_GRADING = r"(?!\s+(?:knives?|charts?|cards?|books?|swatch(?:es)?|samples?|wheels?)\b)"
+# The colour scheme / grading: "colour palette", "teal and orange palette", "palette of amber and teal",
+# "teal-and-orange grading", "a cinematic LUT", hex codes — not "a wooden palette" or "a palette knife".
+_PALETTE_PATTERN = (
+    rf"\bcolou?r\s+(?:palettes?|grad(?:e|ed|ing)|schemes?){_NOT_GRADING}\b"
+    rf"|\b{_COLOUR_RUN}palettes?\b{_NOT_GRADING}"
+    rf"|\bpalettes?\s+of\s+(?:{_COLOUR_ALT})(?:(?:[\s,-]+(?:and[\s-]+)?)(?:{_COLOUR_ALT}))*\b"
+    rf"|\b{_COLOUR_RUN}grad(?:e|ed|ing)\b"
+    r"|\bLUTs?\b(?=\s*(?:[,;.]|$))|\bLUTs?\s+(?:look|grade|grading|applied)\b"
+    r"|#[0-9A-Fa-f]{6}\b"
+)
+_PALETTE_TRIGGER = re.compile(_PALETTE_PATTERN, re.IGNORECASE)
+# Words that carry no picture content in a look clause (a clause with ≤ 1 other word is dropped whole).
+_LOOK_FILLER = _wordset(
+    "lens lenses film films look looks grain grainy halation anamorphic bokeh flare flares leak leaks shot shots "
+    "soft fine gentle heavy visible subtle warm cool cold creamy oval horizontal highlights highlight depth "
+    "field shallow deep focus vintage cinema cinematic digital dynamic range high colour color colours colors "
+    "response stock emulation texture edges vignetting tungsten balanced night reversal portrait prime wide angle "
+    "telephoto macro feel style aesthetic glow dreamy ethereal magical mystical heavenly otherworldly ultra hd "
+    "hyper detailed masterpiece quality best slightly faded lifted blacks pastel red blue magenta cyan orange teal "
+    "amber natural clean rich organic analog analogue strong slight effect filter rays god volumetric render "
+    "engine octane unreal trending artstation award winning realistic hyperrealistic photorealistic sharp crisp "
+    "grading graded grade mm k f low contrast muted diffusion palette palettes scheme lut luts"
+)
+_FILLER_ALT = "|".join(sorted(_LOOK_FILLER, key=len, reverse=True))
+# A look/palette phrase with a leading "with/and/on a …", its adjectives and a trailing "lens/look/feel"
+# (partial removal from a clause that keeps its content).
+_STYLE_SPAN = re.compile(
+    r"(?:\b(?:with|and|plus|on|through|using|in)\s+(?:(?:an?|the)\s+)?)?"
+    rf"(?:(?:{_FILLER_ALT})\s+){{0,2}}(?:{'|'.join(_LOOK_PATTERNS)}|{_PALETTE_PATTERN})"
+    r"(?:\s+(?:lens(?:es)?|feel|look|style|effect|filter|texture)\b)?",
+    re.IGNORECASE,
+)
+_CLICHE_ADJECTIVES = (
+    "cinematic", "cinematically", "epic", "ethereal", "dreamy", "dreamlike", "magical", "mesmeri[sz]ing",
+    "breathtaking", "stunning", "gorgeous", "majestic", "otherworldly", "enchanting", "awe-inspiring",
+    "spectacular", "jaw-dropping", "picture-perfect",
+)  # fmt: skip
+_ADJ_ALT = "|".join(_CLICHE_ADJECTIVES)
+# A run of these adjectives ("epic dreamy cinematic", "dreamy, epic", "cinematic, epic, and dreamy") with the
+# separator in front of and behind it; never part of a hyphenated word ("magical-looking").
+_CLICHE_RUN = re.compile(
+    rf"(?P<pre>\s*,\s*|\s+and\s+)?(?<![\w-])(?P<run>(?:{_ADJ_ALT})(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s+)"
+    rf"(?:{_ADJ_ALT}))*)(?![\w-])(?P<post>\s*,|\s+and\b)?",
+    re.IGNORECASE,
+)
+
+
+_CLICHE_ONLY = re.compile(_ADJ_ALT, re.IGNORECASE)
+# Colour words that are also things in the picture ("sky over the rooftops", "the sea at dusk").
+_COLOUR_NOUNS = _wordset("sky sea forest blossom sand earth pearl midnight gold silver rust")
+
+
+def _content_words(text: str) -> list[str]:
+    """Words of ``text`` that describe the picture (not look/colour filler, stop words or numbers)."""
+    return [
+        word
+        for word in re.findall(r"[a-z0-9]+", text.lower())
+        if word not in _LOOK_FILLER
+        and word not in _STOP_WORDS
+        and (word not in _COLOUR_WORDS or word in _COLOUR_NOUNS)
+        and not _CLICHE_ONLY.fullmatch(word)
+        and not any(ch.isdigit() for ch in word)  # "35mm", "8k", hex codes
+        and len(word) > 1
+    ]
+
+
+def _strip_look_clause(clause: str, removed: list[str], *, may_drop: bool) -> str | None:
+    """The clause without its look/palette phrases, or ``None`` when nothing worth keeping is left.
+
+    A clause with at most one content word left is dropped whole ("gentle fine grain on the skin") unless
+    ``may_drop`` is false; a clause with no content word left always is ("35mm anamorphic lens").
+    """
+    if not (_LOOK_TRIGGER.search(clause) or _PALETTE_TRIGGER.search(clause)):
+        return clause
+    content = _content_words(_LOOK_TRIGGER.sub(" ", _PALETTE_TRIGGER.sub(" ", clause)))
+    if not content or (may_drop and len(content) <= 1):
+        removed.append(clause.strip())
+        return None
+
+    def drop(match: re.Match[str]) -> str:
+        removed.append(match.group(0).strip())
+        return " "
+
+    return " ".join(_STYLE_SPAN.sub(drop, clause).split())
+
+
+def _strip_clauses(body: str, removed: list[str], *, may_drop: bool) -> str:
+    parts = re.split(r"(\s*[,;]\s*)", body)
+    kept: list[tuple[str, str]] = []
+    for index in range(0, len(parts), 2):
+        if _PALETTE_TRIGGER.search(parts[index]):
+            # "deep teal, warm amber and charcoal color palette": the colour names before it belong to it.
+            while kept and set(re.findall(r"[a-z]+", kept[-1][1].lower())) <= _COLOUR_WORDS:
+                removed.append(kept.pop()[1].strip())
+        clause = _strip_look_clause(parts[index], removed, may_drop=may_drop)
+        if clause is not None and clause.strip():
+            kept.append((parts[index - 1] if index else "", clause))
+    return "".join((sep if i else "") + clause for i, (sep, clause) in enumerate(kept))
+
+
+def _strip_sentence(sentence: str, removed: list[str]) -> str:
+    end_match = re.search(r"[.!?]+$", sentence)
+    end = end_match.group(0) if end_match else ""
+    body = sentence[: end_match.start()] if end_match else sentence
+    attempt: list[str] = []
+    out = _strip_clauses(body, attempt, may_drop=True)
+    if not out.strip() and _content_words(_LOOK_TRIGGER.sub(" ", _PALETTE_TRIGGER.sub(" ", body))):
+        # Never empty a sentence that has content ("Wide shot of a lake with bokeh"): only cut the look spans.
+        attempt = []
+        out = _strip_clauses(body, attempt, may_drop=False)
+    removed.extend(attempt)
+
+    def drop_run(match: re.Match[str]) -> str:
+        removed.append(match.group("run"))
+        # "dark, cinematic, and moody" → "dark, moody": keep the separator in front when one follows.
+        return f"{match.group('pre')}\x00" if match.group("pre") and match.group("post") else " \x00"
+
+    out = _CLICHE_RUN.sub(drop_run, out)
+    # "a dreamy afternoon" → "an afternoon", "An epic dreamy shot" → "A shot": fix the article in front.
+    out = re.sub(
+        r"\b([Aa])n?\s+\x00\s*(?=([A-Za-z]))",
+        lambda m: f"{m.group(1)}{'n' if m.group(2).lower() in 'aeiou' else ''} ",
+        out,
+    ).replace("\x00", "")
+    out = re.sub(r"\s+([,;:])", r"\1", " ".join(out.split())).strip(" ,;:")
+    out = re.sub(r"([,;:])(?:\s*[,;:])+", r"\1", out)
+    out = re.sub(r"^(?:and|with|plus)\s+", "", out, flags=re.IGNORECASE)
+    if out and sentence[:1].isupper() and out[:1].islower():
+        out = out[:1].upper() + out[1:]
+    return f"{out}{end}" if out else ""
+
+
+def drop_colour_lists(text: str) -> str:
+    """``text`` without clauses that are only colour names ("deep teal and warm amber", "muted slate, beige").
+
+    Only for stored (legacy) prompts, where such clauses are the pasted ``palette_en``; in a current prompt a
+    colour belongs to a thing ("a red mailbox") and never stands alone.
+    """
+    sentences: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", (text or "").strip()):
+        end_match = re.search(r"[.!?]+$", sentence)
+        end = end_match.group(0) if end_match else ""
+        body = sentence[: end_match.start()] if end_match else sentence
+        parts = re.split(r"(\s*[,;]\s*)", body)
+        kept = [
+            (parts[i - 1] if i else "", parts[i])
+            for i in range(0, len(parts), 2)
+            if not (re.findall(r"[a-z]+", parts[i].lower()) and set(re.findall(r"[a-z]+", parts[i].lower())) <= _COLOUR_WORDS)
+        ]
+        out = "".join((sep if i else "") + clause for i, (sep, clause) in enumerate(kept)).strip(" ,;")
+        if out:
+            sentences.append(f"{out[:1].upper()}{out[1:]}{end}" if sentence[:1].isupper() else f"{out}{end}")
+    return " ".join(sentences)
+
+
+def strip_ai_cliches(text: str) -> tuple[str, list[str]]:
+    """Remove the stock "AI look" vocabulary from a prompt. Returns ``(text, removed phrases)``.
+
+    Drops lens/film-look/grain/halation/bokeh/flare/quality-spam clauses (``35mm anamorphic lens``,
+    ``fine grain``, ``8k``, ``masterpiece``), colour-palette/grading clauses and hex codes, and the adjectives
+    cinematic/epic/ethereal/dreamy/magical/breathtaking/stunning…; ordinary text is returned unchanged.
+    A sentence that has content is never emptied. Idempotent.
+    """
+    if not text or not (_LOOK_TRIGGER.search(text) or _PALETTE_TRIGGER.search(text) or _CLICHE_RUN.search(text)):
+        return text, []
+    removed: list[str] = []
+    sentences = [_strip_sentence(s, removed) for s in re.split(r"(?<=[.!?])\s+", text.strip())]
+    return " ".join(s for s in sentences if s), list(dict.fromkeys(r for r in removed if r))
 
 
 @functools.cache
@@ -633,18 +884,40 @@ def _fit(body: str, limit: int) -> tuple[str, bool]:
     return cut.rstrip(" ,;:"), True
 
 
-def sanitize_prompt(
-    text: str, *, forbidden_names: list[str], max_chars: int = MAX_PROMPT_CHARS
-) -> tuple[str, list[str]]:
-    """Make ``text`` safe to send to a video model.
+# A strip that would leave less than this share of a fragment's content words (picture words, not look,
+# colour or style words) keeps the original (and warns): the filter must never eat the shot itself.
+_MIN_KEPT_AFTER_STRIP = 0.5
 
-    Removes the forbidden names (artist name, aliases, …), real-person /
-    celebrity / look-alike phrasing together with the person it names, and
-    probable real-person names (:func:`strip_person_references`), then appends
-    the likeness-safety and no-text clauses.
-    The result never exceeds ``max_chars`` (the body is shortened at a
-    sentence/clause boundary when needed). Idempotent. Returns
-    ``(prompt, warnings)`` with Japanese warnings.
+
+def strip_ai_cliches_guarded(text: str) -> tuple[str, list[str], bool]:
+    """:func:`strip_ai_cliches`, unless it would empty ``text`` or remove most of its words.
+
+    Returns ``(text, removed phrases, kept_original)``; ``kept_original`` is true when the strip was refused
+    (the caller warns: the prompt is then sent with its look words rather than with almost nothing).
+    """
+    stripped, removed = strip_ai_cliches(text)
+    if not removed:
+        return text, [], False
+    before = len(_content_words(text))
+    after = len(_content_words(stripped))
+    if not stripped.strip() or after < before * _MIN_KEPT_AFTER_STRIP:
+        return text, [], True
+    return stripped, removed, False
+
+
+_STRIP_REFUSED_WARNING = (
+    "プロンプトの大半が映像の質感を指定する言葉（cinematic・film grain など）だったため、取り除くと内容が"
+    "ほとんど残らず、その部分は元の表現のまま使いました"
+)
+
+
+def _clean_body(
+    text: str, forbidden_names: Iterable[str], *, strip_cliches: bool = False
+) -> tuple[str, list[str]]:
+    """Everything ``sanitize_prompt`` does except appending the clauses and fitting the length.
+
+    ``strip_cliches`` also removes the stock "AI look" vocabulary (silently: these are Claude's own style
+    words; text the user typed is screened where it is composed, with a warning).
     """
     warnings: list[str] = []
     body = unicodedata.normalize("NFKC", text or "")
@@ -656,6 +929,10 @@ def sanitize_prompt(
         warnings.append(
             f"製品名（{'、'.join(brands)}）は映像内に文字として描かれることがあるため、一般的な表現に置き換えました"
         )
+    if strip_cliches:
+        body, _, refused = strip_ai_cliches_guarded(body)
+        if refused:
+            warnings.append(_STRIP_REFUSED_WARNING)
 
     body, removed_names = strip_forbidden_names(body, forbidden_names)
     for name in removed_names:
@@ -666,8 +943,35 @@ def sanitize_prompt(
     refs = strip_person_references(body)
     body = refs.text
     warnings.extend(person_reference_warnings(refs))
+    return _tidy(body).rstrip(" ."), warnings
 
-    body = _tidy(body).rstrip(" .")
+
+def sanitize_fragment(text: str, *, forbidden_names: Iterable[str]) -> tuple[str, list[str]]:
+    """A piece of a prompt being composed (e.g. a storyboard shot), cleaned like :func:`sanitize_prompt`
+    without the clauses, and with the stock "AI look" vocabulary removed (:func:`strip_ai_cliches`).
+
+    Returns ``(text, warnings)``; the text has no trailing period and is not shortened.
+    """
+    return _clean_body(text, list(forbidden_names), strip_cliches=True)
+
+
+def sanitize_prompt(
+    text: str, *, forbidden_names: list[str], max_chars: int = MAX_PROMPT_CHARS
+) -> tuple[str, list[str]]:
+    """Make ``text`` safe to send to a video model.
+
+    Removes the forbidden names (artist name, aliases, …), real-person /
+    celebrity / look-alike phrasing together with the person it names, and
+    probable real-person names (:func:`strip_person_references`) and rewrites
+    product names, then appends the likeness-safety and no-text clauses. It
+    does not strip the "AI look" vocabulary (that happens where prompts are
+    composed, :func:`sanitize_fragment`): re-sanitizing a stored prompt (the
+    planner's alternate takes) must give the same text, or paid clips stop
+    being cache hits. The result never exceeds ``max_chars`` (the body is shortened at a
+    sentence/clause boundary when needed). Idempotent. Returns
+    ``(prompt, warnings)`` with Japanese warnings.
+    """
+    body, warnings = _clean_body(text, forbidden_names)
     body, shortened = _fit(body, prompt_body_budget(max_chars))
     if shortened:
         warnings.append(f"プロンプトが長すぎるため、{max_chars}文字に収まるよう末尾を省略しました")
@@ -842,9 +1146,9 @@ def make_claude_client() -> Any | None:
 
 _TRANSLATE_SYSTEM = (
     "You translate short Japanese creative briefs (world-building notes, moods, scene ideas) into concise, "
-    "vivid English for a text-to-video prompt. Keep concrete visual details (places, light, colours, weather, "
-    "objects, actions). Never add the names of real people. Output only the English translation, no quotes "
-    "and no commentary."
+    "plain English for a text-to-video prompt. Keep concrete visual details (places, light, colours, weather, "
+    "objects, actions); do not add style words such as cinematic, epic or dreamy. Never add the names of real "
+    "people. Output only the English translation, no quotes and no commentary."
 )
 
 

@@ -18,10 +18,18 @@ from app.services.presets import (
     CAMERA_ANGLES,
     CAMERA_MOVES,
     COLOR_GRADES,
+    FRAMING_REGIONS,
+    FRAMINGS,
+    FRAMINGS_WITH_FACE,
+    GARMENT_REGIONS,
     LYRIC_STYLES,
     SCENE_TYPES,
     WORLD_PRESETS,
+    garment_region,
+    visible_garments,
+    wardrobe_phrase,
 )
+from app.services.prompting import strip_ai_cliches
 
 FFMPEG = shutil.which("ffmpeg")
 needs_ffmpeg = pytest.mark.skipif(FFMPEG is None, reason="ffmpeg not installed")
@@ -51,11 +59,13 @@ def test_preset_is_complete(preset_id: str) -> None:
     preset = WORLD_PRESETS[preset_id]
     assert not preset["name_ja"].isascii() and preset["name_en"]
     assert len(preset["description_ja"]) >= 15 and not preset["description_ja"].isascii()
-    # look_en carries lighting, lens and film-stock vocabulary.
-    assert "mm" in preset["lens_en"] and "lens" in preset["lens_en"]
-    assert "film" in preset["film_en"] or "cinema" in preset["film_en"]
+    # look_en carries lighting, camera feel, colour response and atmosphere — in plain words since 2026-10-13
+    # (intentional change: no focal lengths, anamorphic lenses, film looks or grain; grain is added in post).
     for part in ("lighting_en", "lens_en", "film_en", "atmosphere_en"):
         assert preset[part] in preset["look_en"]
+        assert strip_ai_cliches(preset[part]) == (preset[part], []), (preset_id, part)
+    assert not re.search(r"\d\s?mm|anamorphic|\blens\b|grain|halation|bokeh|flare|film look", preset["look_en"])
+    assert "colour" in preset["film_en"]
     assert len(preset["palette"]) == 3 and all(_HEX.match(c) for c in preset["palette"])
     assert preset["palette_en"] and not preset["palette_ja"].isascii()
 
@@ -77,6 +87,15 @@ def test_preset_is_complete(preset_id: str) -> None:
         assert protagonist["en"].startswith("a fictional ")
         assert re.search(r"twenties|thirties", protagonist["en"]), "protagonists are adults"
         assert "架空" in protagonist["ja"]
+        # Structured wardrobe: identity without clothing + every garment with its body region.
+        assert protagonist["identity_en"].startswith("a fictional ") and "wearing" not in protagonist["identity_en"]
+        assert protagonist["en"] == f"{protagonist['identity_en']}, wearing {wardrobe_phrase(protagonist['wardrobe'])}"
+        regions = [g["region"] for g in protagonist["wardrobe"]]
+        assert set(regions) <= set(GARMENT_REGIONS) and "top" in regions and "feet" in regions
+        is_dress = any(re.search(r"dress", g["item_en"]) for g in protagonist["wardrobe"])
+        assert "bottom" in regions or is_dress, "no clip may drop the trousers"
+        for garment in protagonist["wardrobe"]:
+            assert garment_region(garment["item_en"]) == garment["region"], garment
     for location in preset["locations"]:
         assert location["en"].isascii() and not location["ja"].isascii()
 
@@ -93,10 +112,46 @@ def test_scene_vocabulary_templates() -> None:
         assert "{" not in filled and filled.isascii()
         desc = scene["desc_ja"].format(subject="主人公", place="街")
         assert "街" in desc and "{" not in desc
+        assert scene["framing"] in FRAMINGS
+        assert (scene["framing"] == "no_people") == (not scene["has_subject"]), scene_id
+        assert scene["has_subject"] == (scene["framing"] in FRAMINGS_WITH_FACE), scene_id
+        assert strip_ai_cliches(filled) == (filled, []), scene_id
+        assert not re.search(r"bokeh|flare|gazing|drifting petals|slow-motion|slow dolly", filled), scene_id
     for vocab in (CAMERA_ANGLES, CAMERA_MOVES):
         for entry_id, entry in vocab.items():
             assert entry["prompt_en"].isascii() and not entry["name_ja"].isascii(), entry_id
+            assert not re.search(r"dolly|gimbal|drone|crane shot|aerial", entry["prompt_en"]), entry_id
     assert {m.get("energy") for m in CAMERA_MOVES.values()} == {"low", "mid", "high"}
+    # Drone reveals read as stock AI footage: the id stays (enum, stored storyboards) but no preset picks it.
+    assert not any("drone_rise" in preset["camera_moves"] for preset in WORLD_PRESETS.values())
+
+
+def test_wardrobe_helpers() -> None:
+    garments = [
+        {"region": "outer", "item_en": "beige linen trench coat"},
+        {"region": "top", "item_en": "white cotton blouse"},
+        {"region": "bottom", "item_en": "sage-green pleated skirt"},
+        {"region": "feet", "item_en": "white canvas sneakers"},
+        {"region": "head", "item_en": "silver hoop earrings"},
+        {"region": "carry", "item_en": "canvas tote bag"},
+    ]
+    phrase = {framing: wardrobe_phrase(visible_garments(garments, framing)) for framing in FRAMINGS}
+    assert phrase["no_people"] == phrase["detail"] == ""
+    assert phrase["close_up"] == "a beige linen trench coat over a white cotton blouse, with silver hoop earrings"
+    assert phrase["medium"] == (
+        "a beige linen trench coat over a white cotton blouse and a sage-green pleated skirt, with silver hoop "
+        "earrings and a canvas tote bag"
+    )
+    assert phrase["full_body"].endswith("a sage-green pleated skirt and white canvas sneakers, with silver hoop "
+                                        "earrings and a canvas tote bag")  # fmt: skip
+    assert "feet" not in FRAMING_REGIONS["close_up"] | FRAMING_REGIONS["medium"]
+    assert "bottom" not in FRAMING_REGIONS["close_up"] and "bottom" in FRAMING_REGIONS["medium"]
+    assert wardrobe_phrase([{"region": "top", "item_en": "oversized white shirt"}]) == "an oversized white shirt"
+    for text, region in [("white canvas sneakers", "feet"), ("long sage-green pleated skirt", "bottom"),
+                         ("light beige linen trench coat", "outer"), ("sweater dress", "top"),
+                         ("canvas tote bag", "carry"), ("knit beanie", "head"), ("forest green", None),
+                         ("soft fine grain", None), ("silver hair", None)]:  # fmt: skip
+        assert garment_region(text) == region, text
 
 
 def test_lyric_styles_match_contract_and_subtitles() -> None:

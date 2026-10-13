@@ -10,10 +10,23 @@ Prompt vocabulary is English (video models are trained on English captions);
 names and descriptions shown in the UI are Japanese.
 
 Scene ``prompt_en`` strings are templates with two placeholders:
-``{subject}`` (the world-bible protagonist description) and ``{place}`` (the
-world-bible location). Scenes with ``has_subject=False`` are atmosphere
-B-roll without people, which keeps a batch visually varied and is the safest
-material for likeness rules.
+``{subject}`` (the protagonist's identity plus the garments visible in the
+scene's ``framing``) and ``{place}`` (the world-bible location). Scenes with
+``has_subject=False`` are atmosphere B-roll without people (``framing`` is
+``no_people``), which keeps a batch visually varied and is the safest material
+for likeness rules.
+
+Prompt wording is deliberately plain and candid (realism direction, 2026-10-13
+"映像がAI感強くない？"): ordinary people, everyday places, the light a place
+really has, plain physical actions and plain camera language. No lens specs,
+film-look/grain/halation words or palette names reach a prompt (grain and
+grading are added in post by the renderer); ``palette`` hex values are for the
+app's interface only.
+
+Wardrobe is structured (:class:`Garment`: ``region`` + ``item_en``) so a
+prompt names only what the framing shows (:data:`FRAMING_REGIONS`): close-ups
+get the outerwear/top (and head accessories), medium shots add the bottoms and
+carried items, only full-body/wide shots mention shoes.
 
 Colour grades are *colour-only* point filters that work in RGB
 (``colorchannelmixer`` for saturation, ``colorbalance`` for mid-tone and
@@ -30,6 +43,8 @@ contrast around mid-grey) are not used — on a grey ramp, adjacent input codes
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping, Sequence
 from typing import Literal, NotRequired, TypedDict
 
 __all__ = [
@@ -37,6 +52,10 @@ __all__ = [
     "CAMERA_MOVES",
     "COLOR_GRADES",
     "DEFAULT_PRESET_ID",
+    "FRAMINGS",
+    "FRAMINGS_WITH_FACE",
+    "FRAMING_REGIONS",
+    "GARMENT_REGIONS",
     "LYRIC_STYLES",
     "PRESET_IDS",
     "SCENE_TYPES",
@@ -44,22 +63,60 @@ __all__ = [
     "WORLD_PRESETS",
     "CameraEntry",
     "ColorGrade",
+    "Framing",
+    "Garment",
+    "GarmentRegion",
     "LocalizedText",
     "LyricStyle",
+    "Protagonist",
     "SceneType",
     "WorldPreset",
     "color_grade_infos",
+    "garment_region",
     "get_preset",
     "lyric_style_infos",
     "preset_infos",
+    "visible_garments",
+    "wardrobe_phrase",
 ]
 
 Energy = Literal["low", "mid", "high"]
+GarmentRegion = Literal["outer", "top", "bottom", "feet", "head", "carry"]
+Framing = Literal["no_people", "detail", "close_up", "medium", "full_body"]
+
+# outer: coats, jackets · top: shirts, sweaters, dresses · bottom: trousers, skirts, shorts · feet: shoes, socks ·
+# head: hats, glasses, earrings, necklaces, scarves (anything at head/neck height) · carry: bags, watches, belts.
+GARMENT_REGIONS: tuple[GarmentRegion, ...] = ("outer", "top", "bottom", "feet", "head", "carry")
+# no_people: nobody in frame · detail: part of the protagonist without the face (hands, back, feet) ·
+# close_up: face and shoulders · medium: waist up or seated · full_body: the whole figure, wide shots.
+FRAMINGS: tuple[Framing, ...] = ("no_people", "detail", "close_up", "medium", "full_body")
+# Garments a framing shows. no_people/detail get none from the app (a detail prompt names its one visible garment).
+FRAMING_REGIONS: dict[str, frozenset[str]] = {
+    "no_people": frozenset(),
+    "detail": frozenset(),
+    "close_up": frozenset({"outer", "top", "head"}),
+    "medium": frozenset({"outer", "top", "head", "bottom", "carry"}),
+    "full_body": frozenset(GARMENT_REGIONS),
+}
+# Framings whose prompt gets the protagonist's identity (face/hair) from the world bible.
+FRAMINGS_WITH_FACE: frozenset[str] = frozenset({"close_up", "medium", "full_body"})
 
 
 class LocalizedText(TypedDict):
     en: str
     ja: str
+
+
+class Garment(TypedDict):
+    region: GarmentRegion
+    item_en: str  # colour, material and garment in plain words ("faded navy cotton work jacket")
+
+
+class Protagonist(TypedDict):
+    en: str  # identity + every garment (display; legacy ``protagonist_en``)
+    ja: str
+    identity_en: str  # age, build, face and hair — no clothing
+    wardrobe: list[Garment]
 
 
 class SceneType(TypedDict):
@@ -68,6 +125,7 @@ class SceneType(TypedDict):
     desc_ja: str  # template with {subject} / {place} (Japanese)
     has_subject: bool
     energy: Energy
+    framing: Framing  # default framing (Claude may choose another; no-subject scenes are always no_people)
 
 
 class CameraEntry(TypedDict):
@@ -94,13 +152,13 @@ class WorldPreset(TypedDict):
     name_ja: str
     name_en: str
     description_ja: str
-    look_en: str  # lighting + lens + film stock + atmosphere, comma separated
-    lighting_en: str
-    lens_en: str
-    film_en: str
+    look_en: str  # lighting + camera + colour + atmosphere in plain words, comma separated (world bible)
+    lighting_en: str  # the light the places really have
+    lens_en: str  # plain camera feel (no focal lengths / lens names; kept under its historical key)
+    film_en: str  # plain colour response (no film-look / grain words; grain is added in post)
     atmosphere_en: str
-    palette: list[str]  # 3 hex colours
-    palette_en: str
+    palette: list[str]  # 3 hex colours, for the app's interface only (never in prompts)
+    palette_en: str  # the same colours as they occur in the places (reference only, never in prompts)
     palette_ja: str
     scene_types: list[str]
     camera_angles: list[str]
@@ -108,7 +166,7 @@ class WorldPreset(TypedDict):
     color_grades: list[str]
     lyric_styles: list[str]  # recommended lyric styles, best first
     negative_en: str
-    protagonists: list[LocalizedText]
+    protagonists: list[Protagonist]
     locations: list[LocalizedText]
 
 
@@ -118,211 +176,260 @@ SCENE_TYPES: dict[str, SceneType] = {
     "establishing_wide": {
         "name_ja": "情景ワイド",
         "prompt_en": (
-            "wide establishing shot of {place}, {subject}, small in the frame, the environment telling the story"
+            "wide shot of {place} as it really looks, everyday details in view, {subject}, small in the frame "
+            "and going about their day"
         ),
-        "desc_ja": "{place}を広く見せる情景カット。{subject}は小さく画面の中に",
+        "desc_ja": "{place}をありのままに広く見せる情景カット。{subject}は画面の中で小さく、普段どおりに過ごしている",
         "has_subject": True,
         "energy": "low",
+        "framing": "full_body",
     },
     "walking": {
         "name_ja": "歩く",
-        "prompt_en": "{subject}, walking slowly through {place}, clothes moving gently with each step",
-        "desc_ja": "{subject}が{place}をゆっくり歩く",
+        "prompt_en": (
+            "{subject}, walking through {place} at an everyday pace, glancing around, not posing for the camera"
+        ),
+        "desc_ja": "{subject}が{place}をいつもの足取りで歩く",
         "has_subject": True,
         "energy": "mid",
+        "framing": "full_body",
     },
     "back_view": {
         "name_ja": "後ろ姿",
-        "prompt_en": "{subject}, seen from behind, standing still and looking out over {place}",
-        "desc_ja": "{place}を見つめる{subject}の後ろ姿",
+        "prompt_en": (
+            "{subject}, seen from behind in {place}, waiting with hands in pockets and shifting weight, then taking "
+            "a few steps away"
+        ),
+        "desc_ja": "{place}で何かを待つ{subject}の後ろ姿。少しして歩き出す",
         "has_subject": True,
         "energy": "low",
+        "framing": "full_body",
     },
     "close_portrait": {
         "name_ja": "表情のアップ",
         "prompt_en": (
-            "intimate close-up of {subject}, eyes glancing away from the camera, a slow calm breath, "
-            "{place} softly out of focus behind"
+            "close-up of {subject}, in an unguarded moment in {place}, blinking, eyes on something off-screen, a "
+            "small natural change of expression"
         ),
-        "desc_ja": "{subject}の表情に寄る。背景の{place}はぼける",
+        "desc_ja": "{place}で、ふとした瞬間の{subject}の表情に寄る",
         "has_subject": True,
         "energy": "low",
+        "framing": "close_up",
     },
     "profile_window": {
         "name_ja": "窓辺の横顔",
-        "prompt_en": "{subject}, in profile beside a window, the light of {place} reflected faintly in the glass",
-        "desc_ja": "窓辺に立つ{subject}の横顔。ガラスに{place}の光が映る",
+        "prompt_en": (
+            "{subject}, in profile by a window with smudges on the glass, chin resting on one hand, the view of "
+            "{place} faint in the reflection"
+        ),
+        "desc_ja": "窓辺で頬杖をつく{subject}の横顔。ガラスに{place}がうっすら映る",
         "has_subject": True,
         "energy": "low",
+        "framing": "close_up",
     },
     "turn_to_light": {
         "name_ja": "振り返り",
         "prompt_en": (
-            "{subject}, slowly turning their head over the shoulder toward the light, a quiet expression, {place} "
-            "around them"
+            "{subject}, in {place}, turning around as if someone off-screen just called out, a brief real half-smile"
         ),
-        "desc_ja": "{place}で{subject}が光のほうへゆっくり振り返る",
+        "desc_ja": "{place}で、呼ばれたように{subject}が振り返る",
         "has_subject": True,
         "energy": "mid",
+        "framing": "medium",
     },
     "running": {
         "name_ja": "走る",
-        "prompt_en": "{subject}, running forward through {place}, hair and clothes moving naturally in the wind",
-        "desc_ja": "{subject}が{place}を駆け抜ける",
+        "prompt_en": "{subject}, running to catch up with something in {place}, slightly out of breath, uneven steps",
+        "desc_ja": "{subject}が{place}を息を切らして走る",
         "has_subject": True,
         "energy": "high",
+        "framing": "full_body",
     },
     "wind_hair": {
         "name_ja": "風を受ける",
-        "prompt_en": "{subject}, standing in strong wind at {place}, hair and clothes streaming, eyes half closed",
-        "desc_ja": "{place}で強い風を受けて立つ{subject}",
+        "prompt_en": "{subject}, caught in gusty wind at {place}, squinting and pushing hair out of their face",
+        "desc_ja": "{place}で強い風に目を細め、髪を押さえる{subject}",
         "has_subject": True,
         "energy": "high",
+        "framing": "medium",
     },
     "silhouette": {
         "name_ja": "シルエット",
         "prompt_en": (
-            "backlit silhouette of {subject}, against the bright sky above {place}, rim light outlining the figure"
+            "{subject}, against the bright sky at {place}, backlit so the figure is mostly a dark shape, walking "
+            "across the frame"
         ),
-        "desc_ja": "{place}の空を背にした{subject}のシルエット",
+        "desc_ja": "{place}の明るい空を背に、影になった{subject}が横切る",
         "has_subject": True,
         "energy": "mid",
+        "framing": "full_body",
     },
     "spin_sway": {
         "name_ja": "揺れる・回る",
-        "prompt_en": "{subject}, swaying and slowly spinning with arms loose, lost in the music, in {place}",
-        "desc_ja": "音楽に身を任せて揺れる{subject}（{place}）",
+        "prompt_en": (
+            "{subject}, dancing a little in {place} to music only they can hear, unselfconscious and slightly "
+            "awkward, laughing at themselves"
+        ),
+        "desc_ja": "{place}で{subject}が音楽に合わせて少しだけ踊る。照れ笑いまじりに",
         "has_subject": True,
         "energy": "high",
+        "framing": "full_body",
     },
     "crowd_still": {
         "name_ja": "雑踏の中で",
         "prompt_en": (
-            "{subject}, standing still while motion-blurred passers-by stream around them in {place}, "
-            "the passers-by faceless and out of focus"
+            "{subject}, standing still in {place} while ordinary passers-by walk past, the passers-by out of focus "
+            "with no clear faces"
         ),
-        "desc_ja": "{place}の雑踏の中で立ち止まる{subject}",
+        "desc_ja": "{place}の人の流れの中で立ち止まる{subject}",
         "has_subject": True,
         "energy": "mid",
+        "framing": "medium",
     },
     "train_window": {
         "name_ja": "車窓",
         "prompt_en": (
-            "{subject}, sitting by the window of a moving train, passing lights sliding across the glass, {place} "
-            "streaking past outside"
+            "{subject}, sitting by the window of a moving local train, head leaning on the glass, {place} passing "
+            "outside"
         ),
-        "desc_ja": "走る電車の窓辺に座る{subject}。外を{place}が流れていく",
+        "desc_ja": "走る電車の窓にもたれる{subject}。外を{place}が流れていく",
         "has_subject": True,
         "energy": "mid",
+        "framing": "medium",
     },
     "rooftop": {
         "name_ja": "屋上",
-        "prompt_en": "{subject}, standing at the edge of a rooftop above {place}, the horizon stretching far behind",
-        "desc_ja": "{place}を見下ろす屋上に立つ{subject}",
+        "prompt_en": (
+            "{subject}, leaning on the railing of an ordinary rooftop above {place}, water tanks and pipes around, "
+            "looking down at the street"
+        ),
+        "desc_ja": "{place}を見下ろす屋上の手すりにもたれる{subject}",
         "has_subject": True,
         "energy": "mid",
+        "framing": "medium",
     },
     "lying_down": {
         "name_ja": "寝そべる",
-        "prompt_en": "{subject}, lying on their back looking up, {place} around them, eyes slowly closing",
-        "desc_ja": "{place}で仰向けに寝そべり空を見上げる{subject}",
+        "prompt_en": "{subject}, lying on their back in {place}, one arm over their eyes, chest rising and falling",
+        "desc_ja": "{place}で仰向けに寝転び、腕で目を覆う{subject}",
         "has_subject": True,
         "energy": "low",
+        "framing": "full_body",
     },
     "water_reflection": {
         "name_ja": "水面の反射",
-        "prompt_en": "reflections rippling on water in {place}, the blurred reflection of {subject}, drifting through",
-        "desc_ja": "{place}の水面に揺れる反射。{subject}の姿がにじむ",
+        "prompt_en": (
+            "the reflection of {subject}, in a puddle or still water in {place}, breaking up when a drop or the "
+            "wind disturbs the surface"
+        ),
+        "desc_ja": "{place}の水面や水たまりに映る{subject}。波紋で揺れる",
         "has_subject": True,
         "energy": "low",
+        "framing": "medium",
     },
     "ambient_detail": {
         "name_ja": "質感ディテール",
         "prompt_en": (
-            "slow macro detail of {place}: light moving across textured surfaces, dust and particles drifting in the "
-            "air, no people"
+            "close detail of ordinary textures in {place}: worn surfaces and small everyday objects, the light "
+            "shifting a little as a cloud passes, no people"
         ),
-        "desc_ja": "{place}の質感に寄るマクロカット（人物なし）",
+        "desc_ja": "{place}の使い込まれた質感や小物に寄るカット（人物なし）",
         "has_subject": False,
         "energy": "low",
+        "framing": "no_people",
     },
     "sky_drift": {
         "name_ja": "空",
-        "prompt_en": "the sky above {place} slowly shifting, clouds drifting and the light changing, no people",
-        "desc_ja": "{place}の空。雲が流れ光が移ろう（人物なし）",
+        "prompt_en": (
+            "the sky above {place} with treetops, wires or rooftops along the lower edge of the frame, clouds "
+            "moving at their real speed, no people"
+        ),
+        "desc_ja": "{place}の空。下端に木々や電線、屋根が入り、雲が流れる（人物なし）",
         "has_subject": False,
         "energy": "low",
+        "framing": "no_people",
     },
     "light_abstract": {
         "name_ja": "光の抽象",
         "prompt_en": (
-            "out-of-focus lights of {place} drifting across the frame, soft bokeh and gentle lens flares, no people"
+            "the lights of {place} seen through a window pane with smudges and raindrops, slightly out of focus, "
+            "no people"
         ),
-        "desc_ja": "{place}の光がぼけて漂う抽象カット（人物なし）",
+        "desc_ja": "窓ガラス越しに少しぼけて見える{place}の明かり（人物なし）",
         "has_subject": False,
         "energy": "mid",
+        "framing": "no_people",
     },
     "nature_macro": {
         "name_ja": "自然のマクロ",
         "prompt_en": (
-            "macro shot of leaves, grass and dew drops in {place} trembling in a light breeze, shallow depth of field, "
+            "close-up of grass, weeds and leaves at {place} moving in the breeze, a small insect crawling past, "
             "no people"
         ),
-        "desc_ja": "{place}の葉や水滴に寄るマクロカット（人物なし）",
+        "desc_ja": "{place}の草や葉に寄るカット。風に揺れる（人物なし）",
         "has_subject": False,
         "energy": "low",
+        "framing": "no_people",
     },
     "street_flow": {
         "name_ja": "街の流れ",
         "prompt_en": (
-            "traffic light trails and reflections flowing through {place}, wet asphalt glistening, no pedestrians"
+            "ordinary traffic passing through {place}, headlights and reflections on the road surface, no "
+            "pedestrians in focus"
         ),
-        "desc_ja": "{place}を流れる車のライトと反射（人物の特定なし）",
+        "desc_ja": "{place}を行き交う車と路面の反射（人物の特定なし）",
         "has_subject": False,
         "energy": "high",
+        "framing": "no_people",
     },
 }
 
+# Plain camera language: what the camera does, not cinematography jargon.
 CAMERA_ANGLES: dict[str, CameraEntry] = {
-    "eye_level": {"name_ja": "目線の高さ", "prompt_en": "eye-level camera"},
-    "low_angle": {"name_ja": "ローアングル", "prompt_en": "low-angle camera looking up"},
-    "high_angle": {"name_ja": "ハイアングル", "prompt_en": "high-angle camera looking down"},
-    "overhead": {"name_ja": "真俯瞰", "prompt_en": "top-down overhead camera"},
-    "over_shoulder": {"name_ja": "肩越し", "prompt_en": "over-the-shoulder framing"},
-    "ground_level": {"name_ja": "地面すれすれ", "prompt_en": "camera placed just above the ground"},
+    "eye_level": {"name_ja": "目線の高さ", "prompt_en": "camera at eye level"},
+    "low_angle": {"name_ja": "ローアングル", "prompt_en": "camera low, looking slightly up"},
+    "high_angle": {"name_ja": "ハイアングル", "prompt_en": "camera a little above, looking down"},
+    "overhead": {"name_ja": "真俯瞰", "prompt_en": "camera looking straight down from above"},
+    "over_shoulder": {"name_ja": "肩越し", "prompt_en": "framed over someone's shoulder"},
+    "ground_level": {"name_ja": "地面すれすれ", "prompt_en": "camera just above the ground"},
     "through_foreground": {
         "name_ja": "前景越し",
-        "prompt_en": "shot through soft out-of-focus foreground elements",
+        "prompt_en": "shot past something in the foreground that is slightly out of focus",
     },
-    "dutch_tilt": {"name_ja": "ダッチアングル", "prompt_en": "slight dutch-angle tilt"},
+    "dutch_tilt": {"name_ja": "ダッチアングル", "prompt_en": "camera slightly tilted"},
 }
 
 CAMERA_MOVES: dict[str, CameraEntry] = {
-    "static": {"name_ja": "フィックス", "prompt_en": "locked-off tripod shot with no camera movement", "energy": "low"},
-    "slow_push_in": {"name_ja": "ゆっくり寄る", "prompt_en": "slow dolly push-in", "energy": "low"},
+    "static": {"name_ja": "フィックス", "prompt_en": "camera on a tripod, not moving", "energy": "low"},
+    "slow_push_in": {"name_ja": "ゆっくり寄る", "prompt_en": "camera moving a little closer", "energy": "low"},
     "slow_pull_out": {
         "name_ja": "ゆっくり引く",
-        "prompt_en": "slow dolly pull-out revealing the space",
+        "prompt_en": "camera slowly moving back to show more of the place",
         "energy": "low",
     },
-    "pan_slow": {"name_ja": "ゆっくりパン", "prompt_en": "slow smooth horizontal pan", "energy": "low"},
-    "tilt_up": {"name_ja": "ティルトアップ", "prompt_en": "slow tilt up", "energy": "low"},
-    "rack_focus": {"name_ja": "ピント送り", "prompt_en": "static camera with a gentle rack focus", "energy": "low"},
-    "handheld": {
-        "name_ja": "手持ち",
-        "prompt_en": "subtle handheld camera with natural micro-movements",
-        "energy": "mid",
+    "pan_slow": {"name_ja": "ゆっくりパン", "prompt_en": "camera slowly panning to follow", "energy": "low"},
+    "tilt_up": {"name_ja": "ティルトアップ", "prompt_en": "camera slowly tilting up", "energy": "low"},
+    "rack_focus": {
+        "name_ja": "ピント送り",
+        "prompt_en": "camera still, focus shifting from the foreground to the background",
+        "energy": "low",
     },
-    "tracking_side": {"name_ja": "横移動", "prompt_en": "smooth lateral tracking shot", "energy": "mid"},
-    "orbit": {"name_ja": "回り込み", "prompt_en": "slow arc orbiting around the subject", "energy": "mid"},
-    "crane_up": {"name_ja": "クレーンアップ", "prompt_en": "rising crane shot", "energy": "mid"},
-    "follow_behind": {"name_ja": "追従", "prompt_en": "gimbal shot following closely behind", "energy": "high"},
-    "drone_rise": {
-        "name_ja": "ドローン上昇",
-        "prompt_en": "aerial drone shot rising and moving forward",
+    "handheld": {"name_ja": "手持ち", "prompt_en": "handheld camera with slight natural shake", "energy": "mid"},
+    "tracking_side": {"name_ja": "横移動", "prompt_en": "camera moving alongside at walking pace", "energy": "mid"},
+    "orbit": {"name_ja": "回り込み", "prompt_en": "handheld camera moving partway around", "energy": "mid"},
+    "crane_up": {"name_ja": "クレーンアップ", "prompt_en": "camera rising slowly to a higher view", "energy": "mid"},
+    "follow_behind": {
+        "name_ja": "追従",
+        "prompt_en": "handheld camera following a few steps behind",
         "energy": "high",
     },
-    "fast_push": {"name_ja": "勢いよく寄る", "prompt_en": "energetic fast push-in", "energy": "high"},
+    # Kept for stored storyboards and the enum; presets no longer pick it (drone reveals read as stock AI footage).
+    "drone_rise": {
+        "name_ja": "ドローン上昇",
+        "prompt_en": "high view from above the area, camera drifting slowly forward",
+        "energy": "high",
+    },
+    "fast_push": {"name_ja": "勢いよく寄る", "prompt_en": "camera moving quickly closer", "energy": "high"},
 }
 
 SECTION_LABELS_JA: dict[str, str] = {
@@ -498,7 +605,118 @@ LYRIC_STYLES: dict[str, LyricStyle] = {
     },
 }
 
+# --- wardrobe ----------------------------------------------------------------------------------
+
+
+def _words(text: str) -> list[str]:
+    return text.split()
+
+
+# Garment nouns → body region (the last garment noun of a phrase decides: "tote bag" → carry, "sweater dress" → top).
+_GARMENT_NOUNS: dict[str, GarmentRegion] = {
+    **dict.fromkeys(
+        _words(
+            "sneakers shoes shoe boots boot sandals heels loafers trainers slippers flats pumps socks clogs oxfords "
+            "mules geta footwear"
+        ),
+        "feet",
+    ),
+    **dict.fromkeys(
+        _words(
+            "skirt trousers pants jeans shorts slacks leggings chinos culottes tights stockings joggers sweatpants "
+            "corduroys hakama"
+        ),
+        "bottom",
+    ),
+    **dict.fromkeys(
+        _words(
+            "coat jacket trench parka cardigan blazer raincoat overcoat windbreaker poncho cape anorak gilet vest "
+            "bomber shawl"
+        ),
+        "outer",
+    ),
+    **dict.fromkeys(
+        _words(
+            "shirt t-shirt tee blouse sweater jumper hoodie sweatshirt top camisole tank turtleneck polo dress "
+            "sundress gown kimono yukata uniform jumpsuit overalls robe tunic pullover"
+        ),
+        "top",
+    ),
+    **dict.fromkeys(
+        _words(
+            "hat cap beanie beret glasses sunglasses spectacles earrings earring necklace chain choker scarf "
+            "headband hairpin hairclip bandana pendant piercings"
+        ),
+        "head",
+    ),
+    **dict.fromkeys(_words("bag tote backpack rucksack purse satchel handbag watch belt bracelet"), "carry"),
+}
+_ARTICLE_WORDS = frozenset({"a", "an", "the", "some", "her", "his", "their", "two", "pair"})
+
+
+def garment_region(text: str) -> GarmentRegion | None:
+    """Body region of a garment phrase (``"white canvas sneakers"`` → ``feet``), ``None`` when it names no garment."""
+    region: GarmentRegion | None = None
+    for word in re.findall(r"[a-z]+(?:-[a-z]+)*", (text or "").lower()):
+        region = _GARMENT_NOUNS.get(word, region)
+    return region
+
+
+def _with_article(item: str) -> str:
+    text = " ".join((item or "").split()).strip(" ,.;")
+    words = text.split()
+    if not words or words[0].lower() in _ARTICLE_WORDS:
+        return text
+    last = re.sub(r"[^a-z]", "", words[-1].lower())
+    if last.endswith("s") and not last.endswith(("ss", "us", "is")):  # plural: jeans, sneakers, earrings
+        return text
+    return f"{'an' if words[0][0].lower() in 'aeiou' else 'a'} {text}"
+
+
+def _join(items: Sequence[str]) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}" if items else ""
+
+
+def wardrobe_phrase(garments: Sequence[Mapping[str, str]]) -> str:
+    """Garments as an English phrase for "wearing …": outerwear over the top, then bottoms, shoes, accessories.
+
+    ``[{outer: charcoal wool coat}, {top: cream knit sweater}, {feet: black boots}]`` →
+    ``"a charcoal wool coat over a cream knit sweater and black boots"``.
+    """
+    by_region: dict[str, list[str]] = {region: [] for region in GARMENT_REGIONS}
+    for garment in garments:
+        item = _with_article(str(garment.get("item_en") or ""))
+        if item and garment.get("region") in by_region and item not in by_region[str(garment.get("region"))]:
+            by_region[str(garment.get("region"))].append(item)
+    outer, top = by_region["outer"], by_region["top"]
+    main = [f"{outer[0]} over {top[0]}", *outer[1:], *top[1:]] if outer and top else [*outer, *top]
+    main += by_region["bottom"] + by_region["feet"]
+    extras = by_region["head"] + by_region["carry"]
+    if not main:
+        return _join(extras)
+    return f"{_join(main)}, with {_join(extras)}" if extras else _join(main)
+
+
+def visible_garments(garments: Sequence[Mapping[str, str]], framing: str) -> list[Mapping[str, str]]:
+    """The garments a shot of this ``framing`` shows (``FRAMING_REGIONS``); unknown framings show none."""
+    regions = FRAMING_REGIONS.get(framing, frozenset())
+    return [g for g in garments if g.get("region") in regions and str(g.get("item_en") or "").strip()]
+
+
+def _person(identity_en: str, wardrobe: Sequence[tuple[GarmentRegion, str]], ja: str) -> Protagonist:
+    garments: list[Garment] = [{"region": region, "item_en": item} for region, item in wardrobe]
+    return {
+        "en": f"{identity_en}, wearing {wardrobe_phrase(garments)}",
+        "ja": ja,
+        "identity_en": identity_en,
+        "wardrobe": garments,
+    }
+
+
 # --- world presets ----------------------------------------------------------------------------
+#
+# Plain, naturalistic wording: real light sources, true-to-life colour, ordinary people and places.
+# No focal lengths, lens names, film looks, grain, halation or palette names (they read as stock AI imagery).
 
 _BASE_ANGLES = ["eye_level", "low_angle", "high_angle", "over_shoulder", "through_foreground"]
 
@@ -522,7 +740,7 @@ def _preset(
     color_grades: list[str],
     lyric_styles: list[str],
     negative_en: str,
-    protagonists: list[LocalizedText],
+    protagonists: list[Protagonist],
     locations: list[LocalizedText],
 ) -> WorldPreset:
     return {
@@ -554,13 +772,15 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         id="cinematic",
         name_ja="シネマティック",
         name_en="Cinematic",
-        description_ja="映画のような光と構図。浅い被写界深度と陰影で、1カットごとにドラマを感じさせる王道のルック。",
-        lighting_en="motivated soft key light with deep contrasty shadows and warm practical lights",
-        lens_en="35mm anamorphic lens, shallow depth of field, gentle oval bokeh",
-        film_en="tungsten-balanced cinema film look with fine grain",
-        atmosphere_en="light haze in the air catching the light",
+        description_ja="映画のような光と構図。実際にある光と陰影で、1カットごとにドラマを感じさせる王道のルック。",
+        lighting_en=(
+            "only the light the place really has: street lamps, lit windows and the last daylight, deep shadows"
+        ),
+        lens_en="steady camera at human height with a natural field of view",
+        film_en="true-to-life colour with slightly muted contrast",
+        atmosphere_en="damp air after rain, puddles and wet pavement",
         palette=["#0F2A3A", "#E39B55", "#1B1B1F"],
-        palette_en="deep teal, warm amber and charcoal",
+        palette_en="dark blue-green shadows, warm street-lamp light and charcoal asphalt",
         palette_ja="深いティール・アンバー・チャコール",
         scene_types=[
             "establishing_wide",
@@ -582,48 +802,62 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
             "slow_push_in",
             "slow_pull_out",
             "tracking_side",
+            "handheld",
             "orbit",
             "crane_up",
             "follow_behind",
-            "drone_rise",
             "rack_focus",
         ],
         color_grades=["teal_orange", "warm_film", "cool_night", "natural"],
         lyric_styles=["cinematic", "simple", "fade"],
-        negative_en="flat lighting, amateur footage, harsh on-camera flash",
+        negative_en="flat lighting, harsh on-camera flash, glossy commercial look",
         protagonists=[
-            {
-                "en": (
-                    "a fictional woman in her late twenties with shoulder-length dark hair, wearing a long charcoal "
-                    "wool coat over a cream knit sweater"
-                ),
-                "ja": "肩までの黒髪にチャコールのロングコートを着た20代後半の女性（架空の人物）",
-            },
-            {
-                "en": (
-                    "a fictional man in his late twenties with short black hair and light stubble, wearing a dark navy "
-                    "overcoat and a grey scarf"
-                ),
-                "ja": "短い黒髪に紺のオーバーコートとグレーのマフラーの20代後半の男性（架空の人物）",
-            },
+            _person(
+                "a fictional woman in her late twenties with shoulder-length dark hair and an ordinary, "
+                "unretouched face",
+                [
+                    ("outer", "long charcoal wool coat"),
+                    ("top", "cream knit sweater"),
+                    ("bottom", "dark grey straight-leg trousers"),
+                    ("feet", "black leather ankle boots"),
+                ],
+                "肩までの黒髪にチャコールのロングコートを着た20代後半の女性（架空の人物）",
+            ),
+            _person(
+                "a fictional man in his late twenties with short black hair, light stubble and an ordinary face",
+                [
+                    ("outer", "dark navy overcoat"),
+                    ("top", "plain white shirt"),
+                    ("bottom", "charcoal trousers"),
+                    ("feet", "black leather shoes"),
+                    ("head", "grey wool scarf"),
+                ],
+                "短い黒髪に紺のオーバーコートとグレーのマフラーの20代後半の男性（架空の人物）",
+            ),
         ],
         locations=[
-            {"en": "a rain-slicked city street at blue hour", "ja": "雨に濡れたブルーアワーの街路"},
-            {"en": "an empty coastal highway at dusk", "ja": "夕暮れの誰もいない海沿いの道"},
-            {"en": "a quiet train platform at night", "ja": "夜の静かな駅のホーム"},
+            {"en": "a quiet residential street after rain at dusk", "ja": "雨上がりの夕暮れの住宅街"},
+            {
+                "en": "an empty coastal road at dusk with guard rails and wind-bent grass",
+                "ja": "ガードレールと風になびく草のある夕暮れの海沿いの道",
+            },
+            {
+                "en": "a small train platform at night under fluorescent lights",
+                "ja": "蛍光灯の灯る夜の小さな駅のホーム",
+            },
         ],
     ),
     "emotional": _preset(
         id="emotional",
         name_ja="エモーショナル",
         name_en="Emotional",
-        description_ja="柔らかな逆光と余韻のある間。感情に寄り添う親密なカットで、切なさや温かさを描く。",
-        lighting_en="soft golden backlight with gentle lens flare and warm bounce light on the face",
-        lens_en="50mm lens at f/1.4, very shallow depth of field, creamy bokeh",
-        film_en="soft warm portrait-film colour with gentle fine grain",
-        atmosphere_en="dust particles floating in the sunbeams, tender intimate mood",
+        description_ja="柔らかな自然光と余韻のある間。感情に寄り添う親密なカットで、切なさや温かさを描く。",
+        lighting_en="soft daylight from a window or late-afternoon sun, light bouncing off pale walls",
+        lens_en="handheld camera close to the person, natural field of view",
+        film_en="warm true-to-life colour with gentle contrast",
+        atmosphere_en="quiet lived-in rooms and streets, small everyday details",
         palette=["#F2C6A0", "#7A8FA6", "#FFF4E6"],
-        palette_en="peach, dusty blue and soft cream",
+        palette_en="warm skin and wood tones, faded blue denim and cream walls",
         palette_ja="ピーチ・くすんだブルー・クリーム",
         scene_types=[
             "close_portrait",
@@ -637,6 +871,7 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
             "water_reflection",
             "sky_drift",
             "ambient_detail",
+            "light_abstract",
             "train_window",
         ],
         camera_angles=["eye_level", "high_angle", "over_shoulder", "through_foreground", "ground_level"],
@@ -648,34 +883,44 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
             "orbit",
             "rack_focus",
             "tracking_side",
-            "crane_up",
+            "pan_slow",
         ],
         color_grades=["golden_hour", "warm_film", "faded_pastel", "natural"],
         lyric_styles=["fade", "simple", "minimal"],
         negative_en="harsh contrast, cold clinical light",
         protagonists=[
-            {
-                "en": (
-                    "a fictional young woman in her early twenties with long wavy chestnut hair, wearing an oversized "
-                    "white shirt and a thin silver necklace"
-                ),
-                "ja": "長い栗色のウェーブヘアに白いオーバーサイズシャツの20代前半の女性（架空の人物）",
-            },
-            {
-                "en": (
-                    "a fictional young man in his early twenties with tousled brown hair, wearing a faded denim jacket "
-                    "over a white t-shirt"
-                ),
-                "ja": "くしゃっとした茶髪にデニムジャケットの20代前半の男性（架空の人物）",
-            },
+            _person(
+                "a fictional young woman in her early twenties with long wavy chestnut hair, freckles and an "
+                "ordinary, unretouched face",
+                [
+                    ("top", "oversized white cotton shirt"),
+                    ("bottom", "light blue jeans"),
+                    ("feet", "white canvas sneakers"),
+                    ("head", "thin silver necklace"),
+                ],
+                "長い栗色のウェーブヘアに白いオーバーサイズシャツの20代前半の女性（架空の人物）",
+            ),
+            _person(
+                "a fictional young man in his early twenties with tousled brown hair and an ordinary face",
+                [
+                    ("outer", "faded denim jacket"),
+                    ("top", "white t-shirt"),
+                    ("bottom", "black chinos"),
+                    ("feet", "worn brown leather boots"),
+                ],
+                "くしゃっとした茶髪にデニムジャケットの20代前半の男性（架空の人物）",
+            ),
         ],
         locations=[
             {
-                "en": "a sunlit bedroom with sheer curtains moving in the breeze",
-                "ja": "薄いカーテンが揺れる陽だまりの部屋",
+                "en": "a small sunlit bedroom with thin curtains and a cluttered desk",
+                "ja": "薄いカーテンと散らかった机のある、陽の入る小さな部屋",
             },
-            {"en": "a riverside path in late afternoon light", "ja": "午後遅くの光が差す川沿いの小道"},
-            {"en": "a seaside town at golden hour", "ja": "ゴールデンアワーの海辺の町"},
+            {"en": "a riverside path with benches in late-afternoon light", "ja": "ベンチのある午後遅くの川沿いの小道"},
+            {
+                "en": "a seaside town with narrow streets and laundry drying on balconies",
+                "ja": "ベランダに洗濯物が干された、細い路地の海辺の町",
+            },
         ],
     ),
     "urban_night": _preset(
@@ -683,12 +928,15 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         name_ja="都会の夜",
         name_en="Urban Night",
         description_ja="ネオンと雨の反射、行き交う光。夜の街を歩く孤独とスピード感をスタイリッシュに。",
-        lighting_en="mixed neon practical lighting in magenta and cyan, wet reflections, deep blacks",
-        lens_en="35mm anamorphic lens with horizontal blue lens flares, shallow depth of field",
-        film_en="tungsten night-film look with soft red halation around highlights",
-        atmosphere_en="light rain and steam rising from the street, glistening asphalt",
+        lighting_en=(
+            "mixed street light from lit shop fronts, vending machines, traffic lights and car headlights, wet "
+            "reflections, deep blacks"
+        ),
+        lens_en="handheld camera at street level, natural field of view",
+        film_en="true-to-life night colour with real dark shadows",
+        atmosphere_en="light rain, wet asphalt, steam rising from a drain",
         palette=["#0B0F2B", "#FF2E88", "#2EE6FF"],
-        palette_en="midnight navy, neon magenta and electric cyan",
+        palette_en="dark night sky, pink and cyan shop lights reflected on wet asphalt",
         palette_ja="ミッドナイトネイビー・ネオンマゼンタ・シアン",
         scene_types=[
             "walking",
@@ -712,7 +960,6 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
             "follow_behind",
             "handheld",
             "orbit",
-            "drone_rise",
             "fast_push",
             "pan_slow",
         ],
@@ -720,38 +967,49 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         lyric_styles=["simple", "karaoke", "cinematic"],
         negative_en="daylight, readable signage, legible neon words, brand logos",
         protagonists=[
-            {
-                "en": (
-                    "a fictional woman in her mid-twenties with a sleek black bob haircut, wearing a black leather "
-                    "jacket and silver hoop earrings"
-                ),
-                "ja": "黒髪のボブに黒のレザージャケットとシルバーのフープピアスの20代半ばの女性（架空の人物）",
-            },
-            {
-                "en": (
-                    "a fictional man in his mid-twenties with short bleached hair, wearing a black hooded jacket and a "
-                    "silver chain"
-                ),
-                "ja": "短いブリーチヘアに黒のフードジャケットとシルバーチェーンの20代半ばの男性（架空の人物）",
-            },
+            _person(
+                "a fictional woman in her mid-twenties with a black bob haircut and an ordinary, unretouched face",
+                [
+                    ("outer", "black leather jacket"),
+                    ("top", "grey cotton t-shirt"),
+                    ("bottom", "black jeans"),
+                    ("feet", "black lace-up boots"),
+                    ("head", "small silver hoop earrings"),
+                ],
+                "黒髪のボブに黒のレザージャケットとシルバーのフープピアスの20代半ばの女性（架空の人物）",
+            ),
+            _person(
+                "a fictional man in his mid-twenties with short bleached hair and an ordinary face",
+                [
+                    ("outer", "black hooded jacket"),
+                    ("top", "white t-shirt"),
+                    ("bottom", "dark cargo trousers"),
+                    ("feet", "black sneakers"),
+                    ("head", "thin silver chain necklace"),
+                ],
+                "短いブリーチヘアに黒のフードジャケットとシルバーチェーンの20代半ばの男性（架空の人物）",
+            ),
         ],
         locations=[
-            {"en": "a neon-lit downtown street in the rain at night", "ja": "雨の夜のネオン街"},
-            {"en": "a narrow alley glowing with unreadable neon signs", "ja": "読めないネオンが光る細い路地"},
-            {"en": "an elevated train line crossing a glittering city at night", "ja": "夜景を横切る高架線"},
+            {"en": "a downtown side street in the rain at night", "ja": "雨の夜の繁華街の裏通り"},
+            {
+                "en": "a narrow alley lit by small shop fronts with no readable signs",
+                "ja": "読める看板のない小さな店の明かりが灯る細い路地",
+            },
+            {"en": "the platform of an elevated train line at night", "ja": "夜の高架駅のホーム"},
         ],
     ),
     "nostalgic": _preset(
         id="nostalgic",
         name_ja="ノスタルジック",
         name_en="Nostalgic",
-        description_ja="16mmフィルムの粒子と褪せた色。夏休みの記憶のような、懐かしく少し切ない情景。",
-        lighting_en="warm hazy late-afternoon sunlight with soft halation",
-        lens_en="vintage 16mm lens with soft edges and gentle vignetting",
-        film_en="16mm reversal-film look with visible grain and slightly faded colors",
-        atmosphere_en="lazy summer air, cicada-season warmth, a memory-like quality",
+        description_ja="フィルムのような粒子と褪せた色。夏休みの記憶のような、懐かしく少し切ない情景。",
+        lighting_en="warm, slightly hazy late-afternoon sunlight",
+        lens_en="handheld camera with slightly imperfect framing, natural field of view",
+        film_en="warm, slightly faded true-to-life colour",
+        atmosphere_en="summer heat, sun-bleached walls, weeds growing by the road",
         palette=["#E8C07D", "#6E9C9F", "#C96F53"],
-        palette_en="faded mustard, sea-glass green and terracotta",
+        palette_en="sun-faded yellow walls, green sea and rusty terracotta roofs",
         palette_ja="褪せたマスタード・シーグラスグリーン・テラコッタ",
         scene_types=[
             "walking",
@@ -763,6 +1021,7 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
             "running",
             "sky_drift",
             "ambient_detail",
+            "nature_macro",
             "establishing_wide",
             "water_reflection",
             "wind_hair",
@@ -773,20 +1032,21 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         lyric_styles=["minimal", "fade", "cinematic"],
         negative_en="modern smartphones, crisp digital look, high-tech gadgets",
         protagonists=[
-            {
-                "en": (
-                    "a fictional young woman in her early twenties with a low ponytail, wearing a pale yellow sundress "
-                    "and white canvas sneakers"
-                ),
-                "ja": "低いポニーテールに淡い黄色のワンピースと白いスニーカーの20代前半の女性（架空の人物）",
-            },
-            {
-                "en": (
-                    "a fictional young man in his early twenties with short messy hair, wearing a loose white short-"
-                    "sleeved shirt and khaki shorts"
-                ),
-                "ja": "短いくせ毛に白い半袖シャツとカーキの短パンの20代前半の男性（架空の人物）",
-            },
+            _person(
+                "a fictional young woman in her early twenties with a low ponytail, sun-tanned skin and an "
+                "ordinary face",
+                [("top", "pale yellow cotton sundress"), ("feet", "white canvas sneakers")],
+                "低いポニーテールに淡い黄色のワンピースと白いスニーカーの20代前半の女性（架空の人物）",
+            ),
+            _person(
+                "a fictional young man in his early twenties with short messy hair and an ordinary face",
+                [
+                    ("top", "loose white short-sleeved shirt"),
+                    ("bottom", "khaki shorts"),
+                    ("feet", "worn rubber sandals"),
+                ],
+                "短いくせ毛に白い半袖シャツとカーキの短パンの20代前半の男性（架空の人物）",
+            ),
         ],
         locations=[
             {
@@ -802,12 +1062,12 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         name_ja="ネイチャー",
         name_en="Nature",
         description_ja="森・海・空・風。自然光とスケールの大きな風景で、壮大さと解放感を描く。",
-        lighting_en="natural sunlight, soft morning light and golden hour glow",
-        lens_en="24mm wide-angle lens with natural perspective and deep focus",
-        film_en="clean high-dynamic-range digital cinema look with natural colors",
-        atmosphere_en="mist drifting over the landscape, wind moving through grass and trees",
+        lighting_en="natural daylight, soft morning light or a low evening sun",
+        lens_en="camera at human height with a wide but natural field of view",
+        film_en="true-to-life colour with natural contrast",
+        atmosphere_en="wind moving grass and branches, morning mist lying in low places",
         palette=["#2F5D3A", "#A8C5DA", "#E9DFC4"],
-        palette_en="forest green, sky blue and sand beige",
+        palette_en="green grass and trees, pale sky and sandy paths",
         palette_ja="フォレストグリーン・スカイブルー・サンドベージュ",
         scene_types=[
             "establishing_wide",
@@ -826,9 +1086,10 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         camera_angles=["eye_level", "low_angle", "high_angle", "overhead", "ground_level", "through_foreground"],
         camera_moves=[
             "static",
+            "handheld",
             "slow_push_in",
             "slow_pull_out",
-            "drone_rise",
+            "pan_slow",
             "crane_up",
             "tracking_side",
             "orbit",
@@ -838,22 +1099,33 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         lyric_styles=["minimal", "simple", "fade"],
         negative_en="buildings, cars, litter, power lines",
         protagonists=[
-            {
-                "en": (
-                    "a fictional woman in her mid-twenties with long dark braided hair, wearing a loose olive linen "
-                    "dress"
-                ),
-                "ja": "長い黒髪の三つ編みにオリーブ色のリネンワンピースの20代半ばの女性（架空の人物）",
-            },
-            {
-                "en": "a fictional man in his mid-twenties with shoulder-length dark hair, wearing a beige linen shirt",
-                "ja": "肩までの黒髪にベージュのリネンシャツの20代半ばの男性（架空の人物）",
-            },
+            _person(
+                "a fictional woman in her mid-twenties with long dark braided hair, sun-tanned skin and an ordinary "
+                "face",
+                [
+                    ("outer", "light grey knit cardigan"),
+                    ("top", "loose olive linen dress"),
+                    ("feet", "brown leather walking boots"),
+                ],
+                "長い黒髪の三つ編みにオリーブ色のリネンワンピースの20代半ばの女性（架空の人物）",
+            ),
+            _person(
+                "a fictional man in his mid-twenties with shoulder-length dark hair and an ordinary face",
+                [
+                    ("top", "beige linen shirt"),
+                    ("bottom", "faded olive trousers"),
+                    ("feet", "worn hiking boots"),
+                ],
+                "肩までの黒髪にベージュのリネンシャツの20代半ばの男性（架空の人物）",
+            ),
         ],
         locations=[
-            {"en": "a misty mountain meadow at sunrise", "ja": "朝霧の高原"},
-            {"en": "a windswept coastal cliff above the ocean", "ja": "海を見下ろす風の強い崖"},
-            {"en": "a sunlit old-growth forest", "ja": "木漏れ日の原生林"},
+            {"en": "a mountain meadow at sunrise with low mist", "ja": "朝霧の残る日の出の高原"},
+            {"en": "a grassy cliff path above the ocean on a windy day", "ja": "風の強い日の、海を見下ろす崖の小道"},
+            {
+                "en": "an old forest with moss-covered ground and patches of sunlight",
+                "ja": "苔むした地面に木漏れ日が落ちる古い森",
+            },
         ],
     ),
     "dark": _preset(
@@ -861,12 +1133,12 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         name_ja="ダーク",
         name_en="Dark",
         description_ja="低いキー、硬い影、霧。緊張感とミステリアスな空気をまとう、陰影の強い世界。",
-        lighting_en="low-key lighting with a single hard side light and deep crushed shadows",
-        lens_en="40mm anamorphic lens, shallow depth of field",
-        film_en="desaturated film look with heavy grain",
-        atmosphere_en="thick fog and smoke drifting through shafts of cold light",
+        lighting_en="low light from a single real source such as a bare bulb or a street lamp, deep shadows",
+        lens_en="steady camera with a natural field of view",
+        film_en="muted, cool true-to-life colour",
+        atmosphere_en="cold damp air, light fog, concrete and wet surfaces",
         palette=["#0A0A0C", "#4A5560", "#8C1C13"],
-        palette_en="near-black, cold slate grey and deep crimson",
+        palette_en="near-black shadows, cold grey concrete and a dark red accent",
         palette_ja="漆黒・冷たいスレートグレー・深紅",
         scene_types=[
             "silhouette",
@@ -897,19 +1169,29 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         lyric_styles=["cinematic", "minimal", "fade"],
         negative_en="gore, blood, weapons, bright cheerful colors",
         protagonists=[
-            {
-                "en": (
-                    "a fictional woman in her late twenties with slicked-back dark hair, wearing a black high-neck coat"
-                ),
-                "ja": "オールバックの黒髪に黒のハイネックコートの20代後半の女性（架空の人物）",
-            },
-            {
-                "en": "a fictional man in his late twenties with dark wet-look hair, wearing a black trench coat",
-                "ja": "濡れたような黒髪に黒のトレンチコートの20代後半の男性（架空の人物）",
-            },
+            _person(
+                "a fictional woman in her late twenties with slicked-back dark hair and an ordinary, unretouched face",
+                [
+                    ("outer", "black high-neck coat"),
+                    ("top", "black turtleneck"),
+                    ("bottom", "black wool trousers"),
+                    ("feet", "black leather boots"),
+                ],
+                "オールバックの黒髪に黒のハイネックコートの20代後半の女性（架空の人物）",
+            ),
+            _person(
+                "a fictional man in his late twenties with damp dark hair and an ordinary face",
+                [
+                    ("outer", "black trench coat"),
+                    ("top", "dark grey shirt"),
+                    ("bottom", "black trousers"),
+                    ("feet", "black leather shoes"),
+                ],
+                "濡れたような黒髪に黒のトレンチコートの20代後半の男性（架空の人物）",
+            ),
         ],
         locations=[
-            {"en": "an abandoned concrete warehouse filled with fog", "ja": "霧が立ち込める廃倉庫"},
+            {"en": "an empty concrete warehouse with puddles on the floor", "ja": "床に水たまりのある、がらんとした倉庫"},
             {"en": "a dark forest road at night lit by a single streetlight", "ja": "街灯ひとつの夜の森の道"},
             {"en": "a deserted underground parking garage", "ja": "人のいない地下駐車場"},
         ],
@@ -918,13 +1200,13 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         id="dreamy",
         name_ja="ドリーミー",
         name_en="Dreamy",
-        description_ja="霞がかった光、パステル、スローモーション。現実と夢のあいだのような幻想的な世界。",
-        lighting_en="soft diffused glowing light with blooming highlights",
-        lens_en="85mm lens with a soft-focus diffusion filter, dreamy bokeh",
-        film_en="pastel film look with lifted blacks",
-        atmosphere_en="floating petals and light particles, gentle slow-motion feeling",
+        description_ja="やわらかな光と淡い色。現実の中にふと現れる夢のような瞬間を、静かに切り取る世界。",
+        lighting_en="soft overcast or early-morning light, pale and even",
+        lens_en="camera close to the subject with a natural field of view",
+        film_en="soft pastel colours as they really are in the place, gentle contrast",
+        atmosphere_en="quiet, slightly hazy air, curtains or tall grass moving a little",
         palette=["#F6C1D9", "#B9C7F2", "#FFFFFF"],
-        palette_en="blush pink, periwinkle and pearl white",
+        palette_en="pale pink flowers, light blue sky and white fabric",
         palette_ja="ブラッシュピンク・ペリウィンクル・パールホワイト",
         scene_types=[
             "spin_sway",
@@ -941,30 +1223,31 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
             "wind_hair",
         ],
         camera_angles=["eye_level", "high_angle", "overhead", "through_foreground", "ground_level"],
-        camera_moves=["static", "slow_push_in", "slow_pull_out", "orbit", "crane_up", "rack_focus", "tracking_side"],
+        camera_moves=["static", "slow_push_in", "slow_pull_out", "handheld", "orbit", "rack_focus", "tracking_side"],
         color_grades=["lavender_haze", "faded_pastel", "golden_hour", "natural"],
         lyric_styles=["fade", "minimal", "simple"],
         negative_en="harsh shadows, gritty textures, dark horror mood",
         protagonists=[
-            {
-                "en": (
-                    "a fictional young woman in her early twenties with long platinum-blonde hair, wearing a flowing "
-                    "pale lilac dress"
-                ),
-                "ja": "長いプラチナブロンドに淡いライラックのドレスの20代前半の女性（架空の人物）",
-            },
-            {
-                "en": (
-                    "a fictional young man in his early twenties with soft silver-grey hair, wearing a loose white "
-                    "linen shirt"
-                ),
-                "ja": "柔らかなシルバーグレーの髪に白いリネンシャツの20代前半の男性（架空の人物）",
-            },
+            _person(
+                "a fictional young woman in her early twenties with long light-brown hair and an ordinary, "
+                "unretouched face",
+                [("top", "loose pale lilac cotton dress"), ("feet", "white ballet flats")],
+                "長い明るい茶髪に淡いライラックのワンピースの20代前半の女性（架空の人物）",
+            ),
+            _person(
+                "a fictional young man in his early twenties with soft light-brown hair and an ordinary face",
+                [
+                    ("top", "loose white linen shirt"),
+                    ("bottom", "light grey linen trousers"),
+                    ("feet", "white canvas sneakers"),
+                ],
+                "柔らかな明るい茶髪に白いリネンシャツの20代前半の男性（架空の人物）",
+            ),
         ],
         locations=[
-            {"en": "a field of white flowers under a pastel sky", "ja": "パステルの空の下の白い花畑"},
-            {"en": "a shallow mirror-like lake at dawn", "ja": "夜明けの鏡のような浅い湖"},
-            {"en": "a sunlit greenhouse full of hanging plants", "ja": "植物が吊るされた光あふれる温室"},
+            {"en": "a field of white wildflowers under a pale sky", "ja": "淡い空の下の白い野花の原っぱ"},
+            {"en": "a shallow, still lake at dawn", "ja": "夜明けの静かな浅い湖"},
+            {"en": "a small greenhouse full of hanging plants", "ja": "植物が吊るされた小さな温室"},
         ],
     ),
     "documentary": _preset(
@@ -972,12 +1255,12 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         name_ja="ドキュメンタリー",
         name_en="Documentary",
         description_ja="手持ちカメラと自然光。飾らない日常の断片を切り取る、リアルで温度のある映像。",
-        lighting_en="available natural light and real practical lights, unpolished but beautiful",
-        lens_en="28mm prime lens, handheld, moderate depth of field",
-        film_en="muted low-contrast cinema film look with natural grain",
+        lighting_en="available natural light and real practical lights, unpolished",
+        lens_en="handheld camera with a natural field of view and moderate depth of field",
+        film_en="muted, low-contrast true-to-life colour",
         atmosphere_en="candid everyday moments, authentic textures of real life",
         palette=["#5B6770", "#C9B79C", "#2E3B2F"],
-        palette_en="muted slate, warm beige and dark olive",
+        palette_en="grey concrete, warm beige walls and dark green plants",
         palette_ja="スレート・ウォームベージュ・ダークオリーブ",
         scene_types=[
             "walking",
@@ -999,20 +1282,27 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         lyric_styles=["simple", "minimal", "cinematic"],
         negative_en="glossy commercial look, staged posing, heavy color grading",
         protagonists=[
-            {
-                "en": (
-                    "a fictional woman in her early thirties with short tousled hair, wearing a grey hoodie and a "
-                    "canvas tote bag"
-                ),
-                "ja": "短いくしゃっとした髪にグレーのパーカーとキャンバストートの30代前半の女性（架空の人物）",
-            },
-            {
-                "en": (
-                    "a fictional man in his early thirties with a short beard, wearing a worn olive work jacket and a "
-                    "knit beanie"
-                ),
-                "ja": "短いひげにオリーブのワークジャケットとニット帽の30代前半の男性（架空の人物）",
-            },
+            _person(
+                "a fictional woman in her early thirties with short tousled hair and an ordinary, unretouched face",
+                [
+                    ("top", "grey hoodie"),
+                    ("bottom", "dark blue jeans"),
+                    ("feet", "scuffed white sneakers"),
+                    ("carry", "canvas tote bag"),
+                ],
+                "短いくしゃっとした髪にグレーのパーカーとキャンバストートの30代前半の女性（架空の人物）",
+            ),
+            _person(
+                "a fictional man in his early thirties with a short beard and an ordinary face",
+                [
+                    ("outer", "worn olive work jacket"),
+                    ("top", "plain navy t-shirt"),
+                    ("bottom", "grey work trousers"),
+                    ("feet", "brown work boots"),
+                    ("head", "knit beanie"),
+                ],
+                "短いひげにオリーブのワークジャケットとニット帽の30代前半の男性（架空の人物）",
+            ),
         ],
         locations=[
             {"en": "a busy early-morning neighborhood with small shops opening", "ja": "店が開き始める朝の商店街"},
@@ -1025,12 +1315,12 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         name_ja="カスタム",
         name_en="Custom",
         description_ja="入力した世界観テキストをもとに絵コンテを作ります（日本語で自由に記述できます）。",
-        lighting_en="natural cinematic lighting with soft contrast",
-        lens_en="35mm lens, shallow depth of field",
-        film_en="subtle film grain, true-to-life colors",
-        atmosphere_en="atmospheric depth",
+        lighting_en="natural light that fits the place, soft contrast",
+        lens_en="camera at human height with a natural field of view",
+        film_en="true-to-life colour",
+        atmosphere_en="real, lived-in surroundings",
         palette=["#2B2D42", "#D9A066", "#EDF2F4"],
-        palette_en="ink blue, warm ochre and off-white",
+        palette_en="dark blue shadows, warm ochre light and off-white walls",
         palette_ja="インクブルー・オーカー・オフホワイト",
         scene_types=[
             "establishing_wide",
@@ -1061,19 +1351,28 @@ WORLD_PRESETS: dict[str, WorldPreset] = {
         lyric_styles=["simple", "cinematic", "fade"],
         negative_en="",
         protagonists=[
-            {
-                "en": (
-                    "a fictional woman in her mid-twenties with shoulder-length dark hair, wearing a simple black "
-                    "jacket"
-                ),
-                "ja": "肩までの黒髪に黒いジャケットの20代半ばの女性（架空の人物）",
-            },
-            {
-                "en": "a fictional man in his mid-twenties with short dark hair, wearing a simple black jacket",
-                "ja": "短い黒髪に黒いジャケットの20代半ばの男性（架空の人物）",
-            },
+            _person(
+                "a fictional woman in her mid-twenties with shoulder-length dark hair and an ordinary face",
+                [
+                    ("outer", "simple black jacket"),
+                    ("top", "white t-shirt"),
+                    ("bottom", "dark jeans"),
+                    ("feet", "black sneakers"),
+                ],
+                "肩までの黒髪に黒いジャケットの20代半ばの女性（架空の人物）",
+            ),
+            _person(
+                "a fictional man in his mid-twenties with short dark hair and an ordinary face",
+                [
+                    ("outer", "simple black jacket"),
+                    ("top", "grey t-shirt"),
+                    ("bottom", "dark jeans"),
+                    ("feet", "black sneakers"),
+                ],
+                "短い黒髪に黒いジャケットの20代半ばの男性（架空の人物）",
+            ),
         ],
-        locations=[{"en": "an atmospheric open space", "ja": "空気感のある開けた場所"}],
+        locations=[{"en": "an open space that fits the setting", "ja": "設定に合った開けた場所"}],
     ),
 }
 

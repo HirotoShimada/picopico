@@ -3,7 +3,10 @@
 One FFmpeg invocation renders the whole video:
 
 * every shot is its own input (``-ss``/``-t`` input seeking, ``-stream_loop``
-  when a clip is too short) and filter chain: trim → speed → 30 fps CFR →
+  when a clip is too short) and filter chain: trim → speed → 30 fps CFR (a
+  source more than 0.5 fps slower than that after the speed change — 24 fps
+  AI clips, slowed shots — goes through ``framerate`` frame blending, so no
+  source frame is shown twice; see :func:`_rate_filter`) →
   whole-pixel ``crop`` to the part of the frame the Ken Burns move ever shows
   → one fixed scale (square pixels, at most the output size) → edge-repeating
   pad → ``perspective`` with per-frame corner expressions (``eval=frame``,
@@ -90,6 +93,26 @@ _LOG_TAIL_LINES = 40
 _KB_PIXFMT = "yuv420p"
 _KB_INTERP = "cubic"
 _KB_EDGE = 4  # px of repeated edge around the scaled box (≥ cubic kernel radius)
+# Frame-rate conversion (:func:`_rate_filter`): a shot whose source runs slower than the output
+# rate after its speed change (24 fps AI clips: 24 fps; slowed shots: 24 x 0.8 = 19.2 fps) is
+# converted with ``framerate``, which blends the two source frames around each output time by
+# their distance to it. ``fps`` would show a source frame twice instead (every 4th frame at
+# 24 → 30 fps, about every 3rd in a 0.8x shot): uneven motion under a smooth camera move. Measured
+# on 720×1280 Veo clips (2026-10-13, 4 cores): a 20 s video with three 0.82–0.85x shots took
+# 40.6–43.7 s instead of 39.6–44.5 s (same CPU time, ~115 s) and repeats no frame (``fps``: ~1/3
+# of them); ``minterpolate`` (mi_mode=mci) was sharper on fast motion but took 217 s in the graph,
+# and 64.7 s for its pre-pass alone with one process per shot.
+# The decision is by repeat interval, not ratio: ``fps`` repeats ``fps - source rate`` frames per
+# second, so a source more than ``_BLEND_MIN_GAP_FPS`` below the output rate (more than one repeat
+# every 2 s: 30 fps uploads slowed to 0.95–0.98x, 29 fps) is blended. Closer to the output rate
+# (29.97 fps phone footage: one repeat every ~33 s) ``fps`` stays: a rare repeat beats softening
+# almost every frame. Looped shots (short uploads) also keep ``fps``: ``framerate`` would blend the
+# last frame of one pass with the first of the next (a ghost at every seam).
+_BLEND_MIN_GAP_FPS = 0.5
+# Pixel formats ``framerate`` cannot take, for which FFmpeg would auto-insert an RGB → YUV conversion
+# with swscale's default (BT.601) matrix that the shot's later ``in_color_matrix`` (often BT.709)
+# then misreads: RGB uploads (QuickTime Animation, PNG-in-MOV) are converted explicitly first.
+_RGB_PIX_FMTS = ("rgb", "bgr", "gbr", "argb", "abgr", "0rgb", "0bgr", "pal8", "x2rgb", "x2bgr")
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -419,6 +442,8 @@ class _ClipInfo:
     color_matrix: str  # swscale in_color_matrix
     pixel_width: int = 0  # decoded frame size after autorotation (0 = same as the display size)
     pixel_height: int = 0
+    fps: float = 0.0  # average frame rate of the video stream (0 = unknown)
+    pix_fmt: str = ""  # decoded pixel format ("" = unknown)
 
     @property
     def frame_size(self) -> tuple[int, int]:
@@ -474,6 +499,16 @@ def _ratio(value: Any) -> float | None:
     return n / d
 
 
+def _frame_rate(stream: dict[str, Any]) -> float:
+    """Average frame rate (``avg_frame_rate``, else ``r_frame_rate``) in fps; 0.0 when unknown."""
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        num, _, den = str(stream.get(key) or "").partition("/")
+        n, d = _float(num), _float(den or "1")
+        if n and d and n > 0 and d > 0 and 1.0 <= n / d <= 1000.0:
+            return n / d
+    return 0.0
+
+
 def _rotation(stream: dict[str, Any]) -> int:
     for side in stream.get("side_data_list") or []:
         if "rotation" in side:
@@ -511,7 +546,8 @@ def _probe_clip(path: str) -> _ClipInfo:
         matrix = "bt709" if max(coded_w, coded_h) >= 720 else "bt601"
     return _ClipInfo(
         path=path, duration=duration, width=width, height=height, color_matrix=matrix,
-        pixel_width=pixel_w, pixel_height=pixel_h,
+        pixel_width=pixel_w, pixel_height=pixel_h, fps=_frame_rate(stream),
+        pix_fmt=str(stream.get("pix_fmt") or ""),
     )  # fmt: skip
 
 
@@ -763,6 +799,35 @@ def _shot_geometry(plan: _ShotPlan, spec: RenderSpec) -> _ShotGeometry:
     )
 
 
+def _blends(plan: _ShotPlan, fps: int) -> bool:
+    """Whether the shot's rate conversion blends frames (:func:`_rate_filter`)."""
+    source = plan.clip.fps * plan.speed
+    return not plan.loop and 0 < source and fps - source > _BLEND_MIN_GAP_FPS
+
+
+def _rate_filter(plan: _ShotPlan, fps: int) -> str:
+    """The shot's conversion to ``fps`` CFR, after its speed change (``setpts=PTS/speed``).
+
+    A source running more than ``_BLEND_MIN_GAP_FPS`` slower than the output (24 fps AI clips,
+    slowed shots, 30 fps uploads at 0.95x) is blended (``framerate``: every output frame mixes the
+    two source frames around its time, weighted by distance), so motion advances every frame instead
+    of stopping on repeated frames. Sources at about the output rate or faster, those of unknown
+    rate and looped shots use ``fps`` (nearest frame). An RGB source is converted to YUV with the
+    clip's colour matrix first (``framerate`` takes YUV only; FFmpeg's own conversion would use
+    BT.601 and shift the colours of a BT.709 clip).
+    """
+    if not _blends(plan, fps):
+        return f"fps={fps}"
+    convert = ""
+    if plan.clip.pix_fmt.startswith(_RGB_PIX_FMTS):
+        matrix = plan.clip.color_matrix
+        convert = f"scale=in_color_matrix={matrix}:out_color_matrix={matrix},format=yuv444p,"
+    # ``framerate`` keeps a finer time base (e.g. 1/61440 for a 24 fps MP4); its frames sit
+    # exactly on the 1/fps grid, so ``settb`` is lossless and gives every shot the 1/fps time
+    # base ``fps`` produces (``xfade`` needs both inputs on the same time base).
+    return f"{convert}framerate=fps={fps},settb=1/{fps}"
+
+
 def _shot_chain(index: int, plan: _ShotPlan, spec: RenderSpec) -> str:
     fps, width, height = spec.fps, spec.width, spec.height
     seconds = plan.frames / fps
@@ -780,7 +845,7 @@ def _shot_chain(index: int, plan: _ShotPlan, spec: RenderSpec) -> str:
     if abs(plan.speed - 1.0) > 1e-3:
         parts.append(f"setpts=PTS/{_f(plan.speed)}")
     parts += [
-        f"fps={fps}",
+        _rate_filter(plan, fps),
         # Guarantees the exact frame count even if the source ends a little early.
         f"tpad=stop_mode=clone:stop_duration={_f(seconds + 1, 3)}",
         f"trim=end_frame={plan.frames}",

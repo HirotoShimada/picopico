@@ -12,8 +12,20 @@ import httpx2
 import pytest
 
 from app import schemas
-from app.services.presets import CAMERA_ANGLES, CAMERA_MOVES, SCENE_TYPES, WORLD_PRESETS
-from app.services.prompting import LIKENESS_SAFETY_CLAUSE, NO_TEXT_CLAUSE
+from app.services.presets import (
+    CAMERA_ANGLES,
+    CAMERA_MOVES,
+    FRAMING_REGIONS,
+    FRAMINGS,
+    FRAMINGS_WITH_FACE,
+    SCENE_TYPES,
+    WORLD_PRESETS,
+)
+from app.services.prompting import (
+    LIKENESS_SAFETY_CLAUSE,
+    NO_TEXT_CLAUSE,
+    strip_ai_cliches,
+)
 from app.services.storyboard import (
     STORYBOARD_PROMPT_CHARS,
     STORYBOARD_SCHEMA,
@@ -85,17 +97,29 @@ def test_template_world_bible_is_shared_by_all_scenes(preset_id: str) -> None:
     assert board["source"] == "template" and board["model"] is None and board["cost_usd"] == 0.0
     world = board["world_bible"]
     assert world["protagonist_en"].startswith("a fictional ")
+    assert world["identity_en"].startswith("a fictional ") and "wearing" not in world["identity_en"]
     assert world["palette"] == WORLD_PRESETS[preset_id]["palette"]
     assert not world["summary_ja"].isascii()
+    # 2026-10-13 (intentional change): the tokens are a display summary of the wardrobe, no longer pasted
+    # into every prompt; each prompt carries the identity and only the garments its framing shows.
+    assert world["consistency_tokens_en"] == ", ".join(g["item_en"] for g in world["wardrobe"])
     scenes = board["scenes"]
     assert [s["id"] for s in scenes] == [f"s{i:02d}" for i in range(1, 9)]
     for scene in scenes:
         prompt = scene["prompt_en"]
-        assert world["consistency_tokens_en"] in prompt, "shared look tokens appear in every prompt"
-        if SCENE_TYPES[scene["scene_type"]]["has_subject"]:
-            assert world["protagonist_en"] in prompt, "same protagonist description in every protagonist scene"
-        assert "Vertical 9:16 composition" in prompt and "photorealistic" in prompt
-        assert "natural skin texture" in prompt and "realistic hands" in prompt and "subtle natural motion" in prompt
+        framing = scene["framing"]
+        assert framing == SCENE_TYPES[scene["scene_type"]]["framing"] and framing in FRAMINGS
+        if framing in FRAMINGS_WITH_FACE:
+            assert world["identity_en"].lower() in prompt.lower(), "same identity in every protagonist scene"
+        else:
+            assert "fictional woman" not in prompt and "fictional man" not in prompt
+        for garment in world["wardrobe"]:
+            shown = garment["region"] in FRAMING_REGIONS[framing]
+            assert (garment["item_en"] in prompt) == shown, (framing, garment, prompt)
+        assert "Vertical 9:16" in prompt and "live-action footage" in prompt and "real-time motion" in prompt
+        assert ("natural skin texture" in prompt and "realistic hands" in prompt) == (framing != "no_people")
+        assert strip_ai_cliches(prompt) == (prompt, []), "no stock AI-look vocabulary"
+        assert "#" not in prompt and "palette" not in prompt and "mm " not in prompt
         assert prompt.count(LIKENESS_SAFETY_CLAUSE) == 1 and prompt.count(NO_TEXT_CLAUSE) == 1
         assert len(prompt) <= STORYBOARD_PROMPT_CHARS and prompt.isascii()
         negative = scene["negative_prompt_en"]
@@ -205,12 +229,13 @@ def _schema_objects(node: Any) -> list[dict[str, Any]]:
 
 def test_storyboard_schema_is_strict() -> None:
     objects = _schema_objects(STORYBOARD_SCHEMA)
-    assert len(objects) == 3
+    assert len(objects) == 4  # root, world bible, wardrobe item (added 2026-10-13), scene
     for obj in objects:
         assert obj["additionalProperties"] is False
         assert set(obj["required"]) == set(obj["properties"])
     scene = STORYBOARD_SCHEMA["properties"]["scenes"]["items"]["properties"]
     assert scene["scene_type"]["enum"] == list(SCENE_TYPES)
+    assert scene["framing"]["enum"] == list(FRAMINGS)
 
 
 def _claude_storyboard(n: int, *, artist_in_prompt: bool = False) -> dict[str, Any]:
@@ -293,9 +318,15 @@ def test_claude_success() -> None:
     assert len(board["scenes"]) == 6, "extra scenes are truncated"
     world = board["world_bible"]
     assert world["palette"] == ["#0B0F2B", "#FF2E88", "#2EE6FF"]
+    # A legacy-shaped answer (protagonist_en + consistency_tokens_en, no framing) still normalizes.
+    assert world["identity_en"] == "a fictional woman in her late twenties with short silver hair"
+    assert world["wardrobe"] == [{"region": "outer", "item_en": "red raincoat"}]
+    assert world["consistency_tokens_en"] == "red raincoat"
     for scene in board["scenes"]:
         prompt = scene["prompt_en"]
-        assert world["consistency_tokens_en"] in prompt and "9:16" in prompt
+        assert scene["framing"] == "medium"  # "Medium shot of …"
+        assert world["identity_en"].lower() in prompt.lower() and "red raincoat" in prompt and "9:16" in prompt
+        assert "anamorphic" not in prompt and "35mm" not in prompt and "photorealistic" not in prompt
         assert prompt.count(LIKENESS_SAFETY_CLAUSE) == 1 and prompt.count(NO_TEXT_CLAUSE) == 1
         assert "deformed hands" in scene["negative_prompt_en"] and "extra fingers" in scene["negative_prompt_en"]
         assert scene["lyric_ref"] is None or scene["lyric_ref"].startswith("l0")
@@ -458,7 +489,9 @@ def test_ascii_mood_with_a_person_is_not_copied_into_prompts() -> None:
     assert "Billie" not in _provider_text(board) and "Eilish" not in _provider_text(board)
     assert any("Billie Eilish" in w for w in board["warnings"])
     moody = _template(mood="dark, moody and cinematic", n_scenes=3)
-    assert all("dark, moody, cinematic mood" in s["prompt_en"] for s in moody["scenes"])
+    # "cinematic" is stock AI-look vocabulary and is stripped from prompts (2026-10-13, intentional change).
+    assert all("dark, moody mood" in s["prompt_en"] for s in moody["scenes"])
+    assert not any("cinematic" in s["prompt_en"].lower() for s in moody["scenes"])
 
 
 def test_claude_gets_names_from_free_text_as_forbidden_and_its_detected_people_are_removed() -> None:
@@ -478,9 +511,11 @@ def test_claude_gets_names_from_free_text_as_forbidden_and_its_detected_people_a
     assert "Keanu" not in rest and "Billie" not in rest and "Yonezu" not in rest
     text = _provider_text(board)
     assert "Taylor" not in text and "Kenshi" not in text and "Yonezu" not in text
-    # The cleaned consistency tokens still appear verbatim in every prompt.
-    assert all(board["world_bible"]["consistency_tokens_en"] in s["prompt_en"] for s in board["scenes"])
-    assert board["world_bible"]["consistency_tokens_en"].endswith(tokens)
+    # 2026-10-13 (intentional change): the tokens are no longer pasted into prompts; the wardrobe is derived
+    # from the cleaned description and the tokens' garments (colour / film-look words are dropped).
+    assert board["world_bible"]["consistency_tokens_en"] == "red raincoat"
+    assert all("red raincoat" in s["prompt_en"] and "film look" not in s["prompt_en"] for s in board["scenes"])
+    assert tokens.startswith("red raincoat")
     assert any("Claude が実在の人物名を 1 件検出" in w and "Taylor" in w for w in board["warnings"])
     assert "detected_real_people" in STORYBOARD_SCHEMA["required"]
     assert "detected_real_people" in SYSTEM_PROMPT
@@ -532,7 +567,11 @@ def test_claude_receives_audio_mood_and_estimate() -> None:
 
 def test_base_negative_and_instructions_cover_live_artifacts() -> None:
     # Live Veo run 2026-10-13: a lens-frame ring appeared and one clip dropped the trousers.
-    from app.services.storyboard import BASE_NEGATIVE_EN, MAX_NEGATIVE_CHARS, _merge_negative
+    from app.services.storyboard import (
+        BASE_NEGATIVE_EN,
+        MAX_NEGATIVE_CHARS,
+        _merge_negative,
+    )
 
     merged = _merge_negative("x" * 10, BASE_NEGATIVE_EN)
     assert len(merged) <= MAX_NEGATIVE_CHARS and "circular vignette" in merged and "black borders" in merged
