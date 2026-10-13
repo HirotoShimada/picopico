@@ -1124,7 +1124,7 @@ X-OpenRouter-Title: AI Music Video Factory
 
 ### 8.8 未確認事項（OpenRouter）
 
-1. **実リクエスト全般**: 2026-10-13 に確認済みなのは `GET /videos/models`、`GET /key`、Claude の `POST /chat/completions`（`zdr: true`・`data_collection: "deny"`・`require_parameters: true`・json_schema strict で成功。記録費用 $0.05564 = 請求額）。**`POST /videos` は、アカウント全体で ZDR を強制していると 404 `0 endpoints … matching your guardrail restrictions and data policy … ZDR violation (account settings)` で拒否される（課金なし）ことを確認**。動画の生成・ダウンロード・`usage.cost` は未確認。
+1. **実リクエスト全般**: 2026-10-13 に確認済みなのは `GET /videos/models`、`GET /key`、Claude の `POST /chat/completions`（`zdr: true`・`data_collection: "deny"`・`require_parameters: true`・json_schema strict で成功。記録費用 $0.05564 = 請求額）。**`POST /videos` は、アカウント全体で ZDR を強制していると 404 `0 endpoints … matching your guardrail restrictions and data policy … ZDR violation (account settings)` で拒否される（課金なし）ことを確認**。ZDR 強制を外した後の `POST /videos`（`google/veo-3.1-lite`、duration 4、aspect_ratio 9:16、resolution 720p、generate_audio false）は**202 で受理され、`pending`→`completed` まで約 50 秒、`GET /videos/{id}/content` で 720×1280・24fps・4.0 秒・音声なしの MP4 を取得**。`usage.cost` = 0.12 = 見積もり = アカウントの請求増分。プロンプト中の製品名（フィルム名）は映像内に文字として描かれることを確認（対策済み）。
 2. **動画の作成**:
    - `POST /videos` の成功ステータス（SDK は 202 だけを成功として扱う）。
    - 各モデルが 9:16 と 720p を受け付けるか。

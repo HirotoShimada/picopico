@@ -139,7 +139,7 @@ API キーはサーバー側でのみ読み込み、どの API レスポンス�
 2. `ANTHROPIC_API_KEY` がなく `OPENROUTER_API_KEY` がある → OpenRouter 経由で Claude（`OPENROUTER_CLAUDE_MODEL`）に送る
 3. どちらもない → テンプレートで作る（外部に送らない）
 
-OpenRouter を使う手順（2026-10-13 に実キーで確認: 無料のモデル一覧 `GET /videos/models` の取得と、OpenRouter 経由の Claude による絵コンテ生成 1 回は成功。**動画生成は未検証** — アカウントで ZDR を強制していたため送信段階で 404 で拒否され、課金はありませんでした）:
+OpenRouter を使う手順（2026-10-13 に実キーで確認: モデル一覧の取得、OpenRouter 経由の Claude による絵コンテ生成、Veo 3.1 Lite での動画生成 1 本が成功。ほかの動画モデルは未検証。アカウントで ZDR を強制していると動画は 404 で拒否されます）:
 
 1. OpenRouter でキーを作り、`backend/.env` に `OPENROUTER_API_KEY=...` を設定する。Celery 構成では API とワーカーの両方に渡す。
 2. API とワーカーのホストから `https://openrouter.ai`（`OPENROUTER_API_BASE`）へ HTTPS で接続できるようにする
@@ -272,7 +272,7 @@ OpenRouter の「設定済み」の画面は、キーがないためバックエ
 | Veo（Gemini API） | 未検証（キーなし） | 実装・HTTP モックテスト済み。無効キーで公式エンドポイントの 400 応答のみ確認 |
 | Runway | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
 | Kling | 未検証（キーなし・ホストへ接続不可） | 実装・HTTP モックテスト済み |
-| OpenRouter（`openrouter`） | **一部検証済み**（2026-10-13: モデル一覧の取得と Claude の絵コンテは実 API で成功。動画生成は未検証） | 実装・HTTP モックテスト済み。モデル・料金は `GET /videos/models` から取得（取得できなければ組み込みの 7 モデル。2026-10-13 の一覧の写し）。形状は公式 SDK（`@openrouter/sdk` 1.4.25）のソースによる。Claude の経路（絵コンテ）は実 API で 1 回成功（下の「検証済み」） |
+| OpenRouter（`openrouter`） | **検証済み（1 モデル）**（2026-10-13: モデル一覧・Claude の絵コンテ・Veo 3.1 Lite の動画 1 本を実 API で確認。ほかのモデルは未検証） | 実装・HTTP モックテスト済み。モデル・料金は `GET /videos/models` から取得（取得できなければ組み込みの 7 モデル。2026-10-13 の一覧の写し）。形状は公式 SDK（`@openrouter/sdk` 1.4.25）のソースによる。Claude の経路（絵コンテ）は実 API で 1 回成功（下の「検証済み」） |
 
 API モデルの料金は公式料金表・モデルページの調査値（OpenRouter はモデル一覧の料金。いずれも `verified: false`）です。実キーでの検証が済むまでは概算として扱ってください。
 Runway の利用規約に従い、UI には runwayml.com へのリンク付きで「Powered by Runway」を表示します（Runway の
@@ -310,8 +310,11 @@ Runway の利用規約に従い、UI には runwayml.com へのリンク付き�
   - `GET /videos/models`（無料）: 30 モデルを取得し、料金（`pricing_skus`）の読み取りを全モデルで確認（`tests/fixtures/openrouter_videos_models_2026-10-13.json`）。
   - Claude の絵コンテ（`anthropic/claude-opus-5.5`、`zdr: true`・`data_collection: "deny"`・json_schema 指定）: 3 シーンを 18 秒で生成。
     構造化出力はスキーマどおりで、アプリが記録した費用 $0.05564 と OpenRouter の請求額（`GET /key` の増分）が一致。
-  - 動画（`google/veo-3.1-lite`、4 秒・9:16・720p・無音）: アカウントで ZDR を強制していたため `POST /videos` が 404 で拒否（課金なし）。
-    生成・ダウンロード・`usage.cost` の確認はまだです。
+  - 動画（`google/veo-3.1-lite`、4 秒・9:16・720p・無音）: 最初はアカウントで ZDR を強制していたため `POST /videos` が 404 で拒否（課金なし）。
+    ZDR の強制（Google / All other models）を外した後、**生成に成功**: 投入→待機→完了→`/content` からのダウンロードまで 52 秒、
+    出力は 720×1280・H.264・24fps・4.0 秒・**音声トラックなし**（`generate_audio: false` が効いた）。見積もり $0.12 = アプリが記録した費用 = 請求額。
+    映像はフォトリアルで絵コンテどおりだったが、プロンプトのフィルム名「CineStill 800T」が**画面左下に文字として描かれた**ため、
+    プリセットと Claude への指示から製品名を外し、送信直前にも製品名を一般的な表現へ置き換えるようにした（`prompting.rewrite_brand_names`）。
 
 **未検証（キー・接続先・設定の都合で）**
 

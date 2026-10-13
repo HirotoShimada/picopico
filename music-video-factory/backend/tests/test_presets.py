@@ -305,3 +305,15 @@ def test_color_grades_keep_their_look(grade_id: str) -> None:
     assert set(_LOOKS) == set(COLOR_GRADES)
     for key, (low, high) in _LOOKS[grade_id].items():
         assert low <= look[key] <= high, f"{grade_id}: {key}={look[key]:.3f} not in [{low}, {high}]"
+
+
+def test_presets_and_claude_instructions_avoid_product_names() -> None:
+    # Video models draw product names as visible text (live Veo run, 2026-10-13: "CineStill 800T").
+    import json as _json
+
+    from app.services.prompting import rewrite_brand_names
+    from app.services.storyboard import SYSTEM_PROMPT
+
+    dumped = _json.dumps(WORLD_PRESETS, ensure_ascii=False, default=str)
+    assert rewrite_brand_names(dumped)[1] == []
+    assert "never name a film stock" in SYSTEM_PROMPT

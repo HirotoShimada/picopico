@@ -132,6 +132,42 @@ def _name_pattern(name: str) -> re.Pattern[str] | None:
     return re.compile(body, re.IGNORECASE)
 
 
+# Product names (film stocks, cameras, lenses) get drawn as visible text by video models — seen live on
+# 2026-10-13: "CineStill 800T" in a Veo prompt came back burned into the corner of every frame. They are
+# replaced with generic descriptions of the same look. Bare "Fuji" is left alone (Mount Fuji).
+_BRAND_REWRITES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), replacement)
+    for pattern, replacement in (
+        (r"\bcine\s?still(?:\s*(?:800\s?t|50\s?d))?(?:[\s-]*(?:like|style|film))*\b", "tungsten night-film"),
+        (r"\bkodak\s+vision\s?3(?:\s*\d{2,3}\s?[td])?(?:[\s-]*(?:like|style))?\b", "tungsten-balanced cinema film"),
+        (r"\bkodak\s+portra(?:\s*\d{3})?(?:[\s-]*(?:like|style))?\b", "warm portrait film"),
+        (r"\b(?:kodak\s+)?ektachrome(?:\s*\d{2,3}\s?[d]?)?(?:[\s-]*(?:like|style))?\b", "reversal film"),
+        (r"\bkodak\s+(?:gold|ektar|tri-?x|t-?max|ultramax)(?:\s*\d{2,3})?(?:[\s-]*(?:like|style))?\b",
+         "classic still film"),
+        (r"\bfuji(?:film)?\s+(?:eterna|velvia|provia|superia|pro\s?400h|acros|reala)(?:\s*\d{2,3})?"
+         r"(?:[\s-]*(?:like|style))?\b", "muted cinema film"),
+        (r"\bilford\s+(?:hp5|fp4|delta|pan\s?f|xp2)(?:\s*(?:plus|\+|\d{2,4}))*\b", "black-and-white film"),
+        (r"\b(?:arri\s+alexa(?:\s+(?:mini|lf|35|65))*|red\s+(?:komodo|v-raptor|monstro|dragon)|sony\s+venice"
+         r"|blackmagic\s+(?:ursa|pocket)\w*)\b", "cinema camera"),
+        (r"\b(?:cooke\s+(?:s4|s7|panchro)\w*|zeiss\s+(?:master|ultra|super)\s+primes?|leica\s+summilux\w*"
+         r"|panavision\s+(?:c-series|primo)\w*)(?:\s+(?:primes?|lenses?))?\b", "cinema prime lenses"),
+        (r"\b(?:kodak|fujifilm|cinestill|ilford|arri|panavision)\b", ""),
+    )
+)
+
+
+def rewrite_brand_names(text: str) -> tuple[str, list[str]]:
+    """Replace film-stock / camera / lens brand names with generic wording. Returns (text, names replaced)."""
+    replaced: list[str] = []
+    for pattern, replacement in _BRAND_REWRITES:
+        def _sub(match: re.Match[str], replacement: str = replacement) -> str:
+            replaced.append(" ".join(match.group(0).split()))
+            return replacement
+
+        text = pattern.sub(_sub, text)
+    return text, list(dict.fromkeys(replaced))
+
+
 def strip_forbidden_names(text: str, forbidden_names: Iterable[str]) -> tuple[str, list[str]]:
     """Remove every forbidden name (spacing/case/width-insensitive). Returns (text, removed names)."""
     text = unicodedata.normalize("NFKC", text or "")
@@ -614,6 +650,12 @@ def sanitize_prompt(
     body = unicodedata.normalize("NFKC", text or "")
     body = _CANONICAL_CLAUSES.sub(" ", body)
     body = _NEGATED_SAFETY.sub(" ", body)
+
+    body, brands = rewrite_brand_names(body)
+    if brands:
+        warnings.append(
+            f"製品名（{'、'.join(brands)}）は映像内に文字として描かれることがあるため、一般的な表現に置き換えました"
+        )
 
     body, removed_names = strip_forbidden_names(body, forbidden_names)
     for name in removed_names:

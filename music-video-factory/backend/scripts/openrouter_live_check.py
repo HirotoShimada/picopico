@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         started = time.monotonic()
         result = provider.generate(
             req, str(out_path), timeout=900,
-            on_submitted=lambda job_id: print(f"  submitted job {job_id}"),
+            on_submitted=lambda job_id, _token: print(f"  submitted job {job_id}"),
             on_progress=lambda fraction, stage: print(f"  {time.monotonic() - started:6.1f}s {stage} {fraction:.2f}"),
         )  # fmt: skip
         info = probe(out_path)

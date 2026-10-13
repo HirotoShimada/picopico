@@ -19,6 +19,7 @@ from app.services.prompting import (
     glossary_keywords,
     glossary_translate,
     mood_keywords,
+    rewrite_brand_names,
     sanitize_prompt,
     screen_free_text,
     strip_forbidden_names,
@@ -264,7 +265,7 @@ def test_removes_real_people_named_in_free_text(text: str, names: list[str]) -> 
         "Tokyo Tower at dusk, New York streets in the rain",
         "inspired by 1970s cinema, warm grain",
         "Neon Rain Over Shibuya",
-        "Medium Close-Up of a fictional woman, Kodak Vision3 500T film look",
+        "Medium Close-Up of a fictional woman, tungsten-balanced cinema film look",
         "Aurora borealis over a lake",
     ],
 )
@@ -301,3 +302,30 @@ def test_screen_free_text_and_mood_keywords() -> None:
     assert mood_keywords("Billie Eilish vibes") == []
     assert mood_keywords("dark, moody and cinematic, like Taylor Swift") == ["dark", "moody", "cinematic"]
     assert mood_keywords("切なくて静かな夜") == ["bittersweet", "quiet", "night"]
+
+
+# --- product names get drawn as text by video models (seen live 2026-10-13) --------------------------------------
+
+@pytest.mark.parametrize(
+    ("text", "brand"),
+    [
+        ("35mm anamorphic, CineStill 800T halation, vertical 9:16", "CineStill 800T"),
+        ("Kodak Portra 400 look with soft grain", "Kodak Portra 400"),
+        ("Kodak Vision3 500T film look", "Kodak Vision3 500T"),
+        ("16mm Kodak Ektachrome colours", "Kodak Ektachrome"),
+        ("Fujifilm Eterna-like muted look", "Fujifilm Eterna-like"),
+        ("shot on ARRI Alexa Mini LF with Cooke S4 primes", "ARRI Alexa Mini LF"),
+        ("Ilford HP5 Plus 400 grain", "Ilford HP5 Plus 400"),
+    ],
+)
+def test_sanitize_rewrites_product_names(text: str, brand: str) -> None:
+    out, warnings = sanitize_prompt(text, forbidden_names=[])
+    lowered = out.lower()
+    assert not any(word in lowered for word in ("cinestill", "kodak", "fujifilm", "arri", "ilford", "cooke"))
+    assert any(brand in w and "文字として描かれる" in w for w in warnings)
+    assert sanitize_prompt(out, forbidden_names=[]) == (out, [])  # idempotent, no new warnings
+
+
+def test_generic_film_and_place_words_are_kept() -> None:
+    text = "Mount Fuji at dawn, 35mm anamorphic lens, tungsten night-film halation, 16mm grain"
+    assert rewrite_brand_names(text) == (text, [])

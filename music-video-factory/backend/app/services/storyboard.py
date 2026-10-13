@@ -67,6 +67,7 @@ from app.services.prompting import (
     make_claude_client,
     mood_keywords,
     prompt_body_budget,
+    rewrite_brand_names,
     sanitize_prompt,
     screen_free_text,
     strip_forbidden_names,
@@ -655,7 +656,9 @@ age range, hair, wardrobe with colours and materials. Never a real or famous per
 likeness, never a minor.
 - location_en: one recurring location family that fits the song.
 - palette: exactly three hex colours (#RRGGBB). look_en: lighting, lens (e.g. "35mm anamorphic"), \
-film stock look and atmosphere.
+film look and atmosphere. Describe the film look in generic words (grain, halation, colour response); \
+never name a film stock, camera, lens or any other product brand (e.g. no "CineStill", "Kodak", "ARRI"): \
+video models render such names as visible text in the frame.
 - consistency_tokens_en: at most 200 characters of shared style descriptors (wardrobe, palette, film look) \
 to repeat in every prompt.
 - summary_ja: 2-3 Japanese sentences describing the world for the artist.
@@ -672,8 +675,8 @@ simple physically plausible action -> environment -> lighting -> camera angle an
 colour palette and film look -> "vertical 9:16 composition" -> realism cues ("photorealistic live-action \
 footage, natural skin texture, realistic hands, subtle natural motion") -> the consistency tokens. Repeat \
 the full protagonist description in every scene where the protagonist appears.
-- Never mention real people, celebrities, the artist or any name listed under forbidden_likeness, brands, \
-logos, readable signs or any text in frame.
+- Never mention real people, celebrities, the artist or any name listed under forbidden_likeness, brands \
+or product names (including film stocks, cameras and lenses), logos, readable signs or any text in frame.
 - song.audio_mood (from audio analysis) and song.world_estimate (emotions merged from audio, lyrics and the \
 user's mood) describe the emotional tone; combine them with the lyrics and the user's mood.
 
@@ -951,8 +954,8 @@ def _normalize_claude(
         return str(value).strip() if isinstance(value, str) and value.strip() else fallback
 
     def clean_en(value: str) -> str:
-        """World-bible text without forbidden names or real-person references (kept verbatim in prompts)."""
-        return strip_person_references(strip_forbidden_names(value, forbidden)[0]).text
+        """World-bible text without forbidden names, real-person references or product names (kept verbatim in prompts)."""
+        return strip_person_references(rewrite_brand_names(strip_forbidden_names(value, forbidden)[0])[0]).text
 
     protagonist = clean_en(text("protagonist_en", preset["protagonists"][0]["en"]))
     if "fictional" not in protagonist.lower():
